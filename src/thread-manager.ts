@@ -3,21 +3,36 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+	ROOT_THREAD_PATH,
+	asThreadPath,
 	asThreadId,
+	assertTaskName,
+	isThreadIdText,
+	joinThreadPath,
 	newThreadId,
 	nowIso,
+	threadPathBasename,
 	type ClosedThreadSnapshot,
 	type LiveThreadSnapshot,
 	type ThreadEvent,
 	type ThreadExit,
 	type ThreadId,
+	type ThreadPath,
 	type ThreadPhase,
 	type ThreadSession,
 	type ThreadSnapshot,
 } from "./domain.ts";
 import { isRecord, numberField, stringField } from "./json.ts";
 import { RpcClient, type RpcClientEvent } from "./rpc.ts";
-import type { SendCommand, SendMode, StartCommand, StopCommand } from "./schema.ts";
+import type {
+	ListCommand,
+	SendCommand,
+	SendMode,
+	StartCommand,
+	StopCommand,
+	WaitCommand,
+} from "./schema.ts";
+import { buildForkContext, buildInitialPrompt, type ForkContextSummary } from "./thread-context.ts";
 
 const DEFAULT_MAX_DEPTH = 2;
 const DEFAULT_MAX_THREADS = 8;
@@ -27,17 +42,24 @@ const PROMPT_ACCEPT_TIMEOUT_MS = 4_000;
 const RPC_QUICK_TIMEOUT_MS = 1_500;
 const RPC_SEND_TIMEOUT_MS = 5_000;
 const STOP_GRACE_MS = 1_500;
+const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
+const WAIT_POLL_INTERVAL_MS = 250;
+const DEFAULT_FORK_CONTEXT_MAX_CHARS = 24_000;
 
 type ThreadBase = {
 	readonly id: ThreadId;
 	readonly name: string;
+	readonly taskName: string;
+	readonly path: ThreadPath;
+	readonly parentPath: ThreadPath;
+	readonly parentThreadId: ThreadId | null;
+	readonly depth: number;
 	readonly cwd: string;
 	readonly args: readonly string[];
 	readonly createdAt: string;
 	lastEventAt: string;
 	session: ThreadSession;
 	lastAssistantText: string | null;
-	lastPartialText: string | null;
 	recentEvents: ThreadEvent[];
 	stderrTail: string;
 };
@@ -48,7 +70,9 @@ type LiveThread = ThreadBase & {
 	readonly pid: number;
 	readonly child: ChildProcessWithoutNullStreams;
 	readonly rpc: RpcClient;
+	lastPartialText: string | null;
 	stopRequested: boolean;
+	hasRun: boolean;
 	readonly closed: Promise<void>;
 	readonly resolveClosed: () => void;
 };
@@ -64,6 +88,7 @@ export type StartOutcome = {
 	readonly kind: "started";
 	readonly promptAccepted: boolean;
 	readonly note: string | null;
+	readonly forkContext: ForkContextSummary;
 	readonly thread: ThreadSnapshot;
 };
 
@@ -80,30 +105,85 @@ export type StopOutcome = {
 	readonly thread: ThreadSnapshot;
 };
 
+export type WaitOutcome = {
+	readonly kind: "waited";
+	readonly timedOut: boolean;
+	readonly waitedMs: number;
+	readonly thread: ThreadSnapshot;
+};
+
 export class ThreadManager {
 	readonly #threads = new Map<ThreadId, ManagedThread>();
 	readonly #depth: number;
 	readonly #maxDepth: number;
 	readonly #maxThreads: number;
+	readonly #selfThreadId: ThreadId | null;
+	readonly #currentPath: ThreadPath;
+	readonly #rootSessionId: string;
+	readonly #forkContextMaxChars: number;
 
 	constructor(environment: NodeJS.ProcessEnv = process.env) {
 		this.#depth = readInteger(environment["PI_THREADS_DEPTH"], 0);
 		this.#maxDepth = readInteger(environment["PI_THREADS_MAX_DEPTH"], DEFAULT_MAX_DEPTH);
 		this.#maxThreads = readInteger(environment["PI_THREADS_MAX_THREADS"], DEFAULT_MAX_THREADS);
+		this.#selfThreadId = readOptionalThreadId(environment["PI_THREADS_SELF_ID"]);
+		this.#currentPath = readThreadPath(environment["PI_THREADS_PATH"], ROOT_THREAD_PATH);
+		this.#rootSessionId = environment["PI_THREADS_ROOT_SESSION_ID"] ?? `root_${process.pid}`;
+		this.#forkContextMaxChars = readInteger(
+			environment["PI_THREADS_FORK_CONTEXT_MAX_CHARS"],
+			DEFAULT_FORK_CONTEXT_MAX_CHARS,
+		);
 	}
 
-	list(): readonly ThreadSnapshot[] {
-		return Array.from(this.#threads.values(), (thread) => snapshot(thread));
+	list(command?: ListCommand): readonly ThreadSnapshot[] {
+		let threads = Array.from(this.#threads.values());
+
+		const state = command?.state ?? "all";
+		if (state !== "all") threads = threads.filter((thread) => thread.state === state);
+
+		const parent = command && "parent" in command ? command.parent : undefined;
+		if (parent !== undefined) {
+			const parentPath = this.#resolvePathReference(parent);
+			threads = threads.filter((thread) => thread.parentPath === parentPath);
+		}
+
+		const ancestor = command && "ancestor" in command ? command.ancestor : undefined;
+		if (ancestor !== undefined) {
+			const ancestorPath = this.#resolvePathReference(ancestor);
+			threads = threads.filter(
+				(thread) => thread.path !== ancestorPath && thread.path.startsWith(`${ancestorPath}/`),
+			);
+		}
+
+		threads.sort((left, right) => left.path.localeCompare(right.path));
+		return threads.map((thread) => snapshot(thread));
 	}
 
 	async start(command: StartCommand, ctx: ExtensionContext): Promise<StartOutcome> {
 		this.#assertStartAllowed();
 
 		const id = newThreadId();
-		const name = command.name ?? id;
+		const taskName = command.taskName ?? id;
+		assertTaskName(taskName);
+		const threadPath = joinThreadPath(this.#currentPath, taskName);
+		this.#assertPathAvailable(threadPath);
+
+		const name = command.name ?? command.taskName ?? id;
 		const cwd = resolveCwd(ctx.cwd, command.cwd);
 		const extraArgs = command.args ?? [];
 		assertAllowedExtraArgs(extraArgs);
+		const forkContext = buildForkContext(
+			ctx,
+			command.forkTurns ?? "none",
+			this.#forkContextMaxChars,
+		);
+		const initialPrompt = buildInitialPrompt({
+			prompt: command.prompt,
+			threadId: id,
+			threadPath,
+			parentPath: this.#currentPath,
+			forkContextText: forkContext.text,
+		});
 
 		const argv = buildPiArgs({
 			name,
@@ -115,7 +195,13 @@ export class ThreadManager {
 			...process.env,
 			PI_THREADS_DEPTH: String(this.#depth + 1),
 			PI_THREADS_MAX_DEPTH: String(this.#maxDepth),
-			PI_THREADS_PARENT_ID: id,
+			PI_THREADS_MAX_THREADS: String(this.#maxThreads),
+			PI_THREADS_SELF_ID: id,
+			PI_THREADS_PARENT_ID: this.#selfThreadId ?? "",
+			PI_THREADS_PARENT_THREAD_ID: this.#selfThreadId ?? "",
+			PI_THREADS_PARENT_PATH: this.#currentPath,
+			PI_THREADS_PATH: threadPath,
+			PI_THREADS_ROOT_SESSION_ID: this.#rootSessionId,
 		};
 
 		const child = spawn(invocation.command, invocation.args, {
@@ -136,6 +222,11 @@ export class ThreadManager {
 			state: "live",
 			id,
 			name,
+			taskName,
+			path: threadPath,
+			parentPath: this.#currentPath,
+			parentThreadId: this.#selfThreadId,
+			depth: this.#depth + 1,
 			cwd,
 			args: [...extraArgs],
 			createdAt: nowIso(),
@@ -150,6 +241,7 @@ export class ThreadManager {
 			child,
 			rpc: new RpcClient(child, (event) => this.#handleRpcEvent(id, event)),
 			stopRequested: false,
+			hasRun: false,
 			closed: closedDeferred.promise,
 			resolveClosed: closedDeferred.resolve,
 		};
@@ -182,31 +274,39 @@ export class ThreadManager {
 		let promptAccepted = false;
 		try {
 			const response = await thread.rpc.request(
-				{ type: "prompt", message: command.prompt },
+				{ type: "prompt", message: initialPrompt },
 				PROMPT_ACCEPT_TIMEOUT_MS,
 			);
 			promptAccepted = response.success;
-			if (!response.success) note = response.error ?? "Prompt was rejected by child Pi.";
+			if (!response.success) {
+				thread.phase = "idle";
+				note = response.error ?? "Prompt was rejected by child Pi.";
+			}
 		} catch (error) {
 			note = error instanceof Error ? error.message : String(error);
 		}
 
-		return { kind: "started", promptAccepted, note, thread: snapshot(this.#required(id)) };
+		return {
+			kind: "started",
+			promptAccepted,
+			note,
+			forkContext: forkContext.summary,
+			thread: snapshot(this.#required(id)),
+		};
 	}
 
 	async poll(idText: string): Promise<ThreadSnapshot> {
-		const id = asThreadId(idText);
-		const thread = this.#required(id);
+		const thread = this.#requiredByTarget(idText);
 
 		if (thread.state === "live") {
 			await this.#refreshState(thread);
 		}
 
-		return snapshot(this.#required(id));
+		return snapshot(this.#required(thread.id));
 	}
 
 	async send(command: SendCommand): Promise<SendOutcome> {
-		const thread = this.#live(command.id);
+		const thread = this.#liveByTarget(command.id);
 		const mode = command.mode ?? defaultSendMode(thread.phase);
 		const response = await sendMessage(thread, mode, command.message);
 
@@ -220,8 +320,8 @@ export class ThreadManager {
 	}
 
 	async stop(command: StopCommand): Promise<StopOutcome> {
-		const id = asThreadId(command.id);
-		const thread = this.#required(id);
+		const thread = this.#requiredByTarget(command.id);
+		const id = thread.id;
 
 		if (thread.state === "closed") return { kind: "stopped", thread: snapshot(thread) };
 
@@ -240,6 +340,48 @@ export class ThreadManager {
 
 		await Promise.race([thread.closed, delay(STOP_GRACE_MS)]);
 		return { kind: "stopped", thread: snapshot(this.#required(id)) };
+	}
+
+	async wait(command: WaitCommand): Promise<WaitOutcome> {
+		const startedAt = Date.now();
+		const timeoutMs = command.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
+		const id = this.#requiredByTarget(command.id).id;
+
+		for (;;) {
+			const thread = this.#required(id);
+			// eslint-disable-next-line no-await-in-loop -- wait intentionally observes one thread over time.
+			if (thread.state === "live") await this.#refreshState(thread);
+
+			const refreshed = this.#required(id);
+			if (isSettled(refreshed)) {
+				return {
+					kind: "waited",
+					timedOut: false,
+					waitedMs: Date.now() - startedAt,
+					thread: snapshot(refreshed),
+				};
+			}
+
+			const elapsedMs = Date.now() - startedAt;
+			const remainingMs = timeoutMs - elapsedMs;
+			if (remainingMs <= 0) {
+				return {
+					kind: "waited",
+					timedOut: true,
+					waitedMs: elapsedMs,
+					thread: snapshot(refreshed),
+				};
+			}
+
+			const sleepMs = Math.min(WAIT_POLL_INTERVAL_MS, remainingMs);
+			if (refreshed.state === "live") {
+				// eslint-disable-next-line no-await-in-loop -- wait intentionally sleeps between status checks.
+				await Promise.race([refreshed.closed, delay(sleepMs)]);
+			} else {
+				// eslint-disable-next-line no-await-in-loop -- wait intentionally sleeps between status checks.
+				await delay(sleepMs);
+			}
+		}
 	}
 
 	async shutdown(): Promise<void> {
@@ -277,10 +419,79 @@ export class ThreadManager {
 		return thread;
 	}
 
-	#live(idText: string): LiveThread {
-		const thread = this.#required(asThreadId(idText));
-		if (thread.state === "closed") throw new Error(`Thread is closed: ${idText}`);
+	#requiredByTarget(target: string): ManagedThread {
+		return this.#required(this.#resolveTarget(target));
+	}
+
+	#liveByTarget(target: string): LiveThread {
+		const thread = this.#requiredByTarget(target);
+		if (thread.state === "closed") throw new Error(`Thread is closed: ${target}`);
 		return thread;
+	}
+
+	#resolveTarget(targetText: string): ThreadId {
+		const target = targetText.trim();
+		if (isThreadIdText(target)) return asThreadId(target);
+
+		const pathReference = this.#tryResolvePathReference(target);
+		if (pathReference !== null) {
+			const thread = Array.from(this.#threads.values()).find(
+				(candidate) => candidate.path === pathReference,
+			);
+			if (thread) return thread.id;
+		}
+
+		const matches = Array.from(this.#threads.values()).filter(
+			(thread) =>
+				thread.taskName === target ||
+				threadPathBasename(thread.path) === target ||
+				thread.name === target,
+		);
+		if (matches.length === 1) return matches[0]!.id;
+		if (matches.length > 1) {
+			throw new Error(
+				`Ambiguous thread reference ${targetText}; use one of: ${matches
+					.map((thread) => thread.path)
+					.join(", ")}`,
+			);
+		}
+
+		throw new Error(`Unknown thread reference: ${targetText}`);
+	}
+
+	#resolvePathReference(reference: string): ThreadPath {
+		const trimmed = reference.trim();
+		if (trimmed === "." || trimmed === "self") return this.#currentPath;
+		if (isThreadIdText(trimmed)) {
+			const id = asThreadId(trimmed);
+			if (this.#selfThreadId === id) return this.#currentPath;
+			return this.#required(id).path;
+		}
+
+		const pathReference = this.#tryResolvePathReference(reference);
+		if (pathReference !== null) return pathReference;
+
+		const thread = this.#requiredByTarget(reference);
+		return thread.path;
+	}
+
+	#tryResolvePathReference(referenceText: string): ThreadPath | null {
+		const reference = referenceText.trim();
+		try {
+			if (reference.startsWith("/")) return asThreadPath(reference);
+			if (reference.startsWith("root/")) return asThreadPath(`/${reference}`);
+			if (reference.includes("/")) return asThreadPath(`${this.#currentPath}/${reference}`);
+			return joinThreadPath(this.#currentPath, reference);
+		} catch {
+			return null;
+		}
+	}
+
+	#assertPathAvailable(threadPath: ThreadPath): void {
+		const existing = Array.from(this.#threads.values()).find(
+			(thread) => thread.path === threadPath,
+		);
+		if (existing) throw new Error(`Thread path already exists: ${threadPath}`);
 	}
 
 	#closeThread(id: ThreadId, exit: ThreadExit): void {
@@ -291,13 +502,17 @@ export class ThreadManager {
 			state: "closed",
 			id: thread.id,
 			name: thread.name,
+			taskName: thread.taskName,
+			path: thread.path,
+			parentPath: thread.parentPath,
+			parentThreadId: thread.parentThreadId,
+			depth: thread.depth,
 			cwd: thread.cwd,
 			args: thread.args,
 			createdAt: thread.createdAt,
 			lastEventAt: nowIso(),
 			session: thread.session,
 			lastAssistantText: thread.lastAssistantText,
-			lastPartialText: null,
 			recentEvents: thread.recentEvents,
 			stderrTail: thread.stderrTail,
 			exit,
@@ -326,6 +541,7 @@ export class ThreadManager {
 		switch (type) {
 			case "agent_start": {
 				thread.phase = "busy";
+				thread.hasRun = true;
 				pushEvent(thread, { kind: "state", at: nowIso(), message: "agent started" });
 				return;
 			}
@@ -374,7 +590,6 @@ export class ThreadManager {
 				const requestId = stringField(event, "id");
 				const method = stringField(event, "method") ?? "unknown";
 				const shouldAutoCancel = requestId !== null && isDialogUiMethod(method);
-				if (requestId !== null && !shouldAutoCancel) thread.phase = "waiting_for_ui";
 				pushEvent(thread, {
 					kind: "ui",
 					at: nowIso(),
@@ -417,8 +632,18 @@ export class ThreadManager {
 		}
 
 		const isStreaming = response.data["isStreaming"] === true;
-		if (thread.phase !== "stopping" && thread.phase !== "waiting_for_ui")
-			thread.phase = isStreaming ? "busy" : "idle";
+		if (isStreaming) thread.hasRun = true;
+		if (thread.phase !== "stopping") {
+			if (isStreaming) {
+				thread.phase = "busy";
+			} else if (
+				thread.phase !== "starting" ||
+				thread.hasRun ||
+				thread.lastAssistantText !== null
+			) {
+				thread.phase = "idle";
+			}
+		}
 	}
 }
 
@@ -464,6 +689,11 @@ function snapshot(thread: ManagedThread): ThreadSnapshot {
 			state: "closed",
 			id: thread.id,
 			name: thread.name,
+			taskName: thread.taskName,
+			path: thread.path,
+			parentPath: thread.parentPath,
+			parentThreadId: thread.parentThreadId,
+			depth: thread.depth,
 			cwd: thread.cwd,
 			args: [...thread.args],
 			createdAt: thread.createdAt,
@@ -480,6 +710,11 @@ function snapshot(thread: ManagedThread): ThreadSnapshot {
 		state: "live",
 		id: thread.id,
 		name: thread.name,
+		taskName: thread.taskName,
+		path: thread.path,
+		parentPath: thread.parentPath,
+		parentThreadId: thread.parentThreadId,
+		depth: thread.depth,
 		cwd: thread.cwd,
 		args: [...thread.args],
 		createdAt: thread.createdAt,
@@ -508,6 +743,10 @@ function resolveCwd(parentCwd: string, childCwd: string | undefined): string {
 
 function defaultSendMode(phase: ThreadPhase): SendMode {
 	return phase === "idle" ? "prompt" : "follow_up";
+}
+
+function isSettled(thread: ManagedThread): boolean {
+	return thread.state === "closed" || thread.phase === "idle";
 }
 
 async function sendMessage(thread: LiveThread, mode: SendMode, message: string) {
@@ -566,6 +805,24 @@ function readInteger(value: string | undefined, fallback: number): number {
 	if (value === undefined) return fallback;
 	const parsed = Number.parseInt(value, 10);
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function readOptionalThreadId(value: string | undefined): ThreadId | null {
+	if (value === undefined || value === "") return null;
+	try {
+		return asThreadId(value);
+	} catch {
+		return null;
+	}
+}
+
+function readThreadPath(value: string | undefined, fallback: ThreadPath): ThreadPath {
+	if (value === undefined || value === "") return fallback;
+	try {
+		return asThreadPath(value);
+	} catch {
+		return fallback;
+	}
 }
 
 function isDialogUiMethod(method: string): boolean {

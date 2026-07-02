@@ -1,27 +1,36 @@
 import type { ThreadEvent, ThreadSnapshot } from "./domain.ts";
-import type { SendOutcome, StartOutcome, StopOutcome } from "./thread-manager.ts";
+import type { SendOutcome, StartOutcome, StopOutcome, WaitOutcome } from "./thread-manager.ts";
 
 export function formatStart(outcome: StartOutcome): string {
 	const lines = [
 		`Started Pi thread ${outcome.thread.id} (${outcome.thread.name}).`,
+		`Path: ${outcome.thread.path}`,
 		`Status: ${formatStatus(outcome.thread)}`,
 		`Prompt accepted: ${outcome.promptAccepted ? "yes" : "no"}`,
 	];
+	if (outcome.forkContext.mode !== "none") {
+		lines.push(
+			`Fork context: ${outcome.forkContext.requested} (${outcome.forkContext.includedMessages} messages${outcome.forkContext.truncated ? ", truncated" : ""})`,
+		);
+	}
 	if (outcome.note !== null) lines.push(`Note: ${outcome.note}`);
 	lines.push(`Poll with: { "action": "poll", "id": "${outcome.thread.id}" }`);
 	return lines.join("\n");
 }
 
 export function formatList(threads: readonly ThreadSnapshot[]): string {
-	if (threads.length === 0) return "No Pi threads are running in this parent session.";
+	if (threads.length === 0) return "No Pi threads are managed by this parent session.";
 	return threads
-		.map((thread) => `${thread.id} (${thread.name}) - ${formatStatus(thread)}`)
+		.map((thread) => `${thread.id} ${thread.path} (${thread.name}) - ${formatStatus(thread)}`)
 		.join("\n");
 }
 
 export function formatPoll(thread: ThreadSnapshot): string {
 	const lines = [
 		`Pi thread ${thread.id} (${thread.name})`,
+		`Path: ${thread.path}`,
+		`Parent: ${thread.parentPath}${thread.parentThreadId ? ` (${thread.parentThreadId})` : ""}`,
+		`Depth: ${thread.depth}`,
 		`Status: ${formatStatus(thread)}`,
 		`Cwd: ${thread.cwd}`,
 	];
@@ -59,6 +68,11 @@ export function formatSend(outcome: SendOutcome): string {
 
 export function formatStop(outcome: StopOutcome): string {
 	return `Stopped ${outcome.thread.id}.\nStatus: ${formatStatus(outcome.thread)}`;
+}
+
+export function formatWait(outcome: WaitOutcome): string {
+	const status = outcome.timedOut ? "timed out" : "completed";
+	return `Wait ${status} after ${outcome.waitedMs}ms for ${outcome.thread.id}.\nStatus: ${formatStatus(outcome.thread)}`;
 }
 
 function formatStatus(thread: ThreadSnapshot): string {

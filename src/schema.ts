@@ -8,6 +8,18 @@ export const SendModeSchema = StringEnum(["prompt", "steer", "follow_up"] as con
 		"How to deliver a message to the child session. Omit to send immediately when idle and follow_up when busy.",
 });
 
+export const ListStateSchema = StringEnum(["all", "live", "closed"] as const, {
+	description: "Filter listed threads by runtime state.",
+});
+
+export const ForkTurnsSchema = Type.String({
+	pattern: "^(none|all|[1-9][0-9]*)$",
+	description:
+		"How much parent conversation context to include in the child prompt: none, all, or a positive number of recent user turns.",
+});
+
+const TargetDescription = "Thread id, canonical path (/root/task), or unambiguous task name.";
+
 export const StartCommandSchema = Type.Object(
 	{
 		action: Type.Literal("start", { description: "Start a new child Pi session." }),
@@ -18,6 +30,14 @@ export const StartCommandSchema = Type.Object(
 		name: Type.Optional(
 			Type.String({ minLength: 1, description: "Display name for the child Pi session." }),
 		),
+		taskName: Type.Optional(
+			Type.String({
+				pattern: "^[a-z0-9][a-z0-9_]{0,63}$",
+				description:
+					"Stable task name segment for the child thread path. Use lowercase letters, digits, and underscores.",
+			}),
+		),
+		forkTurns: Type.Optional(ForkTurnsSchema),
 		args: Type.Optional(
 			Type.Array(Type.String(), {
 				description:
@@ -31,19 +51,46 @@ export const StartCommandSchema = Type.Object(
 	Strict,
 );
 
-export const ListCommandSchema = Type.Object(
+const ListFields = {
+	action: Type.Literal("list", {
+		description: "List child Pi sessions managed by this parent session.",
+	}),
+	state: Type.Optional(ListStateSchema),
+} as const;
+
+export const ListCommandSchema = Type.Union(
+	[
+		Type.Object(ListFields, Strict),
+		Type.Object(
+			{
+				...ListFields,
+				parent: Type.String({
+					minLength: 1,
+					description: "Only list direct children of this path or thread.",
+				}),
+			},
+			Strict,
+		),
+		Type.Object(
+			{
+				...ListFields,
+				ancestor: Type.String({
+					minLength: 1,
+					description: "Only list descendants of this path or thread.",
+				}),
+			},
+			Strict,
+		),
+	],
 	{
-		action: Type.Literal("list", {
-			description: "List child Pi sessions managed by this parent session.",
-		}),
+		description: "List child Pi sessions. parent and ancestor filters are mutually exclusive.",
 	},
-	Strict,
 );
 
 export const PollCommandSchema = Type.Object(
 	{
 		action: Type.Literal("poll", { description: "Poll one child Pi session." }),
-		id: Type.String({ minLength: 1, description: "Thread id returned by start or list." }),
+		id: Type.String({ minLength: 1, description: TargetDescription }),
 	},
 	Strict,
 );
@@ -51,7 +98,7 @@ export const PollCommandSchema = Type.Object(
 export const SendCommandSchema = Type.Object(
 	{
 		action: Type.Literal("send", { description: "Send a message to a child Pi session." }),
-		id: Type.String({ minLength: 1, description: "Thread id returned by start or list." }),
+		id: Type.String({ minLength: 1, description: TargetDescription }),
 		message: Type.String({ minLength: 1, description: "Message to send to the child session." }),
 		mode: Type.Optional(SendModeSchema),
 	},
@@ -61,7 +108,7 @@ export const SendCommandSchema = Type.Object(
 export const StopCommandSchema = Type.Object(
 	{
 		action: Type.Literal("stop", { description: "Stop a child Pi session." }),
-		id: Type.String({ minLength: 1, description: "Thread id returned by start or list." }),
+		id: Type.String({ minLength: 1, description: TargetDescription }),
 		force: Type.Optional(
 			Type.Boolean({ description: "Use SIGKILL immediately instead of graceful termination." }),
 		),
@@ -69,18 +116,44 @@ export const StopCommandSchema = Type.Object(
 	Strict,
 );
 
+export const WaitCommandSchema = Type.Object(
+	{
+		action: Type.Literal("wait", {
+			description: "Wait until a child Pi session becomes idle, closes, or the timeout expires.",
+		}),
+		id: Type.String({ minLength: 1, description: TargetDescription }),
+		timeoutMs: Type.Optional(
+			Type.Integer({
+				minimum: 0,
+				maximum: 600_000,
+				description: "Maximum time to wait in milliseconds. Defaults to 30000.",
+			}),
+		),
+	},
+	Strict,
+);
+
 export const PiThreadParamsSchema = Type.Union(
-	[StartCommandSchema, ListCommandSchema, PollCommandSchema, SendCommandSchema, StopCommandSchema],
+	[
+		StartCommandSchema,
+		ListCommandSchema,
+		PollCommandSchema,
+		SendCommandSchema,
+		StopCommandSchema,
+		WaitCommandSchema,
+	],
 	{
 		description:
-			"Strict tagged union. Each action accepts only the fields for that action: start, list, poll, send, or stop.",
+			"Strict tagged union. Each action accepts only the fields for that action: start, list, poll, send, wait, or stop.",
 	},
 );
 
 export type SendMode = Static<typeof SendModeSchema>;
+export type ListState = Static<typeof ListStateSchema>;
 export type StartCommand = Static<typeof StartCommandSchema>;
 export type ListCommand = Static<typeof ListCommandSchema>;
 export type PollCommand = Static<typeof PollCommandSchema>;
 export type SendCommand = Static<typeof SendCommandSchema>;
 export type StopCommand = Static<typeof StopCommandSchema>;
+export type WaitCommand = Static<typeof WaitCommandSchema>;
 export type PiThreadParams = Static<typeof PiThreadParamsSchema>;

@@ -1,10 +1,14 @@
 import { randomUUID } from "node:crypto";
 
 declare const threadIdBrand: unique symbol;
+declare const threadPathBrand: unique symbol;
 
 export type ThreadId = string & { readonly [threadIdBrand]: "ThreadId" };
+export type ThreadPath = string & { readonly [threadPathBrand]: "ThreadPath" };
 
-export type ThreadPhase = "starting" | "busy" | "idle" | "waiting_for_ui" | "stopping";
+export const ROOT_THREAD_PATH = asThreadPath("/root");
+
+export type ThreadPhase = "starting" | "busy" | "idle" | "stopping";
 
 export type ThreadSession =
 	| { readonly kind: "unknown" }
@@ -44,6 +48,11 @@ export type LiveThreadSnapshot = {
 	readonly state: "live";
 	readonly id: ThreadId;
 	readonly name: string;
+	readonly taskName: string;
+	readonly path: ThreadPath;
+	readonly parentPath: ThreadPath;
+	readonly parentThreadId: ThreadId | null;
+	readonly depth: number;
 	readonly cwd: string;
 	readonly args: readonly string[];
 	readonly createdAt: string;
@@ -61,6 +70,11 @@ export type ClosedThreadSnapshot = {
 	readonly state: "closed";
 	readonly id: ThreadId;
 	readonly name: string;
+	readonly taskName: string;
+	readonly path: ThreadPath;
+	readonly parentPath: ThreadPath;
+	readonly parentThreadId: ThreadId | null;
+	readonly depth: number;
 	readonly cwd: string;
 	readonly args: readonly string[];
 	readonly createdAt: string;
@@ -84,6 +98,34 @@ export function asThreadId(value: string): ThreadId {
 	}
 
 	return value as ThreadId;
+}
+
+export function isThreadIdText(value: string): boolean {
+	return /^thread_[0-9a-f]{12}$/u.test(value);
+}
+
+export function assertTaskName(value: string): string {
+	if (!/^[a-z0-9][a-z0-9_]{0,63}$/u.test(value)) {
+		throw new Error(`Invalid task name: ${value}. Use lowercase letters, digits, and underscores.`);
+	}
+
+	return value;
+}
+
+export function asThreadPath(value: string): ThreadPath {
+	if (!/^\/root(?:\/[a-z0-9][a-z0-9_]{0,63})*$/u.test(value)) {
+		throw new Error(`Invalid thread path: ${value}`);
+	}
+
+	return value as ThreadPath;
+}
+
+export function joinThreadPath(parent: ThreadPath, taskName: string): ThreadPath {
+	return asThreadPath(`${parent}/${assertTaskName(taskName)}`);
+}
+
+export function threadPathBasename(threadPath: ThreadPath): string {
+	return threadPath.slice(threadPath.lastIndexOf("/") + 1);
 }
 
 export function assertNever(value: never): never {

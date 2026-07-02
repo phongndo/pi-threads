@@ -18,13 +18,23 @@ There are no baked-in roles (no "reviewer", no "planner", no "worker"). Pi decid
 
 Pi calls the `pi_thread` tool with one action:
 
-| Action | What it does |
-|---|---|
-| `start` | Spawn a child Pi session with a prompt. Returns a thread id. |
-| `poll` | Check a thread's status, see its latest output and recent events. |
-| `send` | Send a follow-up message to a running thread. |
-| `list` | List all threads managed by this parent session. |
-| `stop` | Stop a thread gracefully (or forcefully). |
+| Action  | What it does                                                      |
+| ------- | ----------------------------------------------------------------- |
+| `start` | Spawn a child Pi session with a prompt. Returns a thread id.      |
+| `poll`  | Check a thread's status, see its latest output and recent events. |
+| `send`  | Send a follow-up message to a running thread.                     |
+| `wait`  | Wait until a child session is idle/closed or a timeout expires.   |
+| `list`  | List all threads managed by this parent session.                  |
+| `stop`  | Stop a thread gracefully (or forcefully).                         |
+
+Threads also get a stable canonical path like `/root/review_tests`. Pass
+`taskName` on `start` to choose the final path segment, then refer to the thread
+later by id, full path, or unambiguous task name.
+
+`start` accepts `forkTurns` for lightweight context forking into the child
+prompt: `none` (default), `all`, or a positive number of recent user turns.
+This keeps the implementation process-isolated while giving Pi an explicit,
+bounded way to hand context to subthreads when useful.
 
 ## Installation
 
@@ -34,10 +44,11 @@ pi install /path/to/pi-threads
 
 ## Configuration
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `PI_THREADS_MAX_DEPTH` | `2` | How deep threads can spawn threads. |
-| `PI_THREADS_MAX_THREADS` | `8` | Max concurrent live threads per parent. |
+| Variable                            | Default | Purpose                                                |
+| ----------------------------------- | ------- | ------------------------------------------------------ |
+| `PI_THREADS_MAX_DEPTH`              | `2`     | How deep threads can spawn threads.                    |
+| `PI_THREADS_MAX_THREADS`            | `8`     | Max concurrent live threads per parent.                |
+| `PI_THREADS_FORK_CONTEXT_MAX_CHARS` | `24000` | Max parent-context characters included by `forkTurns`. |
 
 ## Safety
 

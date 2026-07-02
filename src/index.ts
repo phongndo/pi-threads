@@ -1,7 +1,14 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { assertNever } from "./domain.ts";
-import { formatList, formatPoll, formatSend, formatStart, formatStop } from "./format.ts";
+import {
+	formatList,
+	formatPoll,
+	formatSend,
+	formatStart,
+	formatStop,
+	formatWait,
+} from "./format.ts";
 import { PiThreadParamsSchema, type PiThreadParams } from "./schema.ts";
 import { ThreadManager } from "./thread-manager.ts";
 
@@ -16,12 +23,14 @@ export default function (pi: ExtensionAPI) {
 		name: "pi_thread",
 		label: "Pi Thread",
 		description:
-			"Start, list, poll, message, and stop child Pi sessions. Input is a strict tagged union keyed by action.",
+			"Start, list, poll, wait for, message, and stop child Pi sessions. Input is a strict tagged union keyed by action.",
 		promptSnippet:
-			"Start, poll, message, list, or stop child Pi sessions for isolated or parallel work.",
+			"Start, poll, message, wait for, list, or stop child Pi sessions for isolated or parallel work.",
 		promptGuidelines: [
 			"Use pi_thread when an independent Pi session would help with isolation, parallel investigation, review, or long-running work.",
-			"Use pi_thread start with a small, concrete prompt; then use pi_thread poll before relying on the child output.",
+			"Use pi_thread start with a small, concrete prompt and a stable lower_snake_case taskName when you may refer to it later.",
+			"Use pi_thread forkTurns only when the child needs parent context; prefer none or a small recent-turn count over all.",
+			"Use pi_thread poll or wait before relying on child output; wait only when blocked on that child result.",
 			"Use pi_thread send for follow-up instructions and pi_thread stop for stale or unnecessary child sessions.",
 			"Avoid runaway spawning: only create child Pi sessions that materially reduce risk, latency, or context pressure.",
 		],
@@ -39,7 +48,7 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 				case "list": {
-					const threads = manager.list();
+					const threads = manager.list(params);
 					return {
 						content: [{ type: "text", text: formatList(threads) }],
 						details: { kind: "listed", threads },
@@ -66,6 +75,13 @@ export default function (pi: ExtensionAPI) {
 						details: outcome,
 					};
 				}
+				case "wait": {
+					const outcome = await manager.wait(params);
+					return {
+						content: [{ type: "text", text: formatWait(outcome) }],
+						details: outcome,
+					};
+				}
 				default:
 					assertNever(params);
 			}
@@ -75,8 +91,10 @@ export default function (pi: ExtensionAPI) {
 			const action = typeof args.action === "string" ? args.action : "unknown";
 			const id = "id" in args && typeof args.id === "string" ? ` ${args.id}` : "";
 			const name = "name" in args && typeof args.name === "string" ? ` ${args.name}` : "";
+			const taskName =
+				"taskName" in args && typeof args.taskName === "string" ? ` ${args.taskName}` : "";
 			return new Text(
-				`${theme.fg("toolTitle", theme.bold("pi_thread"))} ${theme.fg("accent", action)}${id}${name}`,
+				`${theme.fg("toolTitle", theme.bold("pi_thread"))} ${theme.fg("accent", action)}${id}${taskName}${name}`,
 				0,
 				0,
 			);
