@@ -9,7 +9,7 @@ import {
 	formatStop,
 	formatWait,
 } from "./format.ts";
-import { PiThreadParamsSchema, type PiThreadParams } from "./schema.ts";
+import { assertPiThreadParams, PiThreadParamsSchema } from "./schema.ts";
 import { ThreadManager } from "./thread-manager.ts";
 import {
 	PI_THREAD_DESCRIPTION,
@@ -33,7 +33,8 @@ export default function (pi: ExtensionAPI) {
 		parameters: PiThreadParamsSchema,
 
 		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
-			const params = rawParams as PiThreadParams;
+			assertPiThreadParams(rawParams);
+			const params = rawParams;
 
 			switch (params.action) {
 				case "start": {

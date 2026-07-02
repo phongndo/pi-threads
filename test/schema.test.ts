@@ -1,10 +1,21 @@
 import { Value } from "typebox/value";
 import { describe, expect, it } from "vitest";
 import { ROOT_THREAD_PATH, asThreadId, asThreadPath, joinThreadPath } from "../src/domain.ts";
-import { PiThreadParamsSchema, type PiThreadParams } from "../src/schema.ts";
+import {
+	assertPiThreadParams,
+	PiThreadParamsSchema,
+	StrictPiThreadParamsSchema,
+	type PiThreadParams,
+} from "../src/schema.ts";
 import { assertAllowedExtraArgs, buildPiArgs } from "../src/thread-manager.ts";
 
-describe("pi_thread tagged union schema", () => {
+describe("pi_thread schemas", () => {
+	it("exposes an object-root provider schema", () => {
+		expect(PiThreadParamsSchema.type).toBe("object");
+		expect("anyOf" in PiThreadParamsSchema).toBe(false);
+		expect("oneOf" in PiThreadParamsSchema).toBe(false);
+	});
+
 	it("accepts each valid action shape", () => {
 		const valid: readonly PiThreadParams[] = [
 			{ action: "start", prompt: "Inspect the repo", taskName: "inspect_repo", forkTurns: "2" },
@@ -15,10 +26,14 @@ describe("pi_thread tagged union schema", () => {
 			{ action: "stop", id: "thread_012345abcdef", force: true },
 		];
 
-		for (const input of valid) expect(Value.Check(PiThreadParamsSchema, input)).toBe(true);
+		for (const input of valid) {
+			expect(Value.Check(PiThreadParamsSchema, input)).toBe(true);
+			expect(Value.Check(StrictPiThreadParamsSchema, input)).toBe(true);
+			expect(() => assertPiThreadParams(input)).not.toThrow();
+		}
 	});
 
-	it("rejects impossible action/field combinations", () => {
+	it("strictly rejects impossible action/field combinations", () => {
 		const invalid = [
 			{ action: "start", id: "thread_012345abcdef" },
 			{ action: "list", id: "thread_012345abcdef" },
@@ -32,7 +47,10 @@ describe("pi_thread tagged union schema", () => {
 			{ action: "unknown" },
 		] as const;
 
-		for (const input of invalid) expect(Value.Check(PiThreadParamsSchema, input)).toBe(false);
+		for (const input of invalid) {
+			expect(Value.Check(StrictPiThreadParamsSchema, input)).toBe(false);
+			expect(() => assertPiThreadParams(input)).toThrow(/Invalid pi_thread parameters/u);
+		}
 	});
 });
 
