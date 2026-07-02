@@ -50,6 +50,26 @@ bounded way to hand context to subthreads when useful.
 
 ## Installation
 
+From npm:
+
+```bash
+pi install npm:@phongndo/pi-threads
+```
+
+To try it for one Pi run without installing:
+
+```bash
+pi -e npm:@phongndo/pi-threads
+```
+
+For a project-local/team install, run from the project root:
+
+```bash
+pi install -l npm:@phongndo/pi-threads
+```
+
+From a local checkout during development:
+
 ```bash
 pi install /path/to/pi-threads
 ```
