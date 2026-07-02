@@ -18,7 +18,7 @@ export function buildInitialPrompt(input: {
 	readonly forkContextText: string | null;
 }): string {
 	const lines = [
-		"You are a child Pi thread started by the pi_thread tool.",
+		"You are a child Pi thread started by the thread tool.",
 		`Thread id: ${input.threadId}`,
 		`Canonical task path: ${input.threadPath}`,
 		`Parent path: ${input.parentPath}`,

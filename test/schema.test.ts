@@ -9,7 +9,7 @@ import {
 } from "../src/schema.ts";
 import { assertAllowedExtraArgs, buildPiArgs } from "../src/thread-manager.ts";
 
-describe("pi_thread schemas", () => {
+describe("thread schemas", () => {
 	it("exposes an object-root provider schema", () => {
 		expect(PiThreadParamsSchema.type).toBe("object");
 		expect("anyOf" in PiThreadParamsSchema).toBe(false);
@@ -49,7 +49,7 @@ describe("pi_thread schemas", () => {
 
 		for (const input of invalid) {
 			expect(Value.Check(StrictPiThreadParamsSchema, input)).toBe(false);
-			expect(() => assertPiThreadParams(input)).toThrow(/Invalid pi_thread parameters/u);
+			expect(() => assertPiThreadParams(input)).toThrow(/Invalid thread parameters/u);
 		}
 	});
 });

@@ -222,12 +222,12 @@ type Action = Static<typeof ActionSchema>;
 
 export function assertPiThreadParams(value: unknown): asserts value is PiThreadParams {
 	if (Value.Check(StrictPiThreadParamsSchema, value)) return;
-	if (!isRecord(value)) throw new Error("Invalid pi_thread parameters: expected object");
+	if (!isRecord(value)) throw new Error("Invalid thread parameters: expected object");
 
 	const action = value["action"];
 	if (!isAction(action)) {
 		throw new Error(
-			"Invalid pi_thread parameters: action must be start, list, poll, send, stop, or wait",
+			"Invalid thread parameters: action must be start, list, poll, send, stop, or wait",
 		);
 	}
 
@@ -235,20 +235,20 @@ export function assertPiThreadParams(value: unknown): asserts value is PiThreadP
 	const unexpected = Object.keys(value).filter((field) => !allowed.has(field));
 	if (unexpected.length > 0) {
 		throw new Error(
-			`Invalid pi_thread parameters for ${action}: unexpected field${unexpected.length === 1 ? "" : "s"} ${unexpected.join(", ")}`,
+			`Invalid thread parameters for ${action}: unexpected field${unexpected.length === 1 ? "" : "s"} ${unexpected.join(", ")}`,
 		);
 	}
 
 	const missing = requiredFieldsForAction(action).filter((field) => !(field in value));
 	if (missing.length > 0) {
 		throw new Error(
-			`Invalid pi_thread parameters for ${action}: missing required field${missing.length === 1 ? "" : "s"} ${missing.join(", ")}`,
+			`Invalid thread parameters for ${action}: missing required field${missing.length === 1 ? "" : "s"} ${missing.join(", ")}`,
 		);
 	}
 
 	if (action === "list" && "parent" in value && "ancestor" in value) {
 		throw new Error(
-			"Invalid pi_thread parameters for list: parent and ancestor are mutually exclusive",
+			"Invalid thread parameters for list: parent and ancestor are mutually exclusive",
 		);
 	}
 
@@ -257,7 +257,7 @@ export function assertPiThreadParams(value: unknown): asserts value is PiThreadP
 		.slice(0, 5)
 		.map((error) => error.message)
 		.join("; ");
-	throw new Error(`Invalid pi_thread parameters${summary ? `: ${summary}` : ""}`);
+	throw new Error(`Invalid thread parameters${summary ? `: ${summary}` : ""}`);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -9,7 +9,7 @@ There are no baked-in roles (no "reviewer", no "planner", no "worker"). Pi decid
 ## How Pi learns to use it
 
 This extension teaches Pi through the tool metadata in `src/prompt.ts`, not by
-expecting the user to mention threads. The `pi_thread` tool contributes a prompt
+expecting the user to mention threads. The `thread` tool contributes a prompt
 snippet plus usage guidelines that tell Pi to use threads proactively when they
 materially improve the workflow: sidecar research, parallel independent tasks,
 bounded implementation slices, or second-pass review.
@@ -28,7 +28,7 @@ when to spawn, what to ask, when to wait, and when to keep work local.
 
 ## Commands
 
-Pi calls the `pi_thread` tool with one action:
+Pi calls the `thread` tool with one action:
 
 | Action  | What it does                                                      |
 | ------- | ----------------------------------------------------------------- |
