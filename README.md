@@ -1,6 +1,6 @@
 # pi-threads
 
-`pi-threads` gives Pi one small recursive primitive: start another Pi session, talk to it, inspect it, and stop it.
+`pi-threads` gives Pi one small recursive primitive: start another Pi session, talk to it, inspect it, and stop it. It lets your Pi agent create **dynamic workflows on its own** — forking, delegating, reviewing, or parallelizing work as it sees fit, without any hard-coded workflow graph.
 
 It intentionally does **not** encode roles, workflows, reviewers, planners, or schedulers. Child sessions are normal Pi RPC sessions in the selected working directory, with normal Pi startup behavior. If this package is installed normally, child sessions can load it normally too; recursion is guarded by depth limits.
 
