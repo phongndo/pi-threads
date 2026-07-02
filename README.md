@@ -6,6 +6,18 @@ Pi threads are normal Pi sessions that run in the background. Your Pi agent can 
 
 There are no baked-in roles (no "reviewer", no "planner", no "worker"). Pi decides what to fork and why. Recursion is supported: child sessions can spawn their own children, guarded by depth and concurrency limits.
 
+## How Pi learns to use it
+
+This extension teaches Pi through the tool metadata in `src/prompt.ts`, not by
+expecting the user to mention threads. The `pi_thread` tool contributes a prompt
+snippet plus usage guidelines that tell Pi to use threads proactively when they
+materially improve the workflow: sidecar research, parallel independent tasks,
+bounded implementation slices, or second-pass review.
+
+The behavior is intentionally emergent rather than workflow-specific. There is
+no fixed planner/reviewer/worker graph; Pi receives enough guidance to decide
+when to spawn, what to ask, when to wait, and when to keep work local.
+
 ## What Pi can do with threads
 
 - **Parallelize** — investigate multiple files, codebases, or approaches at once.

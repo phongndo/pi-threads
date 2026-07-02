@@ -11,6 +11,11 @@ import {
 } from "./format.ts";
 import { PiThreadParamsSchema, type PiThreadParams } from "./schema.ts";
 import { ThreadManager } from "./thread-manager.ts";
+import {
+	PI_THREAD_DESCRIPTION,
+	PI_THREAD_PROMPT_GUIDELINES,
+	PI_THREAD_PROMPT_SNIPPET,
+} from "./prompt.ts";
 
 export default function (pi: ExtensionAPI) {
 	const manager = new ThreadManager();
@@ -22,18 +27,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "pi_thread",
 		label: "Pi Thread",
-		description:
-			"Start, list, poll, wait for, message, and stop child Pi sessions. Input is a strict tagged union keyed by action.",
-		promptSnippet:
-			"Start, poll, message, wait for, list, or stop child Pi sessions for isolated or parallel work.",
-		promptGuidelines: [
-			"Use pi_thread when an independent Pi session would help with isolation, parallel investigation, review, or long-running work.",
-			"Use pi_thread start with a small, concrete prompt and a stable lower_snake_case taskName when you may refer to it later.",
-			"Use pi_thread forkTurns only when the child needs parent context; prefer none or a small recent-turn count over all.",
-			"Use pi_thread poll or wait before relying on child output; wait only when blocked on that child result.",
-			"Use pi_thread send for follow-up instructions and pi_thread stop for stale or unnecessary child sessions.",
-			"Avoid runaway spawning: only create child Pi sessions that materially reduce risk, latency, or context pressure.",
-		],
+		description: PI_THREAD_DESCRIPTION,
+		promptSnippet: PI_THREAD_PROMPT_SNIPPET,
+		promptGuidelines: [...PI_THREAD_PROMPT_GUIDELINES],
 		parameters: PiThreadParamsSchema,
 
 		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
