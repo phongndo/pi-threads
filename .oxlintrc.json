@@ -8,7 +8,15 @@
   },
   "rules": {
     "no-console": "off",
-    "typescript/no-explicit-any": "error"
+    "typescript/no-explicit-any": "error",
+    "no-unused-vars": "error",
+    "typescript/no-unused-vars": "error",
+    "typescript/prefer-as-const": "error",
+    "typescript/prefer-optional-chain": "error",
+    "typescript/no-unnecessary-type-assertion": "error",
+    "unicorn/prefer-node-protocol": "error",
+    "unicorn/no-array-for-each": "warn",
+    "unicorn/no-array-reduce": "warn"
   },
   "env": {
     "builtin": true,

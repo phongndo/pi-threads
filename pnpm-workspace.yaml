@@ -4,6 +4,7 @@ packages:
 allowBuilds:
   "@google/genai": false
   protobufjs: false
+  simple-git-hooks: true
 
 minimumReleaseAgeExclude:
   - "@types/node@26.1.0"
