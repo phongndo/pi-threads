@@ -1,54 +1,56 @@
 # pi-threads
 
-`pi-threads` gives Pi one small recursive primitive: start another Pi session, talk to it, inspect it, and stop it. It lets your Pi agent create **dynamic workflows on its own** — forking, delegating, reviewing, or parallelizing work as it sees fit, without any hard-coded workflow graph.
+Let your Pi agent create **dynamic workflows on its own** — forking, delegating, reviewing, or parallelizing work as it sees fit, with no hard-coded workflow graph.
 
-It intentionally does **not** encode roles, workflows, reviewers, planners, or schedulers. Child sessions are normal Pi RPC sessions in the selected working directory, with normal Pi startup behavior. If this package is installed normally, child sessions can load it normally too; recursion is guarded by depth limits.
+Pi threads are normal Pi sessions that run in the background. Your Pi agent can start them with a prompt, check on their progress, send follow-up messages, and stop them when done — all from within a single conversation. A child thread has its own working directory, its own context window, and its own tool access, so parallel investigations stay isolated and don't bloat the parent session.
 
-## Tool
+There are no baked-in roles (no "reviewer", no "planner", no "worker"). Pi decides what to fork and why. Recursion is supported: child sessions can spawn their own children, guarded by depth and concurrency limits.
 
-The extension registers one tool, `pi_thread`, with a strict tagged-union input:
+## What Pi can do with threads
 
-```ts
-type PiThreadCommand =
-  | { action: "start"; prompt: string; name?: string; args?: string[]; cwd?: string }
-  | { action: "list" }
-  | { action: "poll"; id: string }
-  | { action: "send"; id: string; message: string; mode?: "prompt" | "steer" | "follow_up" }
-  | { action: "stop"; id: string; force?: boolean };
+- **Parallelize** — investigate multiple files, codebases, or approaches at once.
+- **Delegate** — hand off a large, self-contained task so the parent stays focused.
+- **Review** — have one thread produce work and another critique it.
+- **Explore** — spin up a throwaway thread to test an idea without polluting the parent session.
+- **Compose** — chain threads together: one gathers context, another acts on it.
+
+## Commands
+
+Pi calls the `pi_thread` tool with one action:
+
+| Action | What it does |
+|---|---|
+| `start` | Spawn a child Pi session with a prompt. Returns a thread id. |
+| `poll` | Check a thread's status, see its latest output and recent events. |
+| `send` | Send a follow-up message to a running thread. |
+| `list` | List all threads managed by this parent session. |
+| `stop` | Stop a thread gracefully (or forcefully). |
+
+## Installation
+
+```bash
+pi install /path/to/pi-threads
 ```
 
-Invalid combinations like `{ action: "poll", prompt: "..." }` are rejected by schema and by TypeScript.
+## Configuration
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PI_THREADS_MAX_DEPTH` | `2` | How deep threads can spawn threads. |
+| `PI_THREADS_MAX_THREADS` | `8` | Max concurrent live threads per parent. |
+
+## Safety
+
+- Threads are killed when the parent Pi session exits.
+- Interactive prompts (dialogs, confirmations) in headless threads are auto-cancelled.
+- One-shot CLI modes (`--print`, `--export`, etc.) are blocked in child threads.
+- Recursion depth and live-thread count are capped.
 
 ## Development
 
 ```bash
 nix develop
 pnpm install
-pnpm check
-pnpm dev:pi
+pnpm check          # format + lint + typecheck + test
+pnpm dev:pi         # run Pi with the extension loaded locally
 ```
-
-Install locally once it is ready:
-
-```bash
-pi install /Users/dp/code/projects/pi-threads
-```
-
-Useful commands:
-
-```bash
-pnpm oxformat       # format with oxfmt
-pnpm lint           # lint with oxlint
-pnpm typecheck      # strict TypeScript
-pnpm test           # unit tests
-pnpm lsp:ts         # TypeScript LSP
-pnpm lsp:oxlint     # Oxlint LSP
-pnpm lsp:oxformat   # oxfmt LSP
-```
-
-## Runtime safety
-
-- Child sessions run in RPC mode and are killed when the parent Pi session shuts down.
-- Interactive UI requests from child sessions are auto-cancelled and recorded, because the child is headless.
-- Recursion is limited with `PI_THREADS_DEPTH` / `PI_THREADS_MAX_DEPTH` (`2` by default).
-- Extra Pi args are allowed as an escape hatch but cannot override RPC mode or use one-shot CLI modes.
