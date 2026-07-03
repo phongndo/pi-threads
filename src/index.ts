@@ -118,6 +118,15 @@ function formatEvents(events: readonly ThreadEvent[], maxCount: number): string[
 	});
 }
 
+function formatTimeoutMsForTitle(timeoutMs: number): string {
+	if (!Number.isInteger(timeoutMs) || timeoutMs < 1000) return `${timeoutMs}ms`;
+	const wholeSeconds = Math.trunc(timeoutMs / 1000);
+	const milliseconds = timeoutMs % 1000;
+	if (milliseconds === 0) return `${wholeSeconds}s`;
+	const fractionalSeconds = String(milliseconds).padStart(3, "0").replace(/0+$/u, "");
+	return `${wholeSeconds}.${fractionalSeconds}s`;
+}
+
 // ---- Extension entrypoint ----
 
 type ThreadEntryDetails = {
@@ -437,8 +446,7 @@ export default function (pi: ExtensionAPI) {
 							? args["timeoutMs"]
 							: undefined;
 					if (timeoutMs !== undefined) {
-						const seconds = Math.round(timeoutMs / 1000);
-						text += " " + theme.fg("muted", `${seconds}s`);
+						text += " " + theme.fg("muted", formatTimeoutMsForTitle(timeoutMs));
 					}
 					break;
 				}

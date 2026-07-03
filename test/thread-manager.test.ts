@@ -163,4 +163,39 @@ describe("ThreadManager session metadata", () => {
 			}),
 		);
 	});
+
+	it("emits one change notification for a successful poll refresh", async () => {
+		const child = new FakeChildProcess();
+		spawnMock.mockReturnValue(child);
+		attachRpc(child, (request) => {
+			if (request["type"] === "get_state") {
+				respond(child, request, {
+					sessionFile: "/tmp/alpha.jsonl",
+					sessionId: "session-alpha",
+					sessionName: "Alpha",
+					pendingMessageCount: 0,
+					isStreaming: false,
+				});
+				return;
+			}
+
+			if (request["type"] === "prompt") respond(child, request);
+		});
+
+		const manager = new ThreadManager({
+			PI_THREADS_DEPTH: "0",
+			PI_THREADS_MAX_DEPTH: "2",
+			PI_THREADS_MAX_THREADS: "8",
+			PI_THREADS_PATH: "/root",
+			PI_THREADS_ROOT_SESSION_ID: "test-root",
+		} as NodeJS.ProcessEnv);
+		await manager.start({ action: "start", prompt: "work", taskName: "alpha" }, context());
+
+		const onChange = vi.fn();
+		manager.onChange(onChange);
+
+		await manager.poll("/root/alpha");
+
+		expect(onChange).toHaveBeenCalledTimes(1);
+	});
 });

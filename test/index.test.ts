@@ -190,6 +190,35 @@ describe("session shutdown thread lifecycle", () => {
 });
 
 describe("thread tool rendering", () => {
+	it("renders wait timeouts precisely instead of rounding fractional seconds", () => {
+		let renderCall:
+			| ((
+					args: Record<string, unknown>,
+					theme: Theme,
+			  ) => {
+					render: (width: number) => string[];
+			  })
+			| undefined;
+		const pi = {
+			registerCommand: () => undefined,
+			registerMessageRenderer: () => undefined,
+			on: () => undefined,
+			registerTool: (tool: { renderCall: typeof renderCall }) => {
+				renderCall = tool.renderCall;
+			},
+		} as unknown as ExtensionAPI;
+
+		extension(pi);
+
+		const rendered = renderCall?.(
+			{ action: "wait", id: "/root/review_tests", timeoutMs: 1500 },
+			theme,
+		);
+
+		expect(rendered?.render(80).join("\n")).toContain("1.5s");
+		expect(rendered?.render(80).join("\n")).not.toContain("2s");
+	});
+
 	it("renders an expanded empty list instead of a blank component", () => {
 		let renderResult:
 			| ((

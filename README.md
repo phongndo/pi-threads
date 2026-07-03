@@ -55,7 +55,7 @@ thread titles, search, and keyboard controls. Use `↑`/`↓` to navigate, type 
 search, `tab` to cycle filters (`all` → `live` → `closed`), `enter` to enter a
 closed/stopped thread's Pi session, `ctrl+p` to poll/refresh that row, `ctrl+r`
 to refresh the list, `ctrl+x` to stop it, and `esc` to clear search or close.
-The control legend is shown in the browser footer.
+The control legend is shown below the browser title.
 
 When you enter a closed/stopped thread from `/threads`, pi switches to that child
 session and records the parent session. Live threads must be stopped or closed

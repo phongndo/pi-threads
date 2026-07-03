@@ -358,7 +358,7 @@ export class ThreadManager {
 		const thread = this.#requiredByTarget(idText);
 
 		if (thread.state === "live") {
-			await this.#refreshState(thread);
+			await this.#refreshState(thread, { emitChange: false });
 		}
 		this.#emitChange();
 
@@ -708,7 +708,10 @@ export class ThreadManager {
 		if (captureSession(thread, data)) this.#emitChange();
 	}
 
-	async #refreshState(thread: LiveThread): Promise<void> {
+	async #refreshState(
+		thread: LiveThread,
+		options: { readonly emitChange: boolean } = { emitChange: true },
+	): Promise<void> {
 		const data = await this.#requestState(thread, { recordErrors: true });
 		if (data === null) return;
 
@@ -727,7 +730,7 @@ export class ThreadManager {
 				thread.phase = "idle";
 			}
 		}
-		this.#emitChange();
+		if (options.emitChange) this.#emitChange();
 	}
 
 	#emitChange(): void {
