@@ -57,9 +57,9 @@ export function buildForkContext(
 	}
 
 	const branch = ctx.sessionManager.getBranch() as readonly unknown[];
-	const messages = branch.flatMap((entry) => formatContextEntry(entry));
-	const selected = mode.kind === "all" ? messages : selectLastUserTurns(messages, mode.turns);
-	const body = selected.join("\n\n");
+	const selection =
+		mode.kind === "all" ? buildAllContext(branch) : buildLastUserTurnsContext(branch, mode.turns);
+	const body = selection.messages.join("\n\n");
 	const { text, truncated } = truncateTail(body, maxChars);
 	const wrapped =
 		text.trim() === ""
@@ -71,11 +71,42 @@ export function buildForkContext(
 		summary: {
 			mode: mode.kind === "all" ? "all" : "last_n",
 			requested,
-			includedMessages: selected.length,
+			includedMessages: selection.messages.length,
 			truncated,
 			characters: wrapped?.length ?? 0,
 		},
 	};
+}
+
+function buildAllContext(branch: readonly unknown[]): { readonly messages: readonly string[] } {
+	const messages: string[] = [];
+	for (const entry of branch) {
+		const message = formatContextEntry(entry);
+		if (message !== null) messages.push(message);
+	}
+	return { messages };
+}
+
+function buildLastUserTurnsContext(
+	branch: readonly unknown[],
+	turns: number,
+): { readonly messages: readonly string[] } {
+	const messages: string[] = [];
+	let seenUserTurns = 0;
+
+	for (let index = branch.length - 1; index >= 0; index -= 1) {
+		const message = formatContextEntry(branch[index]);
+		if (message === null) continue;
+
+		messages.push(message);
+		if (message.startsWith("[user]\n")) {
+			seenUserTurns += 1;
+			if (seenUserTurns === turns) break;
+		}
+	}
+
+	messages.reverse();
+	return { messages };
 }
 
 function forkContextMode(
@@ -91,16 +122,18 @@ function forkContextMode(
 	throw new Error("forkTurns must be `none`, `all`, or a positive integer string");
 }
 
-function formatContextEntry(entry: unknown): readonly string[] {
-	if (!isRecord(entry) || entry["type"] !== "message" || !isRecord(entry["message"])) return [];
+function formatContextEntry(entry: unknown): string | null {
+	if (!isRecord(entry) || entry["type"] !== "message" || !isRecord(entry["message"])) {
+		return null;
+	}
 	const message = entry["message"];
 	const role = stringField(message, "role") ?? "message";
 	const text = messageToText(message);
-	if (text.trim() === "") return [];
+	if (text.trim() === "") return null;
 
 	const toolName = role === "toolResult" ? stringField(message, "toolName") : null;
 	const label = toolName === null ? role : `${role}:${toolName}`;
-	return [`[${label}]\n${trimContextMessage(text)}`];
+	return `[${label}]\n${trimContextMessage(text)}`;
 }
 
 function messageToText(message: Record<string, unknown>): string {
@@ -125,18 +158,6 @@ function messageToText(message: Record<string, unknown>): string {
 
 	if (typeof message["output"] === "string") return message["output"];
 	return "";
-}
-
-function selectLastUserTurns(messages: readonly string[], turns: number): readonly string[] {
-	let seenUserTurns = 0;
-	for (let index = messages.length - 1; index >= 0; index -= 1) {
-		if (messages[index]?.startsWith("[user]\n") === true) {
-			seenUserTurns += 1;
-			if (seenUserTurns === turns) return messages.slice(index);
-		}
-	}
-
-	return messages;
 }
 
 function trimContextMessage(text: string): string {

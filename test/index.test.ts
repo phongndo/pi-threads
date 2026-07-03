@@ -1,10 +1,11 @@
 import type {
 	ExtensionAPI,
+	ExtensionCommandContext,
 	ExtensionContext,
 	SessionShutdownEvent,
 	Theme,
 } from "@earendil-works/pi-coding-agent";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { asThreadId, asThreadPath, type ThreadSnapshot } from "../src/domain.ts";
 import { PI_THREAD_ENTRY_MESSAGE_TYPE } from "../src/threads-command.ts";
 import extension from "../src/index.ts";
@@ -21,6 +22,21 @@ const theme = {
 	bg: (_color: string, text: string) => text,
 	bold: (text: string) => text,
 } as Theme;
+
+const PROCESS_MANAGER_KEY = "__piThreadsProcessManager";
+
+function useProcessManager(manager: ThreadManager): () => void {
+	const store = globalThis as typeof globalThis & Record<string, unknown>;
+	const previous = store[PROCESS_MANAGER_KEY];
+	store[PROCESS_MANAGER_KEY] = manager;
+	return () => {
+		if (previous === undefined) {
+			delete store[PROCESS_MANAGER_KEY];
+		} else {
+			store[PROCESS_MANAGER_KEY] = previous;
+		}
+	};
+}
 
 function ctx(
 	branch: readonly unknown[] = [],
@@ -71,6 +87,44 @@ function managerWithThread(thread: ThreadSnapshot | null): ThreadManager {
 		findBySessionFile: (sessionFile: string) =>
 			thread?.session.kind === "known" && thread.session.file === sessionFile ? thread : undefined,
 	} as unknown as ThreadManager;
+}
+
+type CommandHandler = (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+
+function registeredCommandHandlers(): Map<string, CommandHandler> {
+	const handlers = new Map<string, CommandHandler>();
+	const pi = {
+		registerCommand: (name: string, options: Parameters<ExtensionAPI["registerCommand"]>[1]) => {
+			handlers.set(name, options.handler);
+		},
+		registerMessageRenderer: () => undefined,
+		on: () => undefined,
+		registerTool: () => undefined,
+	} as unknown as ExtensionAPI;
+
+	extension(pi);
+	return handlers;
+}
+
+function commandCtx(branch: readonly unknown[] = []): ExtensionCommandContext & {
+	readonly notify: ReturnType<typeof vi.fn>;
+	readonly shutdown: ReturnType<typeof vi.fn>;
+	readonly switchSession: ReturnType<typeof vi.fn>;
+} {
+	const notify = vi.fn();
+	const shutdown = vi.fn();
+	const switchSession = vi.fn();
+	return {
+		notify,
+		shutdown,
+		switchSession,
+		ui: { notify },
+		sessionManager: { getBranch: () => branch, getSessionFile: () => "/tmp/current.jsonl" },
+	} as unknown as ExtensionCommandContext & {
+		readonly notify: ReturnType<typeof vi.fn>;
+		readonly shutdown: ReturnType<typeof vi.fn>;
+		readonly switchSession: ReturnType<typeof vi.fn>;
+	};
 }
 
 describe("session shutdown thread lifecycle", () => {
@@ -189,7 +243,103 @@ describe("session shutdown thread lifecycle", () => {
 	});
 });
 
+describe("thread exit commands", () => {
+	it("/exit outside a thread requests normal shutdown", async () => {
+		const handlers = registeredCommandHandlers();
+		const exit = handlers.get("exit");
+		if (exit === undefined) throw new Error("/exit command was not registered");
+		const commandContext = commandCtx();
+
+		await exit("", commandContext);
+
+		expect(commandContext.shutdown).toHaveBeenCalledTimes(1);
+		expect(commandContext.switchSession).not.toHaveBeenCalled();
+		expect(commandContext.notify).not.toHaveBeenCalled();
+	});
+
+	it("/exit inside an entered thread switches back to the recorded parent session", async () => {
+		const handlers = registeredCommandHandlers();
+		const exit = handlers.get("exit");
+		if (exit === undefined) throw new Error("/exit command was not registered");
+		const commandContext = commandCtx([
+			{
+				type: "custom_message",
+				customType: PI_THREAD_ENTRY_MESSAGE_TYPE,
+				details: { parentSessionFile: "/tmp/parent.jsonl" },
+			},
+		]);
+
+		await exit("", commandContext);
+
+		expect(commandContext.switchSession).toHaveBeenCalledWith("/tmp/parent.jsonl");
+		expect(commandContext.shutdown).not.toHaveBeenCalled();
+	});
+
+	it("/thread exit still warns when no parent session is recorded", async () => {
+		const handlers = registeredCommandHandlers();
+		const thread = handlers.get("thread");
+		if (thread === undefined) throw new Error("/thread command was not registered");
+		const commandContext = commandCtx();
+
+		await thread("exit", commandContext);
+
+		expect(commandContext.notify).toHaveBeenCalledWith(
+			expect.stringContaining("No parent"),
+			"warning",
+		);
+		expect(commandContext.shutdown).not.toHaveBeenCalled();
+		expect(commandContext.switchSession).not.toHaveBeenCalled();
+	});
+});
+
 describe("thread tool rendering", () => {
+	it("does not list threads when rendering calls without id labels", () => {
+		let renderCall:
+			| ((
+					args: Record<string, unknown>,
+					theme: Theme,
+			  ) => {
+					render: (width: number) => string[];
+			  })
+			| undefined;
+		let listCalls = 0;
+		const restoreManager = useProcessManager({
+			list: () => {
+				listCalls += 1;
+				throw new Error("renderCall should not list threads for this action");
+			},
+		} as unknown as ThreadManager);
+		const pi = {
+			registerCommand: () => undefined,
+			registerMessageRenderer: () => undefined,
+			on: () => undefined,
+			registerTool: (tool: { renderCall: typeof renderCall }) => {
+				renderCall = tool.renderCall;
+			},
+		} as unknown as ExtensionAPI;
+
+		try {
+			extension(pi);
+			if (renderCall === undefined) throw new Error("thread tool was not registered");
+
+			expect(
+				renderCall({ action: "start", prompt: "Draft a plan" }, theme)
+					.render(80)
+					.join("\n")
+					.trimEnd(),
+			).toBe('thread start "Draft a plan"');
+			expect(
+				renderCall({ action: "list", state: "all" }, theme).render(80).join("\n").trimEnd(),
+			).toBe("thread list");
+			expect(
+				renderCall({ action: "wait", timeoutMs: 1500 }, theme).render(80).join("\n").trimEnd(),
+			).toBe("thread wait 1.5s");
+			expect(listCalls).toBe(0);
+		} finally {
+			restoreManager();
+		}
+	});
+
 	it("renders wait timeouts precisely instead of rounding fractional seconds", () => {
 		let renderCall:
 			| ((

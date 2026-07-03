@@ -278,13 +278,31 @@ export async function prepareThreadsForSessionShutdown(
 	}
 }
 
-async function exitThreadSession(ctx: ExtensionCommandContext): Promise<void> {
+type MissingParentExitBehavior = "shutdown" | "warn";
+
+async function exitThreadSession(
+	ctx: ExtensionCommandContext,
+	missingParentBehavior: MissingParentExitBehavior,
+): Promise<void> {
 	const parentSessionFile = findThreadParentSession(ctx);
 	if (parentSessionFile === null) {
+		if (missingParentBehavior === "shutdown") {
+			ctx.shutdown();
+			return;
+		}
 		ctx.ui.notify("No parent Pi thread session is recorded. Use /quit to quit Pi.", "warning");
 		return;
 	}
 	await ctx.switchSession(parentSessionFile);
+}
+
+async function threadCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+	const trimmed = args.trim().toLowerCase();
+	if (trimmed === "exit") {
+		await exitThreadSession(ctx, "warn");
+		return;
+	}
+	ctx.ui.notify("Usage: /thread exit", "error");
 }
 
 export default function (pi: ExtensionAPI) {
@@ -304,8 +322,16 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("exit", {
-		description: "Exit a Pi thread and return to the parent session",
-		handler: async (_args, ctx) => exitThreadSession(ctx),
+		description: "Exit a Pi thread, or quit Pi when no parent thread session is recorded",
+		handler: async (_args, ctx) => exitThreadSession(ctx, "shutdown"),
+	});
+
+	pi.registerCommand("thread", {
+		description: "Pi thread commands",
+		getArgumentCompletions: (_prefix: string) => [
+			{ value: "exit", label: "exit", description: "Return to the parent thread session" },
+		],
+		handler: threadCommand,
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {
@@ -379,10 +405,6 @@ export default function (pi: ExtensionAPI) {
 			const action = typeof args["action"] === "string" ? args["action"] : "unknown";
 			let text = theme.fg("toolTitle", theme.bold("thread")) + " " + theme.fg("accent", action);
 
-			const allThreads = manager.list({ action: "list", state: "all" });
-			const id = typeof args["id"] === "string" ? args["id"] : "";
-			const label = id ? formatThreadLabel(id, allThreads) : "";
-
 			switch (action) {
 				case "start": {
 					const prompt = typeof args["prompt"] === "string" ? args["prompt"] : "";
@@ -400,10 +422,18 @@ export default function (pi: ExtensionAPI) {
 				}
 				case "poll":
 				case "stop": {
+					const id = typeof args["id"] === "string" ? args["id"] : "";
+					const label = id
+						? formatThreadLabel(id, manager.list({ action: "list", state: "all" }))
+						: "";
 					if (label) text += " " + theme.fg("accent", `"${label}"`);
 					break;
 				}
 				case "send": {
+					const id = typeof args["id"] === "string" ? args["id"] : "";
+					const label = id
+						? formatThreadLabel(id, manager.list({ action: "list", state: "all" }))
+						: "";
 					const msg =
 						"message" in args && typeof args["message"] === "string" ? args["message"] : "";
 					const mode = "mode" in args && typeof args["mode"] === "string" ? args["mode"] : "";
@@ -426,6 +456,10 @@ export default function (pi: ExtensionAPI) {
 					break;
 				}
 				case "wait": {
+					const id = typeof args["id"] === "string" ? args["id"] : "";
+					const label = id
+						? formatThreadLabel(id, manager.list({ action: "list", state: "all" }))
+						: "";
 					if (label) text += " " + theme.fg("accent", `"${label}"`);
 					const timeoutMs =
 						"timeoutMs" in args && typeof args["timeoutMs"] === "number"

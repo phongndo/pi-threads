@@ -28,7 +28,7 @@
               nil
               nixd
               nixfmt
-              nodejs_24
+              nodejs_22
               oxfmt
               oxlint
               pnpm
@@ -48,4 +48,3 @@
       formatter = forAllSystems (system: (import nixpkgs { inherit system; }).nixfmt);
     };
 }
-

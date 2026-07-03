@@ -1,4 +1,9 @@
-import { threadPathBasename, type ThreadEvent, type ThreadSnapshot } from "./domain.ts";
+import {
+	threadPathBasename,
+	type ThreadEvent,
+	type ThreadExit,
+	type ThreadSnapshot,
+} from "./domain.ts";
 import type { SendOutcome, StartOutcome, StopOutcome, WaitOutcome } from "./thread-manager.ts";
 
 export function formatStart(outcome: StartOutcome): string {
@@ -85,6 +90,7 @@ export function formatWait(outcome: WaitOutcome): string {
 
 function formatStatus(thread: ThreadSnapshot): string {
 	if (thread.state === "closed") {
+		if (isFailedExit(thread.exit)) return "closed/failed";
 		return `closed/${thread.exit.kind}`;
 	}
 
@@ -146,7 +152,7 @@ export function formatThreadReference(thread: ThreadSnapshot): string {
 export function formatThreadUserStatus(
 	thread: ThreadSnapshot,
 ): "working" | "blocked" | "done" | "failed" {
-	if (thread.state === "closed") return thread.exit.kind === "failed" ? "failed" : "done";
+	if (thread.state === "closed") return isFailedExit(thread.exit) ? "failed" : "done";
 	return thread.phase === "idle" ? "blocked" : "working";
 }
 
@@ -155,8 +161,7 @@ export function formatThreadStateBadge(
 	theme: { fg: (color: "error" | "dim" | "muted" | "warning" | "success", text: string) => string },
 ): string {
 	if (thread.state === "closed") {
-		const exitKind = thread.exit.kind;
-		if (exitKind === "failed") {
+		if (isFailedExit(thread.exit)) {
 			return theme.fg("error", "✕");
 		}
 		return theme.fg("dim", "○");
@@ -176,7 +181,11 @@ export function formatThreadStateBadge(
 
 export function formatThreadSummary(thread: ThreadSnapshot, maxLen?: number): string {
 	const statePart =
-		thread.state === "closed" ? `closed/${thread.exit.kind}` : `live/${thread.phase}`;
+		thread.state === "closed"
+			? isFailedExit(thread.exit)
+				? "closed/failed"
+				: `closed/${thread.exit.kind}`
+			: `live/${thread.phase}`;
 	const pidPart = thread.state === "live" ? ` pid=${thread.pid}` : "";
 
 	const text =
@@ -192,6 +201,12 @@ export function formatThreadSummary(thread: ThreadSnapshot, maxLen?: number): st
 		summary += ` ${truncated}`;
 	}
 	return summary;
+}
+
+function isFailedExit(exit: ThreadExit): boolean {
+	return (
+		exit.kind === "failed" || (exit.kind === "exited" && (exit.code !== 0 || exit.signal !== null))
+	);
 }
 
 function trimForDisplay(text: string, maxLength: number): string {

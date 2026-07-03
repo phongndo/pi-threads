@@ -47,7 +47,11 @@ export function registerThreadsCommand(
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			options.beforeUse?.(ctx);
 			const trimmed = args?.trim().toLowerCase() || "";
-			const filter: StateFilter = trimmed === "live" || trimmed === "closed" ? trimmed : "all";
+			const filter = parseStateFilter(trimmed);
+			if (filter === null) {
+				ctx.ui.notify("Usage: /threads [all|live|closed]", "error");
+				return;
+			}
 
 			if (ctx.mode === "tui") {
 				await showThreadsTui(ctx, manager, manager.list({ action: "list", state: "all" }), filter);
@@ -64,6 +68,12 @@ export function registerThreadsCommand(
 			}
 		},
 	});
+}
+
+function parseStateFilter(value: string): StateFilter | null {
+	if (value === "" || value === "all") return "all";
+	if (value === "live" || value === "closed") return value;
+	return null;
 }
 
 async function showThreadsTui(

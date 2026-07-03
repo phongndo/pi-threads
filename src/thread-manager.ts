@@ -1,6 +1,8 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	ROOT_THREAD_PATH,
@@ -23,7 +25,7 @@ import {
 	type ThreadSnapshot,
 } from "./domain.ts";
 import { isRecord, numberField, stringField } from "./json.ts";
-import { RpcClient, type RpcClientEvent } from "./rpc.ts";
+import { RpcClient, type RpcClientEvent, type RpcResponse } from "./rpc.ts";
 import type {
 	ListCommand,
 	SendCommand,
@@ -42,9 +44,14 @@ const PROMPT_ACCEPT_TIMEOUT_MS = 4_000;
 const RPC_QUICK_TIMEOUT_MS = 1_500;
 const RPC_SEND_TIMEOUT_MS = 5_000;
 const STOP_GRACE_MS = 1_500;
+const STOP_KILL_WAIT_MS = 300;
 const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
 const WAIT_POLL_INTERVAL_MS = 250;
+const BUSY_SEND_IDLE_SETTLE_REFRESHES = 2;
 const DEFAULT_FORK_CONTEXT_MAX_CHARS = 24_000;
+// Pi resolves CLI resource flags from the process startup cwd, while ctx.cwd can
+// later point at a resumed or switched session in another project.
+const PROCESS_START_CWD = process.cwd();
 
 type ThreadBase = {
 	readonly id: ThreadId;
@@ -73,8 +80,33 @@ type LiveThread = ThreadBase & {
 	lastPartialText: string | null;
 	stopRequested: boolean;
 	hasRun: boolean;
+	activityGeneration: number;
+	userMessageStartGeneration: number;
+	awaitingSend: AwaitingSend | null;
+	pendingInitialPrompt: PendingInitialPrompt | null;
 	readonly closed: Promise<void>;
 	readonly resolveClosed: () => void;
+};
+
+type AwaitingSend = {
+	observedActivity: boolean;
+	requireObservedActivity: boolean;
+	ignoreRunActivityUntilIdle: boolean;
+	idleRefreshCount: number;
+	readonly idleRefreshesToSettle: number;
+	readonly pendingMessageBaseline: number | null;
+};
+
+type SendAcceptanceBaseline = {
+	readonly phase: ThreadPhase;
+	readonly activityGeneration: number;
+	readonly userMessageStartGeneration: number;
+	readonly pendingMessageCount: number | null;
+	readonly allowActivityFastPath: boolean;
+};
+
+type PendingInitialPrompt = {
+	readonly requestId: string;
 };
 
 type ClosedThread = ThreadBase & {
@@ -223,6 +255,7 @@ export class ThreadManager {
 		const cwd = resolveCwd(ctx.cwd, command.cwd);
 		const extraArgs = command.args ?? [];
 		assertAllowedExtraArgs(extraArgs);
+		const inheritedArgs = collectInheritedPiArgs(process.argv, PROCESS_START_CWD);
 		const forkContext = buildForkContext(
 			ctx,
 			command.forkTurns ?? "none",
@@ -239,7 +272,8 @@ export class ThreadManager {
 		const argv = buildPiArgs({
 			name,
 			extraArgs,
-			projectTrusted: ctx.isProjectTrusted(),
+			inheritedArgs,
+			projectTrusted: shouldApproveChildCwd(ctx.isProjectTrusted(), ctx.cwd, cwd),
 		});
 		const invocation = getPiInvocation(argv);
 		const childEnvironment = {
@@ -255,16 +289,46 @@ export class ThreadManager {
 			PI_THREADS_ROOT_SESSION_ID: this.#rootSessionId,
 		};
 
-		const child = spawn(invocation.command, invocation.args, {
-			cwd,
-			env: childEnvironment,
-			shell: false,
-			stdio: ["pipe", "pipe", "pipe"],
+		let child: ChildProcessWithoutNullStreams;
+		try {
+			child = spawn(invocation.command, invocation.args, {
+				cwd,
+				env: childEnvironment,
+				shell: false,
+				stdio: ["pipe", "pipe", "pipe"],
+			});
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new Error(`Unable to start child Pi process: ${message}`, { cause: error });
+		}
+
+		const pendingStart: {
+			spawnError: Error | null;
+			close: { readonly code: number | null; readonly signal: string | null } | null;
+		} = { spawnError: null, close: null };
+		child.once("error", (error) => {
+			if (!this.#threads.has(id)) {
+				pendingStart.spawnError = error;
+				return;
+			}
+			this.#closeThread(id, { kind: "failed", message: error.message });
+		});
+
+		child.once("close", (code, signal) => {
+			const current = this.#threads.get(id);
+			if (current === undefined) {
+				pendingStart.close = { code, signal };
+				return;
+			}
+			const stopped = current.state === "live" && current.stopRequested;
+			this.#closeThread(id, classifyProcessExit({ code, signal, stopped }));
 		});
 
 		if (child.pid === undefined) {
 			child.kill("SIGKILL");
-			throw new Error("Unable to start child Pi process: missing pid");
+			const reason =
+				pendingStart.spawnError === null ? "missing pid" : pendingStart.spawnError.message;
+			throw new Error(`Unable to start child Pi process: ${reason}`);
 		}
 
 		const closedDeferred = createDeferred<void>();
@@ -293,6 +357,10 @@ export class ThreadManager {
 			rpc: new RpcClient(child, (event) => this.#handleRpcEvent(id, event)),
 			stopRequested: false,
 			hasRun: false,
+			activityGeneration: 0,
+			userMessageStartGeneration: 0,
+			awaitingSend: null,
+			pendingInitialPrompt: null,
 			closed: closedDeferred.promise,
 			resolveClosed: closedDeferred.resolve,
 		};
@@ -308,32 +376,34 @@ export class ThreadManager {
 			current.lastEventAt = nowIso();
 		});
 
-		child.once("error", (error) => {
-			this.#closeThread(id, { kind: "failed", message: error.message });
-		});
-
-		child.once("close", (code, signal) => {
-			const current = this.#threads.get(id);
-			const stopped = current?.state === "live" && current.stopRequested;
-			this.#closeThread(id, {
-				kind: stopped ? "stopped" : "exited",
-				code,
-				signal,
-			});
-		});
+		if (pendingStart.spawnError !== null) {
+			this.#closeThread(id, { kind: "failed", message: pendingStart.spawnError.message });
+		} else if (pendingStart.close !== null) {
+			this.#closeThread(
+				id,
+				classifyProcessExit({
+					code: pendingStart.close.code,
+					signal: pendingStart.close.signal,
+					stopped: thread.stopRequested,
+				}),
+			);
+		}
 
 		await this.#refreshSession(thread);
 
 		let note: string | null = null;
 		let promptAccepted = false;
 		try {
-			const response = await thread.rpc.request(
+			const request = thread.rpc.requestWithHandle(
 				{ type: "prompt", message: initialPrompt },
 				PROMPT_ACCEPT_TIMEOUT_MS,
 			);
+			thread.pendingInitialPrompt = { requestId: request.id };
+
+			const response = await request.response;
 			promptAccepted = response.success;
+			this.#recordInitialPromptResponse(id, response);
 			if (!response.success) {
-				thread.phase = "idle";
 				note = response.error ?? "Prompt was rejected by child Pi.";
 			}
 		} catch (error) {
@@ -366,9 +436,20 @@ export class ThreadManager {
 	}
 
 	async send(command: SendCommand): Promise<SendOutcome> {
-		const thread = this.#liveByTarget(command.id);
+		let thread = this.#liveByTarget(command.id);
+		const refreshed = await this.#refreshState(thread, { emitChange: false });
+		thread = this.#liveByTarget(thread.id);
 		const mode = command.mode ?? defaultSendMode(thread.phase);
+		const sendAcceptanceBaseline = captureSendAcceptanceBaseline(thread, {
+			allowActivityFastPath: refreshed,
+		});
 		const response = await sendMessage(thread, mode, command.message);
+		if (response.success) {
+			const current = this.#threads.get(thread.id);
+			if (current?.state === "live") {
+				recordAcceptedSend(current, sendAcceptanceBaseline);
+			}
+		}
 		this.#emitChange();
 
 		return {
@@ -376,7 +457,7 @@ export class ThreadManager {
 			mode,
 			accepted: response.success,
 			error: response.success ? null : (response.error ?? "Message was rejected by child Pi."),
-			thread: snapshot(thread),
+			thread: snapshot(this.#required(thread.id)),
 		};
 	}
 
@@ -416,11 +497,38 @@ export class ThreadManager {
 
 		for (;;) {
 			const thread = this.#required(id);
-			// eslint-disable-next-line no-await-in-loop -- wait intentionally observes one thread over time.
-			if (thread.state === "live") await this.#refreshState(thread);
+			if (thread.state === "closed") {
+				return {
+					kind: "waited",
+					timedOut: false,
+					waitedMs: Date.now() - startedAt,
+					thread: snapshot(thread),
+				};
+			}
+
+			const remainingBeforeRefresh = timeoutMs - (Date.now() - startedAt);
+			if (remainingBeforeRefresh <= 0) {
+				return {
+					kind: "waited",
+					timedOut: true,
+					waitedMs: Date.now() - startedAt,
+					thread: snapshot(thread),
+				};
+			}
+
+			let refreshedFromChild = false;
+			if (thread.state === "live") {
+				// eslint-disable-next-line no-await-in-loop -- wait intentionally observes one thread over time.
+				refreshedFromChild = await this.#refreshState(thread, {
+					timeoutMs: Math.min(RPC_QUICK_TIMEOUT_MS, remainingBeforeRefresh),
+				});
+			}
 
 			const refreshed = this.#required(id);
-			if (isSettled(refreshed)) {
+			if (
+				refreshed.state === "closed" ||
+				(refreshedFromChild && refreshed.phase === "idle" && hasNoPendingMessages(refreshed))
+			) {
 				return {
 					kind: "waited",
 					timedOut: false,
@@ -459,8 +567,11 @@ export class ThreadManager {
 			liveThreads.map(async (thread) => {
 				thread.stopRequested = true;
 				thread.child.kill("SIGTERM");
-				await Promise.race([thread.closed, delay(300)]);
-				if (this.#threads.get(thread.id)?.state === "live") thread.child.kill("SIGKILL");
+				await Promise.race([thread.closed, delay(STOP_KILL_WAIT_MS)]);
+				if (this.#threads.get(thread.id)?.state === "live") {
+					thread.child.kill("SIGKILL");
+					await Promise.race([thread.closed, delay(STOP_KILL_WAIT_MS)]);
+				}
 			}),
 		);
 		this.#emitChange();
@@ -592,6 +703,22 @@ export class ThreadManager {
 		this.#emitChange();
 	}
 
+	#recordInitialPromptResponse(id: ThreadId, response: RpcResponse): boolean {
+		const thread = this.#threads.get(id);
+		if (thread?.state !== "live") return false;
+
+		const pending = thread.pendingInitialPrompt;
+		if (pending === null || response.id !== pending.requestId) return false;
+
+		thread.pendingInitialPrompt = null;
+		if (response.success) {
+			recordAcceptedInitialPrompt(thread);
+		} else if (thread.phase === "starting") {
+			thread.phase = "idle";
+		}
+		return true;
+	}
+
 	#handleRpcEvent(id: ThreadId, clientEvent: RpcClientEvent): void {
 		const thread = this.#threads.get(id);
 		if (!thread || thread.state === "closed") return;
@@ -604,12 +731,16 @@ export class ThreadManager {
 			return;
 		}
 
-		if (clientEvent.kind === "response") return;
+		if (clientEvent.kind === "response") {
+			if (this.#recordInitialPromptResponse(id, clientEvent.response)) this.#emitChange();
+			return;
+		}
 
 		const event = clientEvent.event;
 		const type = stringField(event, "type");
 		switch (type) {
 			case "agent_start": {
+				recordPromptRunActivity(thread);
 				thread.phase = "busy";
 				thread.hasRun = true;
 				pushEvent(thread, { kind: "state", at: nowIso(), message: "agent started" });
@@ -617,28 +748,53 @@ export class ThreadManager {
 				return;
 			}
 			case "agent_end": {
+				recordPromptRunActivity(thread);
 				thread.phase = "idle";
 				thread.lastPartialText = null;
+				allowAwaitingSendRunActivity(thread);
+				clearObservedSendIfIdle(thread);
 				pushEvent(thread, { kind: "state", at: nowIso(), message: "agent ended" });
 				this.#emitChange();
 				return;
 			}
+			case "turn_start": {
+				recordPromptRunActivity(thread);
+				thread.phase = "busy";
+				thread.hasRun = true;
+				return;
+			}
+			case "message_start": {
+				recordPromptRunActivity(thread);
+				if (isUserMessage(event["message"])) thread.userMessageStartGeneration++;
+				thread.phase = "busy";
+				thread.hasRun = true;
+				return;
+			}
+			case "turn_end": {
+				recordPromptRunActivity(thread);
+				allowAwaitingSendRunActivity(thread);
+				return;
+			}
 			case "message_update": {
+				recordPromptRunActivity(thread);
 				const text = extractAssistantText(event["message"]);
 				if (text !== null) thread.lastPartialText = text;
 				return;
 			}
 			case "message_end": {
+				recordPromptRunActivity(thread);
 				const text = extractAssistantText(event["message"]);
 				if (text !== null) {
 					thread.lastAssistantText = text;
 					thread.lastPartialText = null;
+					clearObservedSendIfIdle(thread);
 					pushEvent(thread, { kind: "assistant", at: nowIso(), text: tail(text, 2_000) });
 					this.#emitChange();
 				}
 				return;
 			}
 			case "tool_execution_start": {
+				recordPromptRunActivity(thread);
 				thread.phase = "busy";
 				pushEvent(thread, {
 					kind: "tool",
@@ -650,7 +806,12 @@ export class ThreadManager {
 				this.#emitChange();
 				return;
 			}
+			case "tool_execution_update": {
+				recordPromptRunActivity(thread);
+				return;
+			}
 			case "tool_execution_end": {
+				recordPromptRunActivity(thread);
 				pushEvent(thread, {
 					kind: "tool",
 					at: nowIso(),
@@ -662,6 +823,7 @@ export class ThreadManager {
 				return;
 			}
 			case "extension_ui_request": {
+				recordSendActivity(thread);
 				const requestId = stringField(event, "id");
 				const method = stringField(event, "method") ?? "unknown";
 				const shouldAutoCancel = requestId !== null && isDialogUiMethod(method);
@@ -683,10 +845,10 @@ export class ThreadManager {
 
 	async #requestState(
 		thread: LiveThread,
-		options: { readonly recordErrors: boolean },
+		options: { readonly recordErrors: boolean; readonly timeoutMs?: number },
 	): Promise<Record<string, unknown> | null> {
 		const response = await thread.rpc
-			.request({ type: "get_state" }, RPC_QUICK_TIMEOUT_MS)
+			.request({ type: "get_state" }, options.timeoutMs ?? RPC_QUICK_TIMEOUT_MS)
 			.catch((error: unknown) => {
 				if (options.recordErrors) {
 					pushEvent(thread, {
@@ -710,18 +872,58 @@ export class ThreadManager {
 
 	async #refreshState(
 		thread: LiveThread,
-		options: { readonly emitChange: boolean } = { emitChange: true },
-	): Promise<void> {
-		const data = await this.#requestState(thread, { recordErrors: true });
-		if (data === null) return;
+		options: { readonly emitChange?: boolean; readonly timeoutMs?: number } = { emitChange: true },
+	): Promise<boolean> {
+		const requestOptions =
+			options.timeoutMs === undefined
+				? { recordErrors: true }
+				: { recordErrors: true, timeoutMs: options.timeoutMs };
+		const data = await this.#requestState(thread, requestOptions);
+		if (data === null) return false;
 
 		captureSession(thread, data);
 
 		const isStreaming = data["isStreaming"] === true;
-		if (isStreaming) thread.hasRun = true;
+		const isCompacting = data["isCompacting"] === true;
+		const pendingMessageCount = numberField(data, "pendingMessageCount");
+		const hasPendingMessages = pendingMessageCount !== null && pendingMessageCount !== 0;
+		const hasRunActivity = isStreaming || isCompacting;
+		if (hasRunActivity) {
+			thread.hasRun = true;
+			recordPromptRunActivity(thread);
+		}
+		if (hasPendingMessages) {
+			clearPendingInitialPrompt(thread);
+			recordPendingMessageActivity(thread, pendingMessageCount);
+		}
 		if (thread.phase !== "stopping") {
-			if (isStreaming) {
+			if (isStreaming || isCompacting || hasPendingMessages) {
 				thread.phase = "busy";
+			} else if (thread.awaitingSend !== null) {
+				// A successful prompt can be fully handled without starting an agent turn
+				// (for example slash commands or extension input handlers). Once a fresh
+				// state read confirms there is no streaming/compaction/queue activity, the
+				// accepted send can settle even if no agent events were emitted. The initial
+				// prompt is different: a prompt response only confirms acceptance, and the
+				// first agent events can arrive asynchronously after an idle-looking state
+				// read, so it must stay busy until activity is observed. Sends accepted
+				// while another turn was already busy require one extra idle confirmation so
+				// a previous turn ending is not mistaken for new-send work.
+				allowAwaitingSendRunActivity(thread);
+				if (thread.awaitingSend.observedActivity) {
+					thread.phase = "idle";
+					clearObservedSendIfIdle(thread);
+				} else if (thread.awaitingSend.requireObservedActivity) {
+					thread.phase = "busy";
+				} else {
+					thread.awaitingSend.idleRefreshCount++;
+					if (thread.awaitingSend.idleRefreshCount >= thread.awaitingSend.idleRefreshesToSettle) {
+						thread.awaitingSend = null;
+						thread.phase = "idle";
+					} else {
+						thread.phase = "busy";
+					}
+				}
 			} else if (
 				thread.phase !== "starting" ||
 				thread.hasRun ||
@@ -730,7 +932,8 @@ export class ThreadManager {
 				thread.phase = "idle";
 			}
 		}
-		if (options.emitChange) this.#emitChange();
+		if (options.emitChange ?? true) this.#emitChange();
+		return true;
 	}
 
 	#emitChange(): void {
@@ -776,10 +979,12 @@ function captureSession(thread: LiveThread, data: Record<string, unknown>): bool
 export function buildPiArgs(input: {
 	readonly name: string;
 	readonly extraArgs: readonly string[];
+	readonly inheritedArgs?: readonly string[];
 	readonly projectTrusted: boolean;
 }): readonly string[] {
+	const childArgs = mergeChildArgs(input.inheritedArgs ?? [], input.extraArgs);
 	return [
-		...input.extraArgs,
+		...childArgs,
 		"--mode",
 		"rpc",
 		"--name",
@@ -788,25 +993,495 @@ export function buildPiArgs(input: {
 	] as const;
 }
 
-export function assertAllowedExtraArgs(args: readonly string[]): void {
-	const forbidden = new Set([
-		"--mode",
-		"-p",
-		"--print",
-		"--help",
-		"-h",
-		"--version",
-		"-v",
-		"--export",
-		"--list-models",
-	]);
+type CliFlagSpec = {
+	readonly canonical: string;
+	readonly takesValue: boolean;
+	readonly allowExtra: boolean;
+	readonly inherit: boolean;
+	readonly valueKind?: "cli-path";
+};
 
-	for (const arg of args) {
-		const flag = arg.includes("=") ? arg.slice(0, arg.indexOf("=")) : arg;
-		if (forbidden.has(flag)) {
-			throw new Error(`Unsupported child Pi arg for pi-threads: ${arg}`);
+const CLI_FLAG_SPECS = new Map<string, CliFlagSpec>(
+	[
+		flagSpec(["--provider"], { takesValue: true, allowExtra: true, inherit: true }),
+		flagSpec(["--model"], { takesValue: true, allowExtra: true, inherit: true }),
+		flagSpec(["--models"], { takesValue: true, allowExtra: true, inherit: true }),
+		flagSpec(["--thinking"], { takesValue: true, allowExtra: true, inherit: true }),
+		flagSpec(["--exclude-tools", "-xt"], {
+			takesValue: true,
+			allowExtra: true,
+			inherit: true,
+		}),
+		flagSpec(["--no-tools", "-nt"], { takesValue: false, allowExtra: true, inherit: true }),
+		flagSpec(["--no-builtin-tools", "-nbt"], {
+			takesValue: false,
+			allowExtra: true,
+			inherit: true,
+		}),
+		flagSpec(["--offline"], { takesValue: false, allowExtra: true, inherit: true }),
+		flagSpec(["--no-extensions", "-ne"], {
+			takesValue: false,
+			allowExtra: true,
+			inherit: true,
+		}),
+		flagSpec(["--no-skills", "-ns"], { takesValue: false, allowExtra: true, inherit: true }),
+		flagSpec(["--no-prompt-templates", "-np"], {
+			takesValue: false,
+			allowExtra: true,
+			inherit: true,
+		}),
+		flagSpec(["--no-themes"], { takesValue: false, allowExtra: true, inherit: true }),
+		flagSpec(["--no-context-files", "-nc"], {
+			takesValue: false,
+			allowExtra: true,
+			inherit: true,
+		}),
+		flagSpec(["--tools", "-t"], { takesValue: true, allowExtra: false, inherit: true }),
+		flagSpec(["--extension", "-e"], {
+			takesValue: true,
+			allowExtra: false,
+			inherit: true,
+			valueKind: "cli-path",
+		}),
+		flagSpec(["--skill"], {
+			takesValue: true,
+			allowExtra: false,
+			inherit: true,
+			valueKind: "cli-path",
+		}),
+		flagSpec(["--prompt-template"], {
+			takesValue: true,
+			allowExtra: false,
+			inherit: true,
+			valueKind: "cli-path",
+		}),
+		flagSpec(["--theme"], {
+			takesValue: true,
+			allowExtra: false,
+			inherit: true,
+			valueKind: "cli-path",
+		}),
+	].flat(),
+);
+
+const VALUE_FLAGS_TO_SKIP = new Set([
+	"--api-key",
+	"--append-system-prompt",
+	"--export",
+	"--fork",
+	"--mode",
+	"--name",
+	"-n",
+	"--session",
+	"--session-dir",
+	"--session-id",
+	"--system-prompt",
+]);
+
+const OPTIONAL_VALUE_FLAGS_TO_SKIP = new Set(["--list-models"]);
+
+const SENSITIVE_BOOLEAN_FLAGS = new Set([
+	"--approve",
+	"-a",
+	"--continue",
+	"-c",
+	"--help",
+	"-h",
+	"--no-approve",
+	"-na",
+	"--print",
+	"-p",
+	"--resume",
+	"-r",
+	"--verbose",
+	"--version",
+	"-v",
+]);
+
+const PACKAGE_SUBCOMMANDS = new Set(["config", "install", "list", "remove", "uninstall", "update"]);
+const NO_TOOLS_FLAGS = new Set(["--no-tools", "-nt"]);
+const NO_BUILTIN_TOOLS_FLAGS = new Set(["--no-builtin-tools", "-nbt"]);
+const NO_EXTENSIONS_FLAGS = new Set(["--no-extensions", "-ne"]);
+const NO_SKILLS_FLAGS = new Set(["--no-skills", "-ns"]);
+const NO_PROMPT_TEMPLATES_FLAGS = new Set(["--no-prompt-templates", "-np"]);
+const NO_THEMES_FLAGS = new Set(["--no-themes"]);
+const TOOLS_FLAGS = new Set(["--tools", "-t"]);
+const EXTENSION_FLAGS = new Set(["--extension", "-e"]);
+const SKILL_FLAGS = new Set(["--skill"]);
+const PROMPT_TEMPLATE_FLAGS = new Set(["--prompt-template"]);
+const THEME_FLAGS = new Set(["--theme"]);
+const EXCLUDE_TOOLS_FLAGS = new Set(["--exclude-tools", "-xt"]);
+const MODEL_SCOPE_FLAGS = new Set(["--models"]);
+// Pi applies --thinking after scoped model thinking, so it can widen an inherited
+// --models scope just like selecting a different model/provider can.
+const MODEL_SCOPE_OVERRIDE_FLAGS = new Set(["--provider", "--model", "--models", "--thinking"]);
+const BUILTIN_TOOL_NAMES = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+const INHERITED_ENABLE_RESTRICTIONS: readonly {
+	readonly restrictionFlags: ReadonlySet<string>;
+	readonly enableFlags: ReadonlySet<string>;
+}[] = [
+	{ restrictionFlags: NO_TOOLS_FLAGS, enableFlags: TOOLS_FLAGS },
+	{ restrictionFlags: NO_EXTENSIONS_FLAGS, enableFlags: EXTENSION_FLAGS },
+	{ restrictionFlags: NO_SKILLS_FLAGS, enableFlags: SKILL_FLAGS },
+	{ restrictionFlags: NO_PROMPT_TEMPLATES_FLAGS, enableFlags: PROMPT_TEMPLATE_FLAGS },
+	{ restrictionFlags: NO_THEMES_FLAGS, enableFlags: THEME_FLAGS },
+];
+
+export function assertAllowedExtraArgs(args: readonly string[]): void {
+	parseAllowedExtraArgs(args);
+}
+
+export function collectInheritedPiArgs(
+	argv: readonly string[] = process.argv,
+	resourceBaseCwd: string = process.cwd(),
+): readonly string[] {
+	const args = processArgvToPiArgs(argv);
+	const inherited: string[] = [];
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === undefined) continue;
+		if (arg === "--") break;
+
+		// Pi's built-in parser only recognizes value flags in `--flag value` form.
+		// Inline assignments such as `--model=opus` are exposed as extension
+		// unknownFlags instead, so reinterpreting them here would make child Pi
+		// processes inherit settings the parent did not actually apply.
+		if (arg.includes("=")) {
+			continue;
+		}
+
+		const spec = CLI_FLAG_SPECS.get(arg);
+		if (spec?.inherit === true) {
+			if (spec.takesValue) {
+				const value = args[i + 1];
+				if (value !== undefined) {
+					inherited.push(spec.canonical, normalizeInheritedValue(spec, value, resourceBaseCwd));
+					i++;
+				}
+			} else {
+				inherited.push(spec.canonical);
+			}
+			continue;
+		}
+
+		if (VALUE_FLAGS_TO_SKIP.has(arg) && i + 1 < args.length) {
+			i++;
+			continue;
+		}
+
+		if (
+			OPTIONAL_VALUE_FLAGS_TO_SKIP.has(arg) &&
+			i + 1 < args.length &&
+			!isFlagLike(args[i + 1]!) &&
+			!args[i + 1]!.startsWith("@")
+		) {
+			i++;
+			continue;
+		}
+
+		if (SENSITIVE_BOOLEAN_FLAGS.has(arg)) continue;
+
+		if (arg.startsWith("--") && !arg.includes("=")) {
+			const next = args[i + 1];
+			if (next !== undefined && !isFlagLike(next) && !next.startsWith("@")) i++;
 		}
 	}
+
+	return inherited;
+}
+
+function normalizeInheritedValue(
+	spec: CliFlagSpec,
+	value: string,
+	resourceBaseCwd: string,
+): string {
+	if (spec.valueKind !== "cli-path" || !isLocalCliPath(value)) return value;
+	return resolveCliPath(value, resourceBaseCwd);
+}
+
+function isLocalCliPath(value: string): boolean {
+	const trimmed = value.trim();
+	return !(
+		trimmed.startsWith("npm:") ||
+		trimmed.startsWith("git:") ||
+		trimmed.startsWith("github:") ||
+		trimmed.startsWith("http:") ||
+		trimmed.startsWith("https:") ||
+		trimmed.startsWith("ssh:")
+	);
+}
+
+function resolveCliPath(value: string, resourceBaseCwd: string): string {
+	const normalized = normalizeCliPath(value);
+	const normalizedResourceBaseCwd = normalizeCliPath(resourceBaseCwd);
+	return path.isAbsolute(normalized)
+		? path.resolve(normalized)
+		: path.resolve(normalizedResourceBaseCwd, normalized);
+}
+
+function normalizeCliPath(value: string): string {
+	if (value === "~") return os.homedir();
+	if (value.startsWith("~/") || (process.platform === "win32" && value.startsWith("~\\"))) {
+		return path.join(os.homedir(), value.slice(2));
+	}
+	if (value.startsWith("file://")) return fileURLToPath(value);
+	return value;
+}
+
+export function shouldApproveChildCwd(
+	parentProjectTrusted: boolean,
+	parentCwd: string,
+	childCwd: string,
+): boolean {
+	return parentProjectTrusted && isCwdInsideOrEqual(parentCwd, childCwd);
+}
+
+export function isCwdInsideOrEqual(parentCwd: string, childCwd: string): boolean {
+	const parent = realpathOrResolve(parentCwd);
+	const child = realpathOrResolve(childCwd);
+	const relative = path.relative(parent, child);
+	return relative === "" || (!escapesToParent(relative) && !path.isAbsolute(relative));
+}
+
+function escapesToParent(relativePath: string): boolean {
+	return relativePath === ".." || relativePath.startsWith(`..${path.sep}`);
+}
+
+function realpathOrResolve(value: string): string {
+	const resolved = path.resolve(value);
+	try {
+		return fs.realpathSync.native(resolved);
+	} catch {
+		return resolved;
+	}
+}
+
+function flagSpec(
+	aliases: readonly [string, ...string[]],
+	options: Omit<CliFlagSpec, "canonical">,
+): readonly (readonly [string, CliFlagSpec])[] {
+	const canonical = aliases[0];
+	return aliases.map((alias) => [alias, { canonical, ...options }] as const);
+}
+
+function parseAllowedExtraArgs(args: readonly string[]): readonly string[] {
+	const allowed: string[] = [];
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === undefined) continue;
+		if (arg === "--" || PACKAGE_SUBCOMMANDS.has(arg) || !isFlagLike(arg) || arg.includes("=")) {
+			throw new Error(`Unsupported child Pi arg for pi-threads: ${arg}`);
+		}
+
+		const spec = CLI_FLAG_SPECS.get(arg);
+		if (spec?.allowExtra !== true) {
+			throw new Error(`Unsupported child Pi arg for pi-threads: ${arg}`);
+		}
+
+		allowed.push(arg);
+		if (spec.takesValue) {
+			const value = args[i + 1];
+			if (value === undefined || isFlagLike(value)) {
+				throw new Error(`Unsupported child Pi arg for pi-threads: ${arg} requires a value`);
+			}
+			allowed.push(value);
+			i++;
+		}
+	}
+
+	return allowed;
+}
+
+function mergeChildArgs(
+	inheritedArgs: readonly string[],
+	extraArgs: readonly string[],
+): readonly string[] {
+	const allowedExtraArgs = parseAllowedExtraArgs(extraArgs);
+	assertNoInheritedModelScopeOverride(inheritedArgs, allowedExtraArgs);
+	const filteredInheritedArgs = stripInheritedEnablesForRestrictions(
+		inheritedArgs,
+		allowedExtraArgs,
+	);
+
+	const childExcludeToolValues = collectFlagValues(allowedExtraArgs, EXCLUDE_TOOLS_FLAGS);
+	if (childExcludeToolValues.length > 0) {
+		const inheritedExcludeToolValue = collectLastFlagValue(
+			filteredInheritedArgs,
+			EXCLUDE_TOOLS_FLAGS,
+		);
+		const mergedExcludeTools = mergeCommaSeparatedValues([
+			...(inheritedExcludeToolValue === undefined ? [] : [inheritedExcludeToolValue]),
+			...childExcludeToolValues,
+		]);
+		const argsWithoutInheritedExcludeTools = removeFlags(
+			filteredInheritedArgs,
+			EXCLUDE_TOOLS_FLAGS,
+		);
+		const argsWithoutChildExcludeTools = removeFlags(allowedExtraArgs, EXCLUDE_TOOLS_FLAGS);
+		return mergedExcludeTools.length === 0
+			? [...argsWithoutInheritedExcludeTools, ...argsWithoutChildExcludeTools]
+			: [
+					...argsWithoutInheritedExcludeTools,
+					...argsWithoutChildExcludeTools,
+					"--exclude-tools",
+					mergedExcludeTools.join(","),
+				];
+	}
+
+	return [...filteredInheritedArgs, ...allowedExtraArgs];
+}
+
+function stripInheritedEnablesForRestrictions(
+	inheritedArgs: readonly string[],
+	restrictionArgs: readonly string[],
+): readonly string[] {
+	let filteredArgs = inheritedArgs;
+	for (const restriction of INHERITED_ENABLE_RESTRICTIONS) {
+		if (hasFlag(restrictionArgs, restriction.restrictionFlags)) {
+			filteredArgs = removeFlags(filteredArgs, restriction.enableFlags);
+		}
+	}
+	if (
+		!hasFlag(restrictionArgs, NO_TOOLS_FLAGS) &&
+		hasFlag(restrictionArgs, NO_BUILTIN_TOOLS_FLAGS)
+	) {
+		filteredArgs = filterInheritedToolAllowlistForNoBuiltinTools(filteredArgs);
+	}
+	return filteredArgs;
+}
+
+function assertNoInheritedModelScopeOverride(
+	inheritedArgs: readonly string[],
+	allowedExtraArgs: readonly string[],
+): void {
+	if (!hasFlag(inheritedArgs, MODEL_SCOPE_FLAGS)) return;
+	if (!hasFlag(allowedExtraArgs, MODEL_SCOPE_OVERRIDE_FLAGS)) return;
+
+	throw new Error(
+		"Unsupported child Pi arg for pi-threads: child model/provider/thinking args cannot override an inherited --models scope",
+	);
+}
+
+function filterInheritedToolAllowlistForNoBuiltinTools(
+	inheritedArgs: readonly string[],
+): readonly string[] {
+	// --tools is an active-tool allowlist and can re-enable built-ins even when
+	// --no-builtin-tools is present. Intersect the effective inherited allowlist
+	// with the child's no-built-ins restriction; if nothing remains, force no
+	// tools rather than dropping --tools and enabling every extension tool.
+	const inheritedToolValue = collectLastFlagValue(inheritedArgs, TOOLS_FLAGS);
+	if (inheritedToolValue === undefined) return inheritedArgs;
+
+	const argsWithoutInheritedTools = removeFlags(inheritedArgs, TOOLS_FLAGS);
+	const nonBuiltinTools = mergeCommaSeparatedValues([inheritedToolValue]).filter(
+		(toolName) => !BUILTIN_TOOL_NAMES.has(toolName),
+	);
+	return nonBuiltinTools.length === 0
+		? [...argsWithoutInheritedTools, "--no-tools"]
+		: [...argsWithoutInheritedTools, "--tools", nonBuiltinTools.join(",")];
+}
+
+function hasFlag(args: readonly string[], flags: ReadonlySet<string>): boolean {
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === undefined) continue;
+		if (flags.has(arg)) return true;
+
+		const spec = CLI_FLAG_SPECS.get(arg);
+		if (spec?.takesValue === true) i++;
+	}
+	return false;
+}
+
+function collectFlagValues(args: readonly string[], flags: ReadonlySet<string>): readonly string[] {
+	const values: string[] = [];
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === undefined) continue;
+
+		const spec = CLI_FLAG_SPECS.get(arg);
+		if (flags.has(arg)) {
+			const value = args[i + 1];
+			if (spec?.takesValue === true && value !== undefined) {
+				values.push(value);
+				i++;
+			}
+			continue;
+		}
+
+		if (spec?.takesValue === true) i++;
+	}
+	return values;
+}
+
+function collectLastFlagValue(
+	args: readonly string[],
+	flags: ReadonlySet<string>,
+): string | undefined {
+	let value: string | undefined;
+	for (const nextValue of collectFlagValues(args, flags)) value = nextValue;
+	return value;
+}
+
+function mergeCommaSeparatedValues(values: readonly string[]): readonly string[] {
+	const merged: string[] = [];
+	const seen = new Set<string>();
+	for (const value of values) {
+		for (const item of value.split(",")) {
+			const normalized = item.trim();
+			if (normalized === "" || seen.has(normalized)) continue;
+			seen.add(normalized);
+			merged.push(normalized);
+		}
+	}
+	return merged;
+}
+
+function removeFlags(args: readonly string[], flags: ReadonlySet<string>): readonly string[] {
+	const result: string[] = [];
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === undefined) continue;
+		const spec = CLI_FLAG_SPECS.get(arg);
+		if (!flags.has(arg)) {
+			result.push(arg);
+			if (spec?.takesValue === true) {
+				const value = args[i + 1];
+				if (value !== undefined) {
+					result.push(value);
+					i++;
+				}
+			}
+			continue;
+		}
+
+		if (spec?.takesValue === true) i++;
+	}
+	return result;
+}
+
+function processArgvToPiArgs(argv: readonly string[]): readonly string[] {
+	if (argv.length <= 1) return [];
+	const invokedScript = argv[1];
+	if (invokedScript !== undefined && looksLikeNodeScript(invokedScript)) return argv.slice(2);
+	const execName = path.basename(argv[0] ?? "").toLowerCase();
+	if (/^(node|bun)(\.exe)?$/u.test(execName)) return argv.slice(2);
+	return argv.slice(1);
+}
+
+function looksLikeNodeScript(value: string): boolean {
+	return (
+		value.endsWith(".js") ||
+		value.endsWith(".mjs") ||
+		value.endsWith(".cjs") ||
+		value.endsWith(".ts") ||
+		value.startsWith("/$bunfs/root/") ||
+		fs.existsSync(value)
+	);
+}
+
+function isFlagLike(value: string): boolean {
+	return value.startsWith("-") && !value.startsWith("---");
 }
 
 function snapshot(thread: ManagedThread): ThreadSnapshot {
@@ -875,8 +1550,123 @@ function defaultSendMode(phase: ThreadPhase): SendMode {
 	return phase === "idle" ? "prompt" : "follow_up";
 }
 
-function isSettled(thread: ManagedThread): boolean {
-	return thread.state === "closed" || thread.phase === "idle";
+function captureSendAcceptanceBaseline(
+	thread: LiveThread,
+	options: { readonly allowActivityFastPath?: boolean } = {},
+): SendAcceptanceBaseline {
+	const pendingMessageCount = getPendingMessageCount(thread);
+	const allowActivityFastPath = options.allowActivityFastPath ?? true;
+	return {
+		phase: thread.phase,
+		activityGeneration: thread.activityGeneration,
+		userMessageStartGeneration: thread.userMessageStartGeneration,
+		pendingMessageCount,
+		allowActivityFastPath:
+			allowActivityFastPath &&
+			thread.phase === "idle" &&
+			thread.awaitingSend === null &&
+			(pendingMessageCount === null || pendingMessageCount === 0),
+	};
+}
+
+function recordAcceptedSend(thread: LiveThread, baseline: SendAcceptanceBaseline): void {
+	const observedUserMessageStart =
+		thread.userMessageStartGeneration > baseline.userMessageStartGeneration;
+	const observedActivity =
+		observedUserMessageStart ||
+		(baseline.allowActivityFastPath && thread.activityGeneration !== baseline.activityGeneration);
+	thread.awaitingSend = {
+		observedActivity,
+		requireObservedActivity: false,
+		ignoreRunActivityUntilIdle: !baseline.allowActivityFastPath && thread.phase !== "idle",
+		idleRefreshCount: 0,
+		idleRefreshesToSettle: baseline.phase === "idle" ? 1 : BUSY_SEND_IDLE_SETTLE_REFRESHES,
+		pendingMessageBaseline: baseline.pendingMessageCount,
+	};
+	if (thread.phase !== "stopping") {
+		if (observedActivity && thread.phase === "idle") {
+			clearObservedSendIfIdle(thread);
+		} else {
+			thread.phase = "busy";
+		}
+	}
+}
+
+function recordAcceptedInitialPrompt(thread: LiveThread): void {
+	thread.awaitingSend ??= {
+		observedActivity: false,
+		requireObservedActivity: true,
+		ignoreRunActivityUntilIdle: false,
+		idleRefreshCount: 0,
+		idleRefreshesToSettle: 1,
+		pendingMessageBaseline: getPendingMessageCount(thread),
+	};
+	if (thread.phase !== "stopping") thread.phase = "busy";
+}
+
+function recordPromptRunActivity(thread: LiveThread): void {
+	clearPendingInitialPrompt(thread);
+	recordSendActivity(thread);
+}
+
+function clearPendingInitialPrompt(thread: LiveThread): void {
+	thread.pendingInitialPrompt = null;
+}
+
+function recordSendActivity(thread: LiveThread): void {
+	thread.activityGeneration++;
+	if (thread.awaitingSend !== null && !thread.awaitingSend.ignoreRunActivityUntilIdle) {
+		thread.awaitingSend.observedActivity = true;
+	}
+}
+
+function allowAwaitingSendRunActivity(thread: LiveThread): void {
+	if (thread.awaitingSend !== null) thread.awaitingSend.ignoreRunActivityUntilIdle = false;
+}
+
+function recordPendingMessageActivity(thread: LiveThread, pendingMessageCount: number): void {
+	const awaitingSend = thread.awaitingSend;
+	if (awaitingSend === null || awaitingSend.observedActivity) return;
+	const baseline = awaitingSend.pendingMessageBaseline;
+	if (baseline === null || pendingMessageCount > baseline) {
+		thread.activityGeneration++;
+		awaitingSend.observedActivity = true;
+		awaitingSend.ignoreRunActivityUntilIdle = false;
+	}
+}
+
+function clearObservedSendIfIdle(thread: LiveThread): void {
+	if (thread.awaitingSend?.observedActivity === true && thread.phase === "idle") {
+		thread.awaitingSend = null;
+	}
+}
+
+function getPendingMessageCount(thread: ManagedThread): number | null {
+	return thread.session.kind === "known" ? thread.session.pendingMessageCount : null;
+}
+
+function hasNoPendingMessages(thread: ManagedThread): boolean {
+	const pendingMessageCount = getPendingMessageCount(thread);
+	return pendingMessageCount === null || pendingMessageCount === 0;
+}
+
+function classifyProcessExit(input: {
+	readonly code: number | null;
+	readonly signal: string | null;
+	readonly stopped: boolean;
+}): ThreadExit {
+	if (input.stopped) return { kind: "stopped", code: input.code, signal: input.signal };
+	if (input.code === 0 && input.signal === null) {
+		return { kind: "exited", code: input.code, signal: input.signal };
+	}
+
+	const details = [
+		input.code === null ? null : `code ${input.code}`,
+		input.signal === null ? null : `signal ${input.signal}`,
+	]
+		.filter((part): part is string => part !== null)
+		.join(", ");
+	return { kind: "failed", message: `Child Pi process exited with ${details || "unknown status"}` };
 }
 
 async function sendMessage(thread: LiveThread, mode: SendMode, message: string) {
@@ -884,9 +1674,15 @@ async function sendMessage(thread: LiveThread, mode: SendMode, message: string) 
 		case "prompt":
 			return thread.rpc.request({ type: "prompt", message }, RPC_SEND_TIMEOUT_MS);
 		case "steer":
-			return thread.rpc.request({ type: "steer", message }, RPC_SEND_TIMEOUT_MS);
+			return thread.rpc.request(
+				{ type: "prompt", message, streamingBehavior: "steer" },
+				RPC_SEND_TIMEOUT_MS,
+			);
 		case "follow_up":
-			return thread.rpc.request({ type: "follow_up", message }, RPC_SEND_TIMEOUT_MS);
+			return thread.rpc.request(
+				{ type: "prompt", message, streamingBehavior: "followUp" },
+				RPC_SEND_TIMEOUT_MS,
+			);
 	}
 }
 
@@ -920,6 +1716,10 @@ function extractAssistantText(message: unknown): string | null {
 	}
 
 	return parts.length === 0 ? null : parts.join("\n");
+}
+
+function isUserMessage(message: unknown): boolean {
+	return isRecord(message) && message["role"] === "user";
 }
 
 function tail(text: string, maxBytes: number): string {

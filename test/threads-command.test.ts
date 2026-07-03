@@ -1,4 +1,4 @@
-import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import {
 	asThreadId,
@@ -7,7 +7,7 @@ import {
 	type LiveThreadSnapshot,
 	type ThreadSnapshot,
 } from "../src/domain.ts";
-import { ThreadsTreeComponent } from "../src/threads-command.ts";
+import { registerThreadsCommand, ThreadsTreeComponent } from "../src/threads-command.ts";
 import type { ThreadManager } from "../src/thread-manager.ts";
 
 const theme = {
@@ -88,6 +88,31 @@ function component(
 		done,
 	);
 }
+
+describe("/threads command", () => {
+	it("rejects unknown filters instead of falling back to all threads", async () => {
+		let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
+		const list = vi.fn(() => [thread()]);
+		const notify = vi.fn();
+		const pi = {
+			registerCommand: (name: string, options: Parameters<ExtensionAPI["registerCommand"]>[1]) => {
+				if (name === "threads") handler = options.handler;
+			},
+		} as unknown as ExtensionAPI;
+
+		registerThreadsCommand(pi, { list } as unknown as ThreadManager);
+		if (handler === undefined) throw new Error("/threads command was not registered");
+
+		await handler("done", {
+			mode: "print",
+			hasUI: false,
+			ui: { notify },
+		} as unknown as ExtensionCommandContext);
+
+		expect(list).not.toHaveBeenCalled();
+		expect(notify).toHaveBeenCalledWith("Usage: /threads [all|live|closed]", "error");
+	});
+});
 
 describe("ThreadsTreeComponent input", () => {
 	it("treats s as search text instead of the stop shortcut", () => {

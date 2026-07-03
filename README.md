@@ -39,16 +39,78 @@ Pi calls the `thread` tool with one action:
 | `list`  | List all threads managed by this parent session.                  |
 | `stop`  | Stop a thread gracefully (or forcefully).                         |
 
+Example tool calls:
+
+```json
+{
+  "action": "start",
+  "prompt": "Review the API docs for stale examples and report exact fixes.",
+  "taskName": "review_docs",
+  "forkTurns": "3"
+}
+```
+
+```json
+{
+  "action": "start",
+  "prompt": "Run the focused test suite and summarize failures.",
+  "taskName": "test_runner",
+  "cwd": "/path/to/project",
+  "args": ["--model", "anthropic/claude-sonnet-4-5", "--thinking", "low"]
+}
+```
+
+```json
+{ "action": "poll", "id": "/root/review_docs" }
+```
+
+```json
+{
+  "action": "send",
+  "id": "review_docs",
+  "message": "Also check README examples against the current schema.",
+  "mode": "follow_up"
+}
+```
+
+```json
+{ "action": "wait", "id": "/root/test_runner", "timeoutMs": 30000 }
+```
+
+```json
+{ "action": "list", "state": "live" }
+```
+
 Threads also get a stable canonical path like `/root/review_tests`. Pass
 `taskName` on `start` to choose the final path segment, then refer to the thread
 later by id, full path, or unambiguous task name.
+
+`start.args` is intentionally allowlisted. Children always run in RPC mode;
+one-shot modes, session selection, approval flags, package subcommands, bare
+positional args, and `--flag=value` forms are rejected. Safe narrowing flags such
+as `--provider`, `--model`, `--models`, `--thinking`, `--exclude-tools`,
+`--no-tools`, `--no-builtin-tools`, `--offline`, `--no-extensions`,
+`--no-skills`, `--no-prompt-templates`, `--no-themes`, and
+`--no-context-files` can be supplied when a child needs narrower behavior. If
+the parent was started with an inherited `--models` scope, child
+model-selection args (`--provider`, `--model`, or `--models`) are rejected so a
+tool call cannot loosen that scope.
+
+Children also inherit relevant parent Pi restrictions and resource-loading flags
+that Pi parsed from the parent process, including model/provider choices, tool
+restrictions, extension/skill/prompt/theme flags, and `--no-*` resource flags.
+Use Pi's supported `--flag value` form for inherited value flags; inline
+`--flag=value` assignments are not reinterpreted for children. This lets a
+parent started with installed or explicit extensions keep the same environment in
+children while preventing a tool call from loosening the parent's restrictions.
 
 ## Observability
 
 Use `/threads` in Pi's TUI to open an interactive thread browser for the current
 session. It defaults to all known threads so completed work remains visible;
 pass `/threads live`, `/threads all`, or `/threads closed` to filter the list.
-The TUI still opens when the selected filter is empty.
+Other filter text shows usage instead of silently falling back to `all`. The TUI
+still opens when the selected filter is empty.
 
 The browser follows Pi's native tree-like UI style with state badges, friendly
 thread titles, search, and keyboard controls. Use `↑`/`↓` to navigate, type to
@@ -60,8 +122,10 @@ The control legend is shown below the browser title.
 When you enter a closed/stopped thread from `/threads`, pi switches to that child
 session and records the parent session. Live threads must be stopped or closed
 before they can be opened. Use `/exit` from inside the child session to switch
-back to the parent. Entering is disabled when Pi was started with `--no-session`,
-because there is no saved parent session to return to.
+back to the parent. Outside a recorded thread session, `/exit` behaves like a
+normal Pi shutdown request; `/thread exit` is the thread-specific form and warns
+when no parent session is recorded. Entering is disabled when Pi was started with
+`--no-session`, because there is no saved parent session to return to.
 
 Friendly titles (generated session name, `name`, then `taskName` or short id)
 are for display in the TUI and tool call labels. For automation and follow-up
@@ -112,6 +176,12 @@ pi install /path/to/pi-threads
 - Threads are killed when the parent Pi session exits.
 - Interactive prompts (dialogs, confirmations) in headless threads are auto-cancelled.
 - One-shot CLI modes (`--print`, `--export`, etc.) are blocked in child threads.
+- If a child `cwd` is outside the trusted parent project, it is launched with
+  `--no-approve` even when the parent cwd is approved.
+- Recursive threads require the child to load this extension too. This works for
+  installed extensions and explicit `-e`/`--extension` loading inherited from the
+  parent; custom loading mechanisms that are not represented in Pi's CLI args may
+  leave children without the `thread` tool.
 - Recursion depth and live-thread count are capped.
 
 ## Development

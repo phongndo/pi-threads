@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import { Value } from "typebox/value";
 import { describe, expect, it } from "vitest";
 import { ROOT_THREAD_PATH, asThreadId, asThreadPath, joinThreadPath } from "../src/domain.ts";
@@ -7,7 +8,11 @@ import {
 	StrictPiThreadParamsSchema,
 	type PiThreadParams,
 } from "../src/schema.ts";
-import { assertAllowedExtraArgs, buildPiArgs } from "../src/thread-manager.ts";
+import {
+	assertAllowedExtraArgs,
+	buildPiArgs,
+	collectInheritedPiArgs,
+} from "../src/thread-manager.ts";
 
 describe("thread schemas", () => {
 	it("exposes an object-root provider schema", () => {
@@ -77,9 +82,321 @@ describe("child Pi argv", () => {
 		).toEqual(["--model", "sonnet", "--mode", "rpc", "--name", "child", "--approve"]);
 	});
 
+	it("inherits parent runtime resource and restriction args without prompts", () => {
+		const parentCwd = "/tmp/parent-project";
+		expect(
+			collectInheritedPiArgs(
+				[
+					"/usr/bin/node",
+					"/opt/pi/dist/cli.js",
+					"--models",
+					"sonnet,haiku",
+					"--provider",
+					"anthropic",
+					"--model",
+					"sonnet",
+					"--tools",
+					"read,grep",
+					"--exclude-tools",
+					"bash",
+					"--extension",
+					".",
+					"--extension",
+					"npm:@scope/package",
+					"--skill",
+					"skills/review",
+					"--offline",
+					"parent prompt",
+				],
+				parentCwd,
+			),
+		).toEqual([
+			"--models",
+			"sonnet,haiku",
+			"--provider",
+			"anthropic",
+			"--model",
+			"sonnet",
+			"--tools",
+			"read,grep",
+			"--exclude-tools",
+			"bash",
+			"--extension",
+			path.resolve(parentCwd),
+			"--extension",
+			"npm:@scope/package",
+			"--skill",
+			path.resolve(parentCwd, "skills/review"),
+			"--offline",
+		]);
+	});
+
+	it("does not reinterpret inline assignment parent args as inherited Pi flags", () => {
+		expect(
+			collectInheritedPiArgs([
+				"/usr/bin/node",
+				"/opt/pi/dist/cli.js",
+				"--provider=anthropic",
+				"--model=opus",
+				"--models=opus,sonnet",
+				"--thinking=high",
+				"--tools=read,grep",
+				"--exclude-tools=bash",
+				"--extension=.",
+				"-e=./other-extension",
+				"--skill=skills/review",
+				"--prompt-template=prompts/default.md",
+				"--theme=theme.json",
+				"--model",
+				"sonnet",
+			]),
+		).toEqual(["--model", "sonnet"]);
+	});
+
+	it("keeps inherited args before extra args and enforced child invariants", () => {
+		expect(
+			buildPiArgs({
+				name: "child",
+				inheritedArgs: ["--tools", "read,grep", "--extension", "."],
+				extraArgs: ["--model", "sonnet", "--exclude-tools", "bash"],
+				projectTrusted: false,
+			}),
+		).toEqual([
+			"--tools",
+			"read,grep",
+			"--extension",
+			".",
+			"--model",
+			"sonnet",
+			"--exclude-tools",
+			"bash",
+			"--mode",
+			"rpc",
+			"--name",
+			"child",
+			"--no-approve",
+		]);
+	});
+
+	it("rejects child model/provider/thinking overrides when inheriting a model scope", () => {
+		const inheritedArgs = ["--models", "sonnet,haiku", "--model", "sonnet"] as const;
+		const rejected = [
+			["--model", "opus"],
+			["--models", "opus"],
+			["--provider", "openai"],
+			["--thinking", "high"],
+		] as const;
+
+		for (const extraArgs of rejected) {
+			expect(() =>
+				buildPiArgs({
+					name: "child",
+					inheritedArgs,
+					extraArgs,
+					projectTrusted: true,
+				}),
+			).toThrow(/inherited --models scope/u);
+		}
+	});
+
+	it("merges child tool exclusions with inherited exclusions", () => {
+		expect(
+			buildPiArgs({
+				name: "child",
+				inheritedArgs: ["--exclude-tools", "bash,write"],
+				extraArgs: ["--exclude-tools", "read,bash"],
+				projectTrusted: true,
+			}),
+		).toEqual([
+			"--exclude-tools",
+			"bash,write,read",
+			"--mode",
+			"rpc",
+			"--name",
+			"child",
+			"--approve",
+		]);
+	});
+
+	it("strips inherited resource enables when child args request matching restrictions", () => {
+		expect(
+			buildPiArgs({
+				name: "child",
+				inheritedArgs: [
+					"--tools",
+					"read,grep",
+					"--extension",
+					".",
+					"--skill",
+					"skills/review",
+					"--prompt-template",
+					"prompts/default.md",
+					"--theme",
+					"theme.json",
+					"--exclude-tools",
+					"bash",
+				],
+				extraArgs: [
+					"--no-builtin-tools",
+					"--no-extensions",
+					"--no-skills",
+					"--no-prompt-templates",
+					"--no-themes",
+				],
+				projectTrusted: true,
+			}),
+		).toEqual([
+			"--exclude-tools",
+			"bash",
+			"--no-tools",
+			"--no-builtin-tools",
+			"--no-extensions",
+			"--no-skills",
+			"--no-prompt-templates",
+			"--no-themes",
+			"--mode",
+			"rpc",
+			"--name",
+			"child",
+			"--approve",
+		]);
+	});
+
+	it("filters inherited built-in tool allowlists when child args disable built-ins", () => {
+		expect(
+			buildPiArgs({
+				name: "child",
+				inheritedArgs: ["--tools", "read,grep,custom_tool", "--exclude-tools", "bash"],
+				extraArgs: ["--no-builtin-tools"],
+				projectTrusted: true,
+			}),
+		).toEqual([
+			"--exclude-tools",
+			"bash",
+			"--tools",
+			"custom_tool",
+			"--no-builtin-tools",
+			"--mode",
+			"rpc",
+			"--name",
+			"child",
+			"--approve",
+		]);
+
+		expect(
+			buildPiArgs({
+				name: "child",
+				inheritedArgs: ["--tools", "read,grep"],
+				extraArgs: ["--no-builtin-tools"],
+				projectTrusted: true,
+			}),
+		).toEqual([
+			"--no-tools",
+			"--no-builtin-tools",
+			"--mode",
+			"rpc",
+			"--name",
+			"child",
+			"--approve",
+		]);
+	});
+
+	it("strips inherited tool allowlists when child args disable all tools", () => {
+		expect(
+			buildPiArgs({
+				name: "child",
+				inheritedArgs: ["--tools", "read,grep", "--exclude-tools", "bash"],
+				extraArgs: ["--no-tools"],
+				projectTrusted: true,
+			}),
+		).toEqual([
+			"--exclude-tools",
+			"bash",
+			"--no-tools",
+			"--mode",
+			"rpc",
+			"--name",
+			"child",
+			"--approve",
+		]);
+	});
+
+	it("preserves explicit resources in inherited exact-load restrictions", () => {
+		const parentCwd = "/tmp/parent-project";
+		expect(
+			collectInheritedPiArgs(
+				[
+					"/usr/bin/node",
+					"/opt/pi/dist/cli.js",
+					"--no-extensions",
+					"--extension",
+					"./pi-threads",
+					"--no-skills",
+					"--skill",
+					"skills/review",
+					"--no-builtin-tools",
+					"--tools",
+					"read,grep",
+				],
+				parentCwd,
+			),
+		).toEqual([
+			"--no-extensions",
+			"--extension",
+			path.resolve(parentCwd, "pi-threads"),
+			"--no-skills",
+			"--skill",
+			path.resolve(parentCwd, "skills/review"),
+			"--no-builtin-tools",
+			"--tools",
+			"read,grep",
+		]);
+	});
+
 	it("rejects one-shot or protocol-breaking args", () => {
-		expect(() => assertAllowedExtraArgs(["--mode", "json"])).toThrow(/Unsupported/u);
-		expect(() => assertAllowedExtraArgs(["--print"])).toThrow(/Unsupported/u);
-		expect(() => assertAllowedExtraArgs(["--export", "out.html"])).toThrow(/Unsupported/u);
+		const rejected = [
+			["install"],
+			["--mode", "json"],
+			["--print"],
+			["--export", "out.html"],
+			["--extension", "."],
+			["-e", "."],
+			["--session", "abc"],
+			["--continue"],
+			["-c"],
+			["--resume"],
+			["-r"],
+			["--fork", "abc"],
+			["--api-key", "secret"],
+			["--approve"],
+			["--no-approve"],
+			["--tools", "read"],
+			["--help"],
+			["--version"],
+			["--list-models"],
+			["--model=sonnet"],
+			["plain prompt"],
+		] as const;
+
+		for (const args of rejected) {
+			expect(() => assertAllowedExtraArgs(args)).toThrow(/Unsupported/u);
+		}
+	});
+
+	it("allows only safe model and restrictive child args", () => {
+		expect(() =>
+			assertAllowedExtraArgs([
+				"--provider",
+				"anthropic",
+				"--model",
+				"sonnet",
+				"--thinking",
+				"low",
+				"--exclude-tools",
+				"bash",
+				"--no-builtin-tools",
+				"--offline",
+			]),
+		).not.toThrow();
 	});
 });

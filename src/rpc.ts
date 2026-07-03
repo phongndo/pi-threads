@@ -37,6 +37,11 @@ type PendingResponse = {
 	readonly timeout: NodeJS.Timeout;
 };
 
+export type RpcRequestHandle = {
+	readonly id: string;
+	readonly response: Promise<RpcResponse>;
+};
+
 export class RpcClient {
 	readonly #process: ChildProcessWithoutNullStreams;
 	readonly #pending = new Map<string, PendingResponse>();
@@ -47,7 +52,11 @@ export class RpcClient {
 		this.#process = process;
 		this.#onEvent = onEvent;
 
-		attachJsonlReader(this.#process.stdout, (line) => this.#handleLine(line));
+		attachJsonlReader(this.#process.stdout, (line) => this.#handleLine(line), {
+			onError: (error) => {
+				this.#onEvent({ kind: "parse_error", line: "", message: error.message });
+			},
+		});
 		this.#process.once("close", () => {
 			this.#closed = true;
 			this.#rejectAll(new Error("Pi RPC process closed"));
@@ -58,6 +67,13 @@ export class RpcClient {
 		command: Exclude<RpcCommand, { readonly type: "extension_ui_response" }>,
 		timeoutMs: number,
 	): Promise<RpcResponse> {
+		return this.requestWithHandle(command, timeoutMs).response;
+	}
+
+	requestWithHandle(
+		command: Exclude<RpcCommand, { readonly type: "extension_ui_response" }>,
+		timeoutMs: number,
+	): RpcRequestHandle {
 		if (this.#closed) throw new Error("Pi RPC process is closed");
 
 		const id = `req_${randomUUID()}`;
@@ -73,7 +89,7 @@ export class RpcClient {
 		});
 
 		this.#write(payload);
-		return responsePromise;
+		return { id, response: responsePromise };
 	}
 
 	respondToUiRequest(id: string): void {
