@@ -29,7 +29,7 @@
   },
   "scripts": {
     "check": "pnpm oxformat:check && pnpm lint && pnpm typecheck && pnpm test",
-    "dev:pi": "pi -e .",
+    "dev:pi": "pi -ne -e .",
     "lint": "oxlint --deny-warnings --tsconfig tsconfig.json src test vitest.config.ts",
     "lint:fix": "pnpm lint --fix",
     "lsp:oxformat": "oxfmt --lsp",

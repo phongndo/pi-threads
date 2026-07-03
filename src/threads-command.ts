@@ -1,6 +1,13 @@
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
-import { type Component, Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import {
+	type Component,
+	Key,
+	matchesKey,
+	truncateToWidth,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 import type { ThreadSnapshot } from "./domain.ts";
 import {
 	formatPoll,
@@ -13,6 +20,16 @@ import type { ThreadManager } from "./thread-manager.ts";
 
 type StateFilter = "all" | "live" | "closed";
 const FILTER_CYCLE: readonly StateFilter[] = ["all", "live", "closed"];
+const THREAD_HELP_ITEMS = [
+	"↑/↓ move",
+	"tab filter",
+	"enter open closed",
+	"ctrl+p poll",
+	"ctrl+r refresh",
+	"ctrl+x stop",
+	"type search",
+	"esc close",
+];
 export const PI_THREAD_ENTRY_MESSAGE_TYPE = "pi-threads-entry";
 
 export function registerThreadsCommand(
@@ -124,26 +141,17 @@ export class ThreadsTreeComponent implements Component {
 		const lines: string[] = [];
 
 		lines.push("");
-		lines.push(...new DynamicBorder((s: string) => t.fg("accent", s)).render(width));
-		lines.push(
-			truncateToWidth(t.bold(`  Pi Threads (${liveCount} live, ${closedCount} closed)`), width),
-		);
-		lines.push(
-			truncateToWidth(
-				t.fg(
-					"muted",
-					"  ↑↓ move · tab filter · enter open closed · ctrl+p poll · ctrl+r refresh · ctrl+x stop · type search · esc close",
-				),
-				width,
-			),
-		);
+		lines.push(...this.renderBorder(width));
+		lines.push(this.renderTitleLine(width, liveCount, closedCount));
+		lines.push(...this.renderHelpLines(width));
 		lines.push(truncateToWidth(this.renderSearchLine(), width));
-		lines.push(...new DynamicBorder((s: string) => t.fg("accent", s)).render(width));
+		lines.push(...this.renderBorder(width));
+		lines.push("");
 
 		if (filtered.length === 0) {
 			const message = this.emptyMessage();
 			lines.push(truncateToWidth(t.fg("muted", message), width));
-			lines.push(truncateToWidth(t.fg("muted", `  (0/0) [${this.filter}]`), width));
+			lines.push(truncateToWidth(t.fg("muted", "  (0/0)"), width));
 		} else {
 			const maxVisible = Math.min(filtered.length, 14);
 			const startIndex = Math.max(
@@ -161,14 +169,12 @@ export class ThreadsTreeComponent implements Component {
 			}
 
 			lines.push(
-				truncateToWidth(
-					t.fg("muted", `  (${this.selectedIndex + 1}/${filtered.length}) [${this.filter}]`),
-					width,
-				),
+				truncateToWidth(t.fg("muted", `  (${this.selectedIndex + 1}/${filtered.length})`), width),
 			);
 		}
 
-		lines.push(...new DynamicBorder((s: string) => t.fg("accent", s)).render(width));
+		lines.push("");
+		lines.push(...this.renderBorder(width));
 
 		this.cachedWidth = width;
 		this.cachedLines = lines;
@@ -249,6 +255,58 @@ export class ThreadsTreeComponent implements Component {
 	private renderSearchLine(): string {
 		if (this.searchQuery === "") return this.theme.fg("muted", "  Type to search:");
 		return `${this.theme.fg("muted", "  Type to search:")} ${this.theme.fg("accent", this.searchQuery)}`;
+	}
+
+	private renderTitleLine(width: number, liveCount: number, closedCount: number): string {
+		const leftText = this.theme.bold(`  Pi Threads (${liveCount} live, ${closedCount} closed)`);
+		const rightText = truncateToWidth(this.renderFilterControls(), width, "");
+		const availableLeft = Math.max(0, width - visibleWidth(rightText) - 1);
+		const left = truncateToWidth(leftText, availableLeft, "");
+		const spacing = Math.max(0, width - visibleWidth(left) - visibleWidth(rightText));
+		return `${left}${" ".repeat(spacing)}${rightText}`;
+	}
+
+	private renderFilterControls(): string {
+		const t = this.theme;
+		const option = (filter: StateFilter, label: string): string => {
+			const marker = this.filter === filter ? "◉" : "○";
+			const text = `${marker} ${label}`;
+			return this.filter === filter ? t.fg("accent", text) : t.fg("muted", text);
+		};
+
+		return `${t.fg("muted", "State: ")}${option("all", "All")}${t.fg("muted", " | ")}${option("live", "Live")}${t.fg("muted", " | ")}${option("closed", "Closed")}`;
+	}
+
+	private renderHelpLines(width: number): string[] {
+		const availableWidth = Math.max(1, width);
+		const indent = "  ";
+		const separator = " · ";
+		const lines: string[] = [];
+		let currentLine = "";
+
+		for (const item of THREAD_HELP_ITEMS) {
+			const candidate = currentLine
+				? `${currentLine}${separator}${item}`
+				: visibleWidth(`${indent}${item}`) <= availableWidth
+					? `${indent}${item}`
+					: item;
+
+			if (!currentLine || visibleWidth(candidate) <= availableWidth) {
+				currentLine = candidate;
+				continue;
+			}
+
+			lines.push(...wrapTextWithAnsi(currentLine.trimEnd(), availableWidth));
+			currentLine = visibleWidth(`${indent}${item}`) <= availableWidth ? `${indent}${item}` : item;
+		}
+
+		if (currentLine) lines.push(...wrapTextWithAnsi(currentLine.trimEnd(), availableWidth));
+
+		return lines.map((line) => this.theme.fg("muted", line));
+	}
+
+	private renderBorder(width: number): string[] {
+		return new DynamicBorder((s: string) => this.theme.fg("border", s)).render(width);
 	}
 
 	private renderThreadRow(
