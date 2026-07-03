@@ -303,20 +303,6 @@ export default function (pi: ExtensionAPI) {
 		return new Text(theme.fg("muted", text), 1, 0);
 	});
 
-	pi.registerCommand("thread", {
-		description: "Manage Pi thread session state",
-		getArgumentCompletions: (_prefix: string) => [
-			{ value: "exit", label: "exit", description: "Return to the parent session" },
-		],
-		handler: async (args, ctx) => {
-			if (args.trim() === "exit") {
-				await exitThreadSession(ctx);
-				return;
-			}
-			ctx.ui.notify("Usage: /thread exit", "info");
-		},
-	});
-
 	pi.registerCommand("exit", {
 		description: "Exit a Pi thread and return to the parent session",
 		handler: async (_args, ctx) => exitThreadSession(ctx),

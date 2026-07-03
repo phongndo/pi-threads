@@ -375,7 +375,7 @@ export class ThreadsTreeComponent implements Component {
 				withSession: async (nextCtx) => {
 					await nextCtx.sendMessage({
 						customType: PI_THREAD_ENTRY_MESSAGE_TYPE,
-						content: `Entered Pi thread "${threadTitle}". Use /exit or /thread exit to return to the parent session.`,
+						content: `Entered Pi thread "${threadTitle}". Use /exit to return to the parent session.`,
 						display: true,
 						details: {
 							parentSessionFile,
