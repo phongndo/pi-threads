@@ -61,8 +61,7 @@ When you enter a closed/stopped thread from `/threads`, pi switches to that chil
 session and records the parent session. Live threads must be stopped or closed
 before they can be opened. Use `/exit` from inside the child session to switch
 back to the parent. Entering is disabled when Pi was started with `--no-session`,
-because there is no saved parent session to return to. `/thread exit` is kept as
-an explicit alias.
+because there is no saved parent session to return to.
 
 Friendly titles (generated session name, `name`, then `taskName` or short id)
 are for display in the TUI and tool call labels. For automation and follow-up
