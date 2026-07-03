@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/phongndo/pi-threads/security/advisories/new
+    about: Please report security issues privately.
+  - name: Pi documentation
+    url: https://github.com/earendil-works/pi-coding-agent
+    about: Questions about Pi itself may belong upstream.

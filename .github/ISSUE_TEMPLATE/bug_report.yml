@@ -1,0 +1,64 @@
+name: Bug report
+description: Report a reproducible problem in pi-threads.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please do not include security vulnerabilities here; use the private security advisory link instead.
+  - type: input
+    id: version
+    attributes:
+      label: pi-threads version
+      description: npm version or commit SHA.
+      placeholder: "0.2.2"
+    validations:
+      required: true
+  - type: input
+    id: pi-version
+    attributes:
+      label: Pi version
+      placeholder: "0.80.3"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Windows / WSL
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Include the command, tool call, prompt, or minimal repository setup that triggers the problem.
+      placeholder: |
+        1. Run `pi -e npm:@phongndo/pi-threads`
+        2. Ask Pi to start a thread with ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include error messages, thread ids, stderr tails, or screenshots when useful.
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Logs, related issues, or suspected cause.

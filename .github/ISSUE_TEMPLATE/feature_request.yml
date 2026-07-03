@@ -1,0 +1,33 @@
+name: Feature request
+description: Suggest an improvement to pi-threads.
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe the workflow you want to enable. pi-threads intentionally avoids hard-coded roles, so examples of agent behavior are especially helpful.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What is hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior, API, command, or documentation change you want.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing workarounds or different designs.
+  - type: textarea
+    id: risks
+    attributes:
+      label: Safety or compatibility considerations
+      description: Note any effects on child process management, inherited restrictions, recursion, or TUI behavior.

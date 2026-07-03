@@ -3,6 +3,13 @@ dist/
 coverage/
 .DS_Store
 .direnv/
+.env
+.env.*
+!.env.example
+.npm/
+.pnpm-store/
 result
+tmp/
+.tmp/
+*.tsbuildinfo
 *.log
-

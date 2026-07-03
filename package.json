@@ -20,8 +20,12 @@
   },
   "files": [
     "src",
+    "CHANGELOG.md",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "SECURITY.md"
   ],
   "type": "module",
   "publishConfig": {
@@ -32,6 +36,7 @@
     "dev:pi": "pi -ne -e .",
     "lint": "oxlint --deny-warnings --tsconfig tsconfig.json src test vitest.config.ts",
     "lint:fix": "pnpm lint --fix",
+    "licenses:list": "pnpm licenses list",
     "lsp:oxformat": "oxfmt --lsp",
     "lsp:oxlint": "oxlint --lsp",
     "lsp:ts": "typescript-language-server --stdio",
@@ -58,10 +63,10 @@
     "vitest": "^4.1.9"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "@earendil-works/pi-ai": ">=0.80.3 <1.0.0",
+    "@earendil-works/pi-coding-agent": ">=0.80.3 <1.0.0",
+    "@earendil-works/pi-tui": ">=0.80.3 <1.0.0",
+    "typebox": ">=1.1.38 <2.0.0"
   },
   "simple-git-hooks": {
     "pre-commit": "pnpm exec lint-staged"

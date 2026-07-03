@@ -1,6 +1,13 @@
 # pi-threads
 
+[![CI](https://github.com/phongndo/pi-threads/actions/workflows/ci.yml/badge.svg)](https://github.com/phongndo/pi-threads/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/%40phongndo%2Fpi-threads)](https://www.npmjs.com/package/@phongndo/pi-threads)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Let your Pi agent create **dynamic workflows on its own** — forking, delegating, reviewing, or parallelizing work as it sees fit, with no hard-coded workflow graph.
+
+> Status: usable pre-1.0 Pi extension. The behavior is covered by CI and tests,
+> but compatibility follows Pi's evolving extension APIs.
 
 Pi threads are normal Pi sessions that run in the background. Your Pi agent can start them with a prompt, check on their progress, send follow-up messages, and stop them when done — all from within a single conversation. A child thread has its own working directory, its own context window, and its own tool access, so parallel investigations stay isolated and don't bloat the parent session.
 
@@ -139,6 +146,11 @@ bounded way to hand context to subthreads when useful.
 
 ## Installation
 
+Requirements:
+
+- Node.js `>=22.19.0`
+- Pi packages `>=0.80.3 <1.0.0`
+
 From npm:
 
 ```bash
@@ -192,3 +204,19 @@ pnpm install
 pnpm check          # format + lint + typecheck + test
 pnpm dev:pi         # run Pi with the extension loaded locally
 ```
+
+Quality gates are enforced by GitHub Actions on pushes and pull requests. The
+local `pnpm check` command runs the same format, lint, typecheck, and test suite.
+
+## Project health
+
+- Contributing guide: [`CONTRIBUTING.md`](CONTRIBUTING.md)
+- Security policy: [`SECURITY.md`](SECURITY.md)
+- Code of conduct: [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)
+- Changelog: [`CHANGELOG.md`](CHANGELOG.md)
+- Dependency license summary: `pnpm licenses:list`
+
+## License
+
+This project is released under the OSI-approved MIT License. See
+[`LICENSE`](LICENSE) for the full standard license text.
