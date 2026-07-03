@@ -275,13 +275,13 @@ describe("thread exit commands", () => {
 		expect(commandContext.shutdown).not.toHaveBeenCalled();
 	});
 
-	it("/thread exit still warns when no parent session is recorded", async () => {
+	it("/threads exit warns when no parent session is recorded", async () => {
 		const handlers = registeredCommandHandlers();
-		const thread = handlers.get("thread");
-		if (thread === undefined) throw new Error("/thread command was not registered");
+		const threads = handlers.get("threads");
+		if (threads === undefined) throw new Error("/threads command was not registered");
 		const commandContext = commandCtx();
 
-		await thread("exit", commandContext);
+		await threads("exit", commandContext);
 
 		expect(commandContext.notify).toHaveBeenCalledWith(
 			expect.stringContaining("No parent"),
@@ -290,10 +290,35 @@ describe("thread exit commands", () => {
 		expect(commandContext.shutdown).not.toHaveBeenCalled();
 		expect(commandContext.switchSession).not.toHaveBeenCalled();
 	});
+
+	it("/threads exit inside an entered thread switches back to the recorded parent session", async () => {
+		const handlers = registeredCommandHandlers();
+		const threads = handlers.get("threads");
+		if (threads === undefined) throw new Error("/threads command was not registered");
+		const commandContext = commandCtx([
+			{
+				type: "custom_message",
+				customType: PI_THREAD_ENTRY_MESSAGE_TYPE,
+				details: { parentSessionFile: "/tmp/parent.jsonl" },
+			},
+		]);
+
+		await threads("exit", commandContext);
+
+		expect(commandContext.switchSession).toHaveBeenCalledWith("/tmp/parent.jsonl");
+		expect(commandContext.shutdown).not.toHaveBeenCalled();
+		expect(commandContext.notify).not.toHaveBeenCalled();
+	});
+
+	it("does not register the deprecated singular /thread command", () => {
+		const handlers = registeredCommandHandlers();
+
+		expect(handlers.has("thread")).toBe(false);
+	});
 });
 
 describe("thread tool rendering", () => {
-	it("does not list threads when rendering calls without id labels", () => {
+	it("does not list threads when rendering deterministic call labels", () => {
 		let renderCall:
 			| ((
 					args: Record<string, unknown>,
@@ -334,6 +359,18 @@ describe("thread tool rendering", () => {
 			expect(
 				renderCall({ action: "wait", timeoutMs: 1500 }, theme).render(80).join("\n").trimEnd(),
 			).toBe("thread wait 1.5s");
+			expect(
+				renderCall({ action: "wait", id: "/root/review_tests", timeoutMs: 1500 }, theme)
+					.render(80)
+					.join("\n")
+					.trimEnd(),
+			).toBe("thread wait /root/review_tests 1.5s");
+			expect(
+				renderCall({ action: "send", id: "review_tests", message: "Check failures" }, theme)
+					.render(80)
+					.join("\n")
+					.trimEnd(),
+			).toBe('thread send review_tests "Check failures"');
 			expect(listCalls).toBe(0);
 		} finally {
 			restoreManager();
@@ -369,33 +406,19 @@ describe("thread tool rendering", () => {
 		expect(rendered?.render(80).join("\n")).not.toContain("2s");
 	});
 
-	it("renders an expanded empty list instead of a blank component", () => {
-		let renderResult:
-			| ((
-					result: unknown,
-					options: { expanded: boolean; isPartial: boolean },
-					theme: Theme,
-			  ) => {
-					render: (width: number) => string[];
-			  })
-			| undefined;
+	it("uses Pi's default result renderer to keep historical thread output plain", () => {
+		let hasRenderResult: boolean | undefined;
 		const pi = {
 			registerCommand: () => undefined,
 			registerMessageRenderer: () => undefined,
 			on: () => undefined,
-			registerTool: (tool: { renderResult: typeof renderResult }) => {
-				renderResult = tool.renderResult;
+			registerTool: (tool: { renderResult?: unknown }) => {
+				hasRenderResult = "renderResult" in tool;
 			},
 		} as unknown as ExtensionAPI;
 
 		extension(pi);
 
-		const component = renderResult?.(
-			{ content: [], details: { kind: "listed", threads: [] } },
-			{ expanded: true, isPartial: false },
-			theme,
-		);
-
-		expect(component?.render(80).join("\n")).toContain("No threads");
+		expect(hasRenderResult).toBe(false);
 	});
 });

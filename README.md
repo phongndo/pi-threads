@@ -114,10 +114,12 @@ children while preventing a tool call from loosening the parent's restrictions.
 ## Observability
 
 Use `/threads` in Pi's TUI to open an interactive thread browser for the current
-session. It defaults to all known threads so completed work remains visible;
-pass `/threads live`, `/threads all`, or `/threads closed` to filter the list.
-Other filter text shows usage instead of silently falling back to `all`. The TUI
-still opens when the selected filter is empty.
+session. It defaults to all known threads so completed work remains visible.
+Use `/threads exit` as the explicit thread-session exit command; `/exit` remains
+the convenient shortcut that returns to the parent when a parent thread session
+is recorded.
+Other arguments show usage instead of silently falling back to the browser. The
+TUI opens with no arguments.
 
 The browser follows Pi's native tree-like UI style with state badges, friendly
 thread titles, search, and keyboard controls. Use `↑`/`↓` to navigate, type to
@@ -130,14 +132,14 @@ When you enter a closed/stopped thread from `/threads`, pi switches to that chil
 session and records the parent session. Live threads must be stopped or closed
 before they can be opened. Use `/exit` from inside the child session to switch
 back to the parent. Outside a recorded thread session, `/exit` behaves like a
-normal Pi shutdown request; `/thread exit` is the thread-specific form and warns
+normal Pi shutdown request; `/threads exit` is the thread-specific form and warns
 when no parent session is recorded. Entering is disabled when Pi was started with
 `--no-session`, because there is no saved parent session to return to.
 
 Friendly titles (generated session name, `name`, then `taskName` or short id)
-are for display in the TUI and tool call labels. For automation and follow-up
-tool calls, prefer stable references: the `thread_...` id, the canonical path
-such as `/root/review_tests`, or an unambiguous task name.
+are for display in the TUI. Tool call headers and automation use stable
+references: the `thread_...` id, the canonical path such as
+`/root/review_tests`, or an unambiguous task name.
 
 `start` accepts `forkTurns` for lightweight context forking into the child
 prompt: `none` (default), `all`, or a positive number of recent user turns.

@@ -377,6 +377,90 @@ describe("ThreadManager session metadata", () => {
 		expect(requests).toHaveLength(requestCount);
 	});
 
+	it("reports wait progress while a thread remains busy", async () => {
+		const child = new FakeChildProcess();
+		spawnMock.mockReturnValue(child);
+		attachRpc(child, (request) => {
+			if (request["type"] === "get_state") {
+				respond(child, request, {
+					sessionFile: "/tmp/wait-progress.jsonl",
+					sessionId: "session-wait-progress",
+					pendingMessageCount: 0,
+					isStreaming: true,
+					isCompacting: false,
+				});
+				return;
+			}
+
+			if (request["type"] === "prompt") respond(child, request);
+		});
+
+		const manager = new ThreadManager({
+			PI_THREADS_DEPTH: "0",
+			PI_THREADS_MAX_DEPTH: "2",
+			PI_THREADS_MAX_THREADS: "8",
+			PI_THREADS_PATH: "/root",
+			PI_THREADS_ROOT_SESSION_ID: "test-root",
+		} as NodeJS.ProcessEnv);
+
+		await manager.start({ action: "start", prompt: "wait", taskName: "wait_progress" }, context());
+		const onProgress = vi.fn();
+
+		const outcome = await manager.wait(
+			{ action: "wait", id: "wait_progress", timeoutMs: 20 },
+			{ onProgress },
+		);
+
+		expect(outcome.timedOut).toBe(true);
+		expect(onProgress).toHaveBeenCalled();
+		expect(onProgress.mock.calls.at(-1)?.[0]).toEqual(
+			expect.objectContaining({
+				thread: expect.objectContaining({ path: "/root/wait_progress", phase: "busy" }),
+			}),
+		);
+	});
+
+	it("cancels wait before refreshing child state when the signal is aborted", async () => {
+		const child = new FakeChildProcess();
+		const requests: string[] = [];
+		spawnMock.mockReturnValue(child);
+		attachRpc(child, (request) => {
+			requests.push(String(request["type"]));
+			if (request["type"] === "get_state") {
+				respond(child, request, {
+					sessionFile: "/tmp/wait-cancel.jsonl",
+					sessionId: "session-wait-cancel",
+					pendingMessageCount: 0,
+					isStreaming: true,
+				});
+				return;
+			}
+
+			if (request["type"] === "prompt") respond(child, request);
+		});
+
+		const manager = new ThreadManager({
+			PI_THREADS_DEPTH: "0",
+			PI_THREADS_MAX_DEPTH: "2",
+			PI_THREADS_MAX_THREADS: "8",
+			PI_THREADS_PATH: "/root",
+			PI_THREADS_ROOT_SESSION_ID: "test-root",
+		} as NodeJS.ProcessEnv);
+
+		await manager.start({ action: "start", prompt: "wait", taskName: "wait_cancel" }, context());
+		const requestCount = requests.length;
+		const controller = new AbortController();
+		controller.abort();
+
+		await expect(
+			manager.wait(
+				{ action: "wait", id: "wait_cancel", timeoutMs: 20 },
+				{ signal: controller.signal },
+			),
+		).rejects.toThrow("Thread wait aborted");
+		expect(requests).toHaveLength(requestCount);
+	});
+
 	it("keeps accepted initial prompts busy until child activity is observed", async () => {
 		const child = new FakeChildProcess();
 		let promptAccepted = false;

@@ -90,7 +90,7 @@ function component(
 }
 
 describe("/threads command", () => {
-	it("rejects unknown filters instead of falling back to all threads", async () => {
+	it("rejects unknown arguments instead of falling back to all threads", async () => {
 		let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
 		const list = vi.fn(() => [thread()]);
 		const notify = vi.fn();
@@ -110,7 +110,77 @@ describe("/threads command", () => {
 		} as unknown as ExtensionCommandContext);
 
 		expect(list).not.toHaveBeenCalled();
-		expect(notify).toHaveBeenCalledWith("Usage: /threads [all|live|closed]", "error");
+		expect(notify).toHaveBeenCalledWith("Usage: /threads [exit]", "error");
+	});
+
+	it("rejects removed state filter arguments", async () => {
+		let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
+		const list = vi.fn(() => [thread()]);
+		const notify = vi.fn();
+		const pi = {
+			registerCommand: (name: string, options: Parameters<ExtensionAPI["registerCommand"]>[1]) => {
+				if (name === "threads") handler = options.handler;
+			},
+		} as unknown as ExtensionAPI;
+
+		registerThreadsCommand(pi, { list } as unknown as ThreadManager);
+		if (handler === undefined) throw new Error("/threads command was not registered");
+
+		await handler("live", {
+			mode: "print",
+			hasUI: false,
+			ui: { notify },
+		} as unknown as ExtensionCommandContext);
+
+		expect(list).not.toHaveBeenCalled();
+		expect(notify).toHaveBeenCalledWith("Usage: /threads [exit]", "error");
+	});
+
+	it("routes /threads exit to the thread exit handler", async () => {
+		let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
+		const list = vi.fn(() => [thread()]);
+		const exit = vi.fn();
+		const pi = {
+			registerCommand: (name: string, options: Parameters<ExtensionAPI["registerCommand"]>[1]) => {
+				if (name === "threads") handler = options.handler;
+			},
+		} as unknown as ExtensionAPI;
+
+		registerThreadsCommand(pi, { list } as unknown as ThreadManager, { exit });
+		if (handler === undefined) throw new Error("/threads command was not registered");
+
+		const ctx = {
+			mode: "print",
+			hasUI: false,
+			ui: { notify: vi.fn() },
+		} as unknown as ExtensionCommandContext;
+		await handler("exit", ctx);
+
+		expect(exit).toHaveBeenCalledWith(ctx);
+		expect(list).not.toHaveBeenCalled();
+	});
+
+	it("warns instead of silently no-oping when /threads exit has no handler", async () => {
+		let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
+		const notify = vi.fn();
+		const list = vi.fn(() => [thread()]);
+		const pi = {
+			registerCommand: (name: string, options: Parameters<ExtensionAPI["registerCommand"]>[1]) => {
+				if (name === "threads") handler = options.handler;
+			},
+		} as unknown as ExtensionAPI;
+
+		registerThreadsCommand(pi, { list } as unknown as ThreadManager);
+		if (handler === undefined) throw new Error("/threads command was not registered");
+
+		await handler("exit", {
+			mode: "print",
+			hasUI: false,
+			ui: { notify },
+		} as unknown as ExtensionCommandContext);
+
+		expect(notify).toHaveBeenCalledWith("Thread exit is unavailable in this context", "warning");
+		expect(list).not.toHaveBeenCalled();
 	});
 });
 

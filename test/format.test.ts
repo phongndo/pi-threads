@@ -5,7 +5,7 @@ import {
 	type LiveThreadSnapshot,
 	type ThreadSnapshot,
 } from "../src/domain.ts";
-import { formatThreadLabel, formatThreadTitle } from "../src/format.ts";
+import { formatThreadLabel, formatThreadTitle, formatThreadUserStatus } from "../src/format.ts";
 
 function liveThread(overrides: Partial<LiveThreadSnapshot> = {}): ThreadSnapshot {
 	return {
@@ -65,5 +65,10 @@ describe("thread display formatting", () => {
 		expect(formatThreadLabel(thread.id, threads)).toBe("inspect repo");
 		expect(formatThreadLabel(thread.path, threads)).toBe("inspect repo");
 		expect(formatThreadLabel("/root/review_tests", threads)).toBe("review tests");
+	});
+
+	it("describes live idle threads as idle", () => {
+		expect(formatThreadUserStatus(liveThread({ phase: "idle" }))).toBe("idle");
+		expect(formatThreadUserStatus(liveThread({ phase: "busy" }))).toBe("working");
 	});
 });

@@ -152,6 +152,16 @@ export type WaitOutcome = {
 	readonly thread: ThreadSnapshot;
 };
 
+export type WaitProgress = {
+	readonly waitedMs: number;
+	readonly thread: ThreadSnapshot;
+};
+
+type WaitOptions = {
+	readonly signal?: AbortSignal;
+	readonly onProgress?: (progress: WaitProgress) => void;
+};
+
 export class ThreadManager {
 	readonly #threads = new Map<ThreadId, ManagedThread>();
 	readonly #listeners = new Set<ThreadChangeListener>();
@@ -490,12 +500,14 @@ export class ThreadManager {
 		return { kind: "stopped", thread: snapshot(this.#required(id)) };
 	}
 
-	async wait(command: WaitCommand): Promise<WaitOutcome> {
+	async wait(command: WaitCommand, options: WaitOptions = {}): Promise<WaitOutcome> {
 		const startedAt = Date.now();
 		const timeoutMs = command.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
+		throwIfAborted(options.signal);
 		const id = this.#requiredByTarget(command.id).id;
 
 		for (;;) {
+			throwIfAborted(options.signal);
 			const thread = this.#required(id);
 			if (thread.state === "closed") {
 				return {
@@ -519,12 +531,16 @@ export class ThreadManager {
 			let refreshedFromChild = false;
 			if (thread.state === "live") {
 				// eslint-disable-next-line no-await-in-loop -- wait intentionally observes one thread over time.
-				refreshedFromChild = await this.#refreshState(thread, {
-					timeoutMs: Math.min(RPC_QUICK_TIMEOUT_MS, remainingBeforeRefresh),
-				});
+				refreshedFromChild = await abortable(
+					this.#refreshState(thread, {
+						timeoutMs: Math.min(RPC_QUICK_TIMEOUT_MS, remainingBeforeRefresh),
+					}),
+					options.signal,
+				);
 			}
 
 			const refreshed = this.#required(id);
+			emitWaitProgress(options, startedAt, refreshed);
 			if (
 				refreshed.state === "closed" ||
 				(refreshedFromChild && refreshed.phase === "idle" && hasNoPendingMessages(refreshed))
@@ -551,10 +567,10 @@ export class ThreadManager {
 			const sleepMs = Math.min(WAIT_POLL_INTERVAL_MS, remainingMs);
 			if (refreshed.state === "live") {
 				// eslint-disable-next-line no-await-in-loop -- wait intentionally sleeps between status checks.
-				await Promise.race([refreshed.closed, delay(sleepMs)]);
+				await Promise.race([refreshed.closed, delay(sleepMs, options.signal)]);
 			} else {
 				// eslint-disable-next-line no-await-in-loop -- wait intentionally sleeps between status checks.
-				await delay(sleepMs);
+				await delay(sleepMs, options.signal);
 			}
 		}
 	}
@@ -1650,6 +1666,10 @@ function hasNoPendingMessages(thread: ManagedThread): boolean {
 	return pendingMessageCount === null || pendingMessageCount === 0;
 }
 
+function emitWaitProgress(options: WaitOptions, startedAt: number, thread: ManagedThread): void {
+	options.onProgress?.({ waitedMs: Date.now() - startedAt, thread: snapshot(thread) });
+}
+
 function classifyProcessExit(input: {
 	readonly code: number | null;
 	readonly signal: string | null;
@@ -1759,8 +1779,49 @@ function isDialogUiMethod(method: string): boolean {
 	return method === "select" || method === "confirm" || method === "input" || method === "editor";
 }
 
-function delay(milliseconds: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, milliseconds));
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted === true) throw abortError();
+}
+
+function abortError(): Error {
+	return new Error("Thread wait aborted");
+}
+
+async function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+	if (signal === undefined) return promise;
+	throwIfAborted(signal);
+	return new Promise((resolve, reject) => {
+		const onAbort = () => {
+			reject(abortError());
+		};
+		const cleanup = () => signal.removeEventListener("abort", onAbort);
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(
+			(value) => {
+				cleanup();
+				resolve(value);
+			},
+			(error: unknown) => {
+				cleanup();
+				reject(error);
+			},
+		);
+	});
+}
+
+function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+	if (signal?.aborted === true) return Promise.reject(abortError());
+	return new Promise((resolve, reject) => {
+		const timeout = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, milliseconds);
+		const onAbort = () => {
+			clearTimeout(timeout);
+			reject(abortError());
+		};
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
 }
 
 function createDeferred<T>(): {

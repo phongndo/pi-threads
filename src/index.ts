@@ -4,7 +4,6 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 	SessionShutdownEvent,
-	Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import {
@@ -12,7 +11,6 @@ import {
 	asThreadId,
 	asThreadPath,
 	isThreadIdText,
-	type ThreadEvent,
 	type ThreadId,
 	type ThreadPath,
 	type ThreadSnapshot,
@@ -23,23 +21,14 @@ import {
 	formatSend,
 	formatStart,
 	formatStop,
-	formatThreadLabel,
 	formatThreadTitle,
-	formatThreadStateBadge,
-	formatThreadSummary,
+	formatWaitProgress,
 	formatWait,
 } from "./format.ts";
 import { isRecord, stringField } from "./json.ts";
 import { assertPiThreadParams, PiThreadParamsSchema } from "./schema.ts";
 import { PI_THREAD_ENTRY_MESSAGE_TYPE, registerThreadsCommand } from "./threads-command.ts";
-import {
-	ThreadManager,
-	type ThreadManagerScope,
-	type SendOutcome,
-	type StartOutcome,
-	type StopOutcome,
-	type WaitOutcome,
-} from "./thread-manager.ts";
+import { ThreadManager, type ThreadManagerScope, type WaitProgress } from "./thread-manager.ts";
 import {
 	PI_THREAD_DESCRIPTION,
 	PI_THREAD_PROMPT_GUIDELINES,
@@ -63,61 +52,6 @@ function clearProcessManager(manager: ThreadManager): void {
 	if (store[PROCESS_MANAGER_KEY] === manager) delete store[PROCESS_MANAGER_KEY];
 }
 
-// ---- Render helpers ----
-
-function formatThreadState(thread: ThreadSnapshot, theme: Theme): string {
-	if (thread.state === "closed") {
-		const exitKind = thread.exit.kind;
-		if (exitKind === "failed") {
-			return theme.fg("error", `closed/${exitKind}: ${thread.exit.message}`);
-		}
-		let status = `closed/${exitKind}`;
-		if (thread.exit.code !== null) status += ` code=${thread.exit.code}`;
-		if (thread.exit.signal !== null) status += ` sig=${thread.exit.signal}`;
-		return theme.fg("dim", status);
-	}
-
-	switch (thread.phase) {
-		case "starting":
-			return theme.fg("muted", `live/starting pid=${thread.pid}`);
-		case "busy":
-			return theme.fg("accent", `live/busy pid=${thread.pid}`);
-		case "idle":
-			return theme.fg("success", `live/idle pid=${thread.pid}`);
-		case "stopping":
-			return theme.fg("warning", `live/stopping pid=${thread.pid}`);
-	}
-}
-
-function formatLastOutput(thread: ThreadSnapshot, maxLen: number): string | null {
-	const text =
-		thread.state === "live"
-			? (thread.lastPartialText ?? thread.lastAssistantText)
-			: thread.lastAssistantText;
-	if (!text || text.trim() === "") return null;
-	const trimmed = text.trim().replaceAll("\n", " ");
-	if (trimmed.length <= maxLen) return trimmed;
-	return trimmed.slice(0, maxLen - 3) + "...";
-}
-
-function formatEvents(events: readonly ThreadEvent[], maxCount: number): string[] {
-	return events.slice(-maxCount).map((event) => {
-		const at = event.at.slice(11, 19);
-		switch (event.kind) {
-			case "state":
-				return `${at}  ${event.message}`;
-			case "assistant":
-				return `${at}  "${event.text.slice(0, 80).replaceAll("\n", " ")}"`;
-			case "tool":
-				return `${at}  tool: ${event.name} (${event.phase})${event.error ? " error" : ""}`;
-			case "ui":
-				return `${at}  ui: ${event.method}${event.title ? ` - ${event.title}` : ""}`;
-			case "error":
-				return `${at}  error: ${event.message}`;
-		}
-	});
-}
-
 function formatTimeoutMsForTitle(timeoutMs: number): string {
 	if (!Number.isInteger(timeoutMs) || timeoutMs < 1000) return `${timeoutMs}ms`;
 	const wholeSeconds = Math.trunc(timeoutMs / 1000);
@@ -125,6 +59,10 @@ function formatTimeoutMsForTitle(timeoutMs: number): string {
 	if (milliseconds === 0) return `${wholeSeconds}s`;
 	const fractionalSeconds = String(milliseconds).padStart(3, "0").replace(/0+$/u, "");
 	return `${wholeSeconds}.${fractionalSeconds}s`;
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted === true) throw new Error("Thread action aborted");
 }
 
 // ---- Extension entrypoint ----
@@ -296,20 +234,12 @@ async function exitThreadSession(
 	await ctx.switchSession(parentSessionFile);
 }
 
-async function threadCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
-	const trimmed = args.trim().toLowerCase();
-	if (trimmed === "exit") {
-		await exitThreadSession(ctx, "warn");
-		return;
-	}
-	ctx.ui.notify("Usage: /thread exit", "error");
-}
-
 export default function (pi: ExtensionAPI) {
 	const manager = getProcessManager();
 
 	registerThreadsCommand(pi, manager, {
 		beforeUse: (ctx) => syncThreadManagerScope(ctx, manager),
+		exit: (ctx) => exitThreadSession(ctx, "warn"),
 	});
 
 	pi.on("session_start", (_event, ctx) => {
@@ -326,14 +256,6 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => exitThreadSession(ctx, "shutdown"),
 	});
 
-	pi.registerCommand("thread", {
-		description: "Pi thread commands",
-		getArgumentCompletions: (_prefix: string) => [
-			{ value: "exit", label: "exit", description: "Return to the parent thread session" },
-		],
-		handler: threadCommand,
-	});
-
 	pi.on("session_shutdown", async (event, ctx) => {
 		if (!(await prepareThreadsForSessionShutdown(event, ctx, manager))) return;
 		await manager.shutdown();
@@ -348,8 +270,9 @@ export default function (pi: ExtensionAPI) {
 		promptGuidelines: [...PI_THREAD_PROMPT_GUIDELINES],
 		parameters: PiThreadParamsSchema,
 
-		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, rawParams, signal, onUpdate, ctx) {
 			syncThreadManagerScope(ctx, manager);
+			throwIfAborted(signal);
 			assertPiThreadParams(rawParams);
 			const params = rawParams;
 
@@ -390,7 +313,16 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 				case "wait": {
-					const outcome = await manager.wait(params);
+					const waitOptions = {
+						...(signal === undefined ? {} : { signal }),
+						onProgress: (progress: WaitProgress) => {
+							onUpdate?.({
+								content: [{ type: "text", text: formatWaitProgress(progress) }],
+								details: { kind: "waiting", ...progress },
+							});
+						},
+					};
+					const outcome = await manager.wait(params, waitOptions);
 					return {
 						content: [{ type: "text", text: formatWait(outcome) }],
 						details: outcome,
@@ -423,21 +355,15 @@ export default function (pi: ExtensionAPI) {
 				case "poll":
 				case "stop": {
 					const id = typeof args["id"] === "string" ? args["id"] : "";
-					const label = id
-						? formatThreadLabel(id, manager.list({ action: "list", state: "all" }))
-						: "";
-					if (label) text += " " + theme.fg("accent", `"${label}"`);
+					if (id) text += " " + theme.fg("accent", id);
 					break;
 				}
 				case "send": {
 					const id = typeof args["id"] === "string" ? args["id"] : "";
-					const label = id
-						? formatThreadLabel(id, manager.list({ action: "list", state: "all" }))
-						: "";
 					const msg =
 						"message" in args && typeof args["message"] === "string" ? args["message"] : "";
 					const mode = "mode" in args && typeof args["mode"] === "string" ? args["mode"] : "";
-					if (label) text += " " + theme.fg("accent", `"${label}"`);
+					if (id) text += " " + theme.fg("accent", id);
 					if (mode) {
 						const shortMode =
 							mode === "follow_up"
@@ -457,10 +383,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				case "wait": {
 					const id = typeof args["id"] === "string" ? args["id"] : "";
-					const label = id
-						? formatThreadLabel(id, manager.list({ action: "list", state: "all" }))
-						: "";
-					if (label) text += " " + theme.fg("accent", `"${label}"`);
+					if (id) text += " " + theme.fg("accent", id);
 					const timeoutMs =
 						"timeoutMs" in args && typeof args["timeoutMs"] === "number"
 							? args["timeoutMs"]
@@ -476,162 +399,6 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			return new Text(text, 0, 0);
-		},
-
-		renderResult(result, options, theme) {
-			const details = result.details;
-			if (!details || typeof details !== "object") {
-				const first = result.content[0];
-				const text = first?.type === "text" && first.text ? first.text : "(no output)";
-				return new Text(theme.fg("toolOutput", text), 0, 0);
-			}
-
-			const d = details as Record<string, unknown>;
-			const kind = typeof d["kind"] === "string" ? d["kind"] : "";
-			const expanded = options?.expanded === true;
-
-			switch (kind) {
-				case "started": {
-					const outcome = details as StartOutcome;
-					const badge = formatThreadStateBadge(outcome.thread, theme);
-					const lines = [
-						`  ${badge} ${theme.fg("accent", formatThreadTitle(outcome.thread))}  ${formatThreadState(outcome.thread, theme)}`,
-					];
-					if (expanded) {
-						lines.push(
-							`  Path:   ${theme.fg("dim", outcome.thread.path)}`,
-							`  ID:     ${theme.fg("dim", outcome.thread.id)}`,
-							`  Prompt: ${outcome.promptAccepted ? theme.fg("success", "accepted") : theme.fg("warning", "not accepted")}`,
-							`  Fork:   ${theme.fg("muted", outcome.forkContext.mode)}`,
-						);
-						if (outcome.note) lines.push(`  Note:   ${theme.fg("muted", outcome.note)}`);
-					}
-					return new Text(lines.join("\n"), 0, 0);
-				}
-
-				case "listed": {
-					const threads = (
-						details as {
-							readonly kind: "listed";
-							readonly threads: readonly ThreadSnapshot[];
-						}
-					).threads;
-					if (!Array.isArray(threads)) {
-						return new Text(theme.fg("dim", "No threads"), 0, 0);
-					}
-					const liveCount = threads.filter((t) => t.state === "live").length;
-					const closedCount = threads.length - liveCount;
-					const lines: string[] = [];
-					if (expanded) {
-						if (threads.length === 0) {
-							lines.push(`  ${theme.fg("dim", "No threads")}`);
-						} else {
-							for (const t of threads) {
-								const badge = formatThreadStateBadge(t, theme);
-								const summary = formatThreadSummary(t, 80);
-								lines.push(
-									`  ${badge} ${theme.fg("accent", formatThreadTitle(t))}`,
-									`    ${theme.fg("dim", t.path)}  ${theme.fg("dim", summary)}`,
-								);
-							}
-						}
-					} else {
-						lines.push(
-							`  ${threads.length} thread${threads.length === 1 ? "" : "s"} • ${liveCount} live, ${closedCount} closed`,
-						);
-					}
-					return new Text(lines.join("\n"), 0, 0);
-				}
-
-				case "polled": {
-					const thread = (
-						details as {
-							readonly kind: "polled";
-							readonly thread: ThreadSnapshot;
-						}
-					).thread;
-					if (!thread || typeof thread !== "object") {
-						return new Text(theme.fg("error", "Invalid thread data"), 0, 0);
-					}
-					const badge = formatThreadStateBadge(thread, theme);
-					const lines = [
-						`  ${badge} ${theme.fg("accent", formatThreadTitle(thread))}  ${formatThreadState(thread, theme)}`,
-					];
-					if (expanded) {
-						lines.push(`  Path:   ${theme.fg("dim", thread.path)}`);
-						lines.push(`  ID:     ${theme.fg("dim", thread.id)}`);
-						const lastOut = formatLastOutput(thread, 200);
-						if (lastOut) lines.push(`  Last:   ${theme.fg("toolOutput", `"${lastOut}"`)}`);
-						if (thread.recentEvents.length > 0) {
-							lines.push("", `  ${theme.fg("muted", "Events:")}`);
-							for (const eventLine of formatEvents(thread.recentEvents, 8)) {
-								lines.push(`    ${theme.fg("dim", eventLine)}`);
-							}
-						}
-						if (
-							"stderrTail" in thread &&
-							typeof thread.stderrTail === "string" &&
-							thread.stderrTail.trim()
-						) {
-							lines.push("", `  ${theme.fg("warning", "stderr:")}`);
-							lines.push(`    ${theme.fg("dim", thread.stderrTail.slice(0, 200).trimEnd())}`);
-						}
-					} else {
-						const lastOut = formatLastOutput(thread, 80);
-						if (lastOut) lines.push(`  Last:   ${theme.fg("toolOutput", `"${lastOut}"`)}`);
-					}
-					return new Text(lines.join("\n"), 0, 0);
-				}
-
-				case "sent": {
-					const outcome = details as SendOutcome;
-					const lines: string[] = [`  ${theme.fg("accent", formatThreadTitle(outcome.thread))}`];
-					if (outcome.accepted) {
-						lines.push(`  ${theme.fg("success", "Accepted")}`);
-					} else {
-						lines.push(`  ${theme.fg("error", "Rejected")}`);
-						if (outcome.error) lines.push(`  ${theme.fg("warning", outcome.error)}`);
-					}
-					if (expanded) {
-						lines.push(`  Mode:  ${theme.fg("muted", outcome.mode)}`);
-						lines.push(`  State: ${formatThreadState(outcome.thread, theme)}`);
-					}
-					return new Text(lines.join("\n"), 0, 0);
-				}
-
-				case "stopped": {
-					const outcome = details as StopOutcome;
-					return new Text(
-						`  ${theme.fg("accent", formatThreadTitle(outcome.thread))}  ${formatThreadState(outcome.thread, theme)}`,
-						0,
-						0,
-					);
-				}
-
-				case "waited": {
-					const outcome = details as WaitOutcome;
-					const lines: string[] = [];
-					if (outcome.timedOut) {
-						lines.push(
-							`  ${theme.fg("warning", `Timed out after ${outcome.waitedMs}ms`)} ${theme.fg("accent", formatThreadTitle(outcome.thread))}`,
-						);
-					} else {
-						lines.push(
-							`  ${theme.fg("success", `Completed in ${outcome.waitedMs}ms`)} ${theme.fg("accent", formatThreadTitle(outcome.thread))}`,
-						);
-					}
-					if (expanded) {
-						lines.push(`  State: ${formatThreadState(outcome.thread, theme)}`);
-					}
-					return new Text(lines.join("\n"), 0, 0);
-				}
-
-				default: {
-					const first = result.content[0];
-					const text = first?.type === "text" && first.text ? first.text : "(no output)";
-					return new Text(theme.fg("toolOutput", text), 0, 0);
-				}
-			}
 		},
 	});
 }

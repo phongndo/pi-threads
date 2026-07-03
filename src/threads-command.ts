@@ -35,44 +35,55 @@ export const PI_THREAD_ENTRY_MESSAGE_TYPE = "pi-threads-entry";
 export function registerThreadsCommand(
 	pi: ExtensionAPI,
 	manager: ThreadManager,
-	options: { readonly beforeUse?: (ctx: ExtensionCommandContext) => void } = {},
+	options: {
+		readonly beforeUse?: (ctx: ExtensionCommandContext) => void;
+		readonly exit?: (ctx: ExtensionCommandContext) => Promise<void>;
+	} = {},
 ): void {
 	pi.registerCommand("threads", {
 		description: "List and manage Pi threads interactively",
 		getArgumentCompletions: (_prefix: string) => [
-			{ value: "live", label: "live", description: "Show only live threads" },
-			{ value: "all", label: "all", description: "Show all threads" },
-			{ value: "closed", label: "closed", description: "Show only closed threads" },
+			{ value: "exit", label: "exit", description: "Return to the parent thread session" },
 		],
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			options.beforeUse?.(ctx);
 			const trimmed = args?.trim().toLowerCase() || "";
-			const filter = parseStateFilter(trimmed);
-			if (filter === null) {
-				ctx.ui.notify("Usage: /threads [all|live|closed]", "error");
+			const command = parseThreadsCommand(trimmed);
+			if (command === null) {
+				ctx.ui.notify("Usage: /threads [exit]", "error");
+				return;
+			}
+			if (command.kind === "exit") {
+				if (options.exit === undefined) {
+					ctx.ui.notify("Thread exit is unavailable in this context", "warning");
+					return;
+				}
+				await options.exit(ctx);
 				return;
 			}
 
 			if (ctx.mode === "tui") {
-				await showThreadsTui(ctx, manager, manager.list({ action: "list", state: "all" }), filter);
+				await showThreadsTui(ctx, manager, manager.list({ action: "list", state: "all" }), "all");
 			} else if (ctx.hasUI) {
-				const threads = manager.list({ action: "list", state: filter });
+				const threads = manager.list({ action: "list", state: "all" });
 				if (threads.length === 0) {
-					ctx.ui.notify(`No ${filter} threads found`, "info");
+					ctx.ui.notify("No threads found", "info");
 					return;
 				}
 				await showThreadsRpc(ctx, manager, threads);
 			} else {
-				const threads = manager.list({ action: "list", state: filter });
-				ctx.ui.notify(`Found ${threads.length} ${filter} thread(s)`, "info");
+				const threads = manager.list({ action: "list", state: "all" });
+				ctx.ui.notify(`Found ${threads.length} thread(s)`, "info");
 			}
 		},
 	});
 }
 
-function parseStateFilter(value: string): StateFilter | null {
-	if (value === "" || value === "all") return "all";
-	if (value === "live" || value === "closed") return value;
+type ThreadsCommand = { readonly kind: "browse" } | { readonly kind: "exit" };
+
+function parseThreadsCommand(value: string): ThreadsCommand | null {
+	if (value === "exit") return { kind: "exit" };
+	if (value === "") return { kind: "browse" };
 	return null;
 }
 
@@ -339,13 +350,7 @@ export class ThreadsTreeComponent implements Component {
 			: t.fg("accent", formatThreadTitle(thread));
 		const userStatus = formatThreadUserStatus(thread);
 		const statusColor =
-			userStatus === "working"
-				? "accent"
-				: userStatus === "blocked"
-					? "warning"
-					: userStatus === "failed"
-						? "error"
-						: "success";
+			userStatus === "working" ? "accent" : userStatus === "failed" ? "error" : "success";
 		const status = t.fg(statusColor, userStatus);
 		const summary = t.fg("muted", formatThreadSummary(thread, 90));
 		const path = t.fg("dim", thread.path);

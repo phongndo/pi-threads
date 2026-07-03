@@ -4,7 +4,13 @@ import {
 	type ThreadExit,
 	type ThreadSnapshot,
 } from "./domain.ts";
-import type { SendOutcome, StartOutcome, StopOutcome, WaitOutcome } from "./thread-manager.ts";
+import type {
+	SendOutcome,
+	StartOutcome,
+	StopOutcome,
+	WaitOutcome,
+	WaitProgress,
+} from "./thread-manager.ts";
 
 export function formatStart(outcome: StartOutcome): string {
 	const title = formatThreadTitle(outcome.thread);
@@ -88,6 +94,10 @@ export function formatWait(outcome: WaitOutcome): string {
 	return `Wait ${status} after ${outcome.waitedMs}ms for "${formatThreadTitle(outcome.thread)}".\nPath: ${outcome.thread.path}\nStatus: ${formatStatus(outcome.thread)}`;
 }
 
+export function formatWaitProgress(progress: WaitProgress): string {
+	return `Waiting ${progress.waitedMs}ms for "${formatThreadTitle(progress.thread)}".\nPath: ${progress.thread.path}\nStatus: ${formatStatus(progress.thread)}`;
+}
+
 function formatStatus(thread: ThreadSnapshot): string {
 	if (thread.state === "closed") {
 		if (isFailedExit(thread.exit)) return "closed/failed";
@@ -151,9 +161,9 @@ export function formatThreadReference(thread: ThreadSnapshot): string {
 
 export function formatThreadUserStatus(
 	thread: ThreadSnapshot,
-): "working" | "blocked" | "done" | "failed" {
+): "working" | "idle" | "done" | "failed" {
 	if (thread.state === "closed") return isFailedExit(thread.exit) ? "failed" : "done";
-	return thread.phase === "idle" ? "blocked" : "working";
+	return thread.phase === "idle" ? "idle" : "working";
 }
 
 export function formatThreadStateBadge(
