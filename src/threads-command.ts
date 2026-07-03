@@ -97,6 +97,7 @@ export class ThreadsTreeComponent implements Component {
 	private threads: ThreadSnapshot[];
 	private selectedIndex = 0;
 	private searchQuery = "";
+	private closed = false;
 	private cachedWidth: number | undefined;
 	private cachedLines: string[] | undefined;
 
@@ -118,6 +119,7 @@ export class ThreadsTreeComponent implements Component {
 	}
 
 	updateThreads(threads: readonly ThreadSnapshot[]): void {
+		if (this.closed) return;
 		const selectedId = this.selectedThread()?.id;
 		this.threads = [...threads];
 
@@ -182,6 +184,7 @@ export class ThreadsTreeComponent implements Component {
 	}
 
 	handleInput(data: string): void {
+		if (this.closed) return;
 		const filtered = this.filteredThreads();
 
 		if (matchesKey(data, Key.up)) {
@@ -215,7 +218,7 @@ export class ThreadsTreeComponent implements Component {
 				this.rerender();
 				return;
 			}
-			this.done(null);
+			this.close(null);
 			return;
 		}
 
@@ -380,7 +383,8 @@ export class ThreadsTreeComponent implements Component {
 
 		try {
 			const updated = await this.manager.poll(thread.path);
-			this.ctx.ui.notify(
+			if (this.closed) return;
+			this.notify(
 				`Polled ${formatThreadTitle(updated)} — ${formatThreadUserStatus(updated)}`,
 				"info",
 			);
@@ -388,7 +392,7 @@ export class ThreadsTreeComponent implements Component {
 			this.rerender();
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
-			this.ctx.ui.notify(`Poll failed: ${message}`, "error");
+			this.notify(`Poll failed: ${message}`, "error");
 		}
 	}
 
@@ -397,7 +401,7 @@ export class ThreadsTreeComponent implements Component {
 		if (!thread) return;
 		const parentSessionFile = this.ctx.sessionManager.getSessionFile();
 		if (parentSessionFile === undefined) {
-			this.ctx.ui.notify(
+			this.notify(
 				"Cannot enter a thread from a --no-session Pi session because there is no saved parent session to return to.",
 				"warning",
 			);
@@ -407,12 +411,10 @@ export class ThreadsTreeComponent implements Component {
 
 		try {
 			const updated = await this.manager.poll(thread.path);
+			if (this.closed) return;
 			this.replaceThread(updated);
 			if (updated.session.kind !== "known") {
-				this.ctx.ui.notify(
-					`Thread session is not ready yet: ${formatThreadTitle(updated)}`,
-					"warning",
-				);
+				this.notify(`Thread session is not ready yet: ${formatThreadTitle(updated)}`, "warning");
 				this.rerender();
 				return;
 			}
@@ -420,7 +422,7 @@ export class ThreadsTreeComponent implements Component {
 			const sessionFile = updated.session.file;
 			const threadTitle = formatThreadTitle(updated);
 			if (updated.state === "live") {
-				this.ctx.ui.notify(
+				this.notify(
 					`Thread ${threadTitle} is still live. Stop it with Ctrl+X or wait for it to close before opening its session.`,
 					"warning",
 				);
@@ -428,7 +430,7 @@ export class ThreadsTreeComponent implements Component {
 				return;
 			}
 
-			this.done(null);
+			this.close(null);
 			await this.ctx.switchSession(sessionFile, {
 				withSession: async (nextCtx) => {
 					await nextCtx.sendMessage({
@@ -446,7 +448,7 @@ export class ThreadsTreeComponent implements Component {
 			});
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
-			this.ctx.ui.notify(`Enter failed: ${message}`, "error");
+			this.notify(`Enter failed: ${message}`, "error", { allowClosed: true });
 		}
 	}
 
@@ -456,11 +458,12 @@ export class ThreadsTreeComponent implements Component {
 
 		try {
 			const outcome = await this.manager.stop({ action: "stop", id: thread.path, force: false });
-			this.ctx.ui.notify(`Stopped ${formatThreadTitle(outcome.thread)}`, "info");
+			if (this.closed) return;
+			this.notify(`Stopped ${formatThreadTitle(outcome.thread)}`, "info");
 			this.refreshList();
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
-			this.ctx.ui.notify(`Stop failed: ${message}`, "error");
+			this.notify(`Stop failed: ${message}`, "error");
 		}
 	}
 
@@ -470,6 +473,7 @@ export class ThreadsTreeComponent implements Component {
 	}
 
 	private refreshList(): void {
+		if (this.closed) return;
 		this.threads = [...this.manager.list({ action: "list", state: "all" })];
 		this.selectedIndex = Math.min(
 			this.selectedIndex,
@@ -485,9 +489,33 @@ export class ThreadsTreeComponent implements Component {
 	}
 
 	private rerender(): void {
+		if (this.closed) return;
 		this.invalidate();
 		this.tui.requestRender();
 	}
+
+	private close(result: null): void {
+		if (this.closed) return;
+		this.closed = true;
+		this.done(result);
+	}
+
+	private notify(
+		message: string,
+		type: "info" | "warning" | "error" = "info",
+		options: { readonly allowClosed?: boolean } = {},
+	): void {
+		if (this.closed && options.allowClosed !== true) return;
+		try {
+			this.ctx.ui.notify(message, type);
+		} catch (err: unknown) {
+			if (!isStaleExtensionContextError(err)) throw err;
+		}
+	}
+}
+
+function isStaleExtensionContextError(err: unknown): boolean {
+	return err instanceof Error && err.message.includes("This extension ctx is stale");
 }
 
 async function showThreadsRpc(

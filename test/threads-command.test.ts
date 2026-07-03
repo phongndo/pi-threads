@@ -200,4 +200,44 @@ describe("ThreadsTreeComponent input", () => {
 			expect.objectContaining({ withSession: expect.any(Function) }),
 		);
 	});
+
+	it("does not use a stale command context after the menu closes during stop", async () => {
+		let stale = false;
+		const notify = vi.fn();
+		let resolveStop!: (outcome: {
+			readonly kind: "stopped";
+			readonly thread: ThreadSnapshot;
+		}) => void;
+		const stop = vi.fn(
+			() =>
+				new Promise<{ readonly kind: "stopped"; readonly thread: ThreadSnapshot }>((resolve) => {
+					resolveStop = resolve;
+				}),
+		);
+		const done = vi.fn();
+		const tree = component(
+			{ stop },
+			[thread()],
+			{
+				get ui() {
+					if (stale) {
+						throw new Error("This extension ctx is stale after session replacement or reload.");
+					}
+					return { notify };
+				},
+			} as unknown as ExtensionCommandContext,
+			done,
+		);
+
+		const stopPromise = (
+			tree as unknown as { readonly handleStop: () => Promise<void> }
+		).handleStop();
+		tree.handleInput("\x1b");
+		stale = true;
+		resolveStop({ kind: "stopped", thread: thread() });
+
+		await expect(stopPromise).resolves.toBeUndefined();
+		expect(done).toHaveBeenCalledWith(null);
+		expect(notify).not.toHaveBeenCalled();
+	});
 });
