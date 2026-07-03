@@ -12,7 +12,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Repository community health documentation: contributing guide, security policy,
   code of conduct, issue templates, and pull request template.
 - README links for project quality, support, security, and license information.
-- Dependabot configuration for npm and GitHub Actions.
 
 ### Changed
 
