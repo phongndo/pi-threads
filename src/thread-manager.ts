@@ -84,6 +84,14 @@ type ClosedThread = ThreadBase & {
 
 type ManagedThread = LiveThread | ClosedThread;
 
+export type ThreadChangeListener = (threads: readonly ThreadSnapshot[]) => void;
+
+export type ThreadManagerScope = {
+	readonly currentPath: ThreadPath;
+	readonly depth: number;
+	readonly selfThreadId: ThreadId | null;
+};
+
 export type StartOutcome = {
 	readonly kind: "started";
 	readonly promptAccepted: boolean;
@@ -114,25 +122,68 @@ export type WaitOutcome = {
 
 export class ThreadManager {
 	readonly #threads = new Map<ThreadId, ManagedThread>();
-	readonly #depth: number;
+	readonly #listeners = new Set<ThreadChangeListener>();
+	readonly #baseScope: ThreadManagerScope;
+	#depth: number;
 	readonly #maxDepth: number;
 	readonly #maxThreads: number;
-	readonly #selfThreadId: ThreadId | null;
-	readonly #currentPath: ThreadPath;
+	#selfThreadId: ThreadId | null;
+	#currentPath: ThreadPath;
 	readonly #rootSessionId: string;
 	readonly #forkContextMaxChars: number;
 
 	constructor(environment: NodeJS.ProcessEnv = process.env) {
-		this.#depth = readInteger(environment["PI_THREADS_DEPTH"], 0);
+		const baseDepth = readInteger(environment["PI_THREADS_DEPTH"], 0);
+		const baseSelfThreadId = readOptionalThreadId(environment["PI_THREADS_SELF_ID"]);
+		const baseCurrentPath = readThreadPath(environment["PI_THREADS_PATH"], ROOT_THREAD_PATH);
+		this.#baseScope = {
+			currentPath: baseCurrentPath,
+			depth: baseDepth,
+			selfThreadId: baseSelfThreadId,
+		};
+		this.#depth = baseDepth;
 		this.#maxDepth = readInteger(environment["PI_THREADS_MAX_DEPTH"], DEFAULT_MAX_DEPTH);
 		this.#maxThreads = readInteger(environment["PI_THREADS_MAX_THREADS"], DEFAULT_MAX_THREADS);
-		this.#selfThreadId = readOptionalThreadId(environment["PI_THREADS_SELF_ID"]);
-		this.#currentPath = readThreadPath(environment["PI_THREADS_PATH"], ROOT_THREAD_PATH);
+		this.#selfThreadId = baseSelfThreadId;
+		this.#currentPath = baseCurrentPath;
 		this.#rootSessionId = environment["PI_THREADS_ROOT_SESSION_ID"] ?? `root_${process.pid}`;
 		this.#forkContextMaxChars = readInteger(
 			environment["PI_THREADS_FORK_CONTEXT_MAX_CHARS"],
 			DEFAULT_FORK_CONTEXT_MAX_CHARS,
 		);
+	}
+
+	onChange(listener: ThreadChangeListener): () => void {
+		this.#listeners.add(listener);
+		return () => {
+			this.#listeners.delete(listener);
+		};
+	}
+
+	getScope(): ThreadManagerScope {
+		return {
+			currentPath: this.#currentPath,
+			depth: this.#depth,
+			selfThreadId: this.#selfThreadId,
+		};
+	}
+
+	resetScope(): void {
+		this.rebindScope(this.#baseScope);
+	}
+
+	rebindScope(scope: ThreadManagerScope): void {
+		this.#currentPath = scope.currentPath;
+		this.#depth = scope.depth;
+		this.#selfThreadId = scope.selfThreadId;
+	}
+
+	findBySessionFile(sessionFile: string): ThreadSnapshot | undefined {
+		const thread = Array.from(this.#threads.values()).find(
+			(candidate) =>
+				candidate.session.kind === "known" && sameSessionFile(candidate.session.file, sessionFile),
+		);
+		return thread === undefined ? undefined : snapshot(thread);
 	}
 
 	list(command?: ListCommand): readonly ThreadSnapshot[] {
@@ -248,6 +299,7 @@ export class ThreadManager {
 
 		this.#threads.set(id, thread);
 		pushEvent(thread, { kind: "state", at: nowIso(), message: `started pid ${child.pid}` });
+		this.#emitChange();
 
 		child.stderr.on("data", (chunk: Buffer | string) => {
 			const current = this.#threads.get(id);
@@ -270,6 +322,8 @@ export class ThreadManager {
 			});
 		});
 
+		await this.#refreshSession(thread);
+
 		let note: string | null = null;
 		let promptAccepted = false;
 		try {
@@ -285,6 +339,11 @@ export class ThreadManager {
 		} catch (error) {
 			note = error instanceof Error ? error.message : String(error);
 		}
+		const current = this.#threads.get(id);
+		if (current?.state === "live" && current.session.kind !== "known") {
+			await this.#refreshSession(current);
+		}
+		this.#emitChange();
 
 		return {
 			kind: "started",
@@ -301,6 +360,7 @@ export class ThreadManager {
 		if (thread.state === "live") {
 			await this.#refreshState(thread);
 		}
+		this.#emitChange();
 
 		return snapshot(this.#required(thread.id));
 	}
@@ -309,6 +369,7 @@ export class ThreadManager {
 		const thread = this.#liveByTarget(command.id);
 		const mode = command.mode ?? defaultSendMode(thread.phase);
 		const response = await sendMessage(thread, mode, command.message);
+		this.#emitChange();
 
 		return {
 			kind: "sent",
@@ -320,14 +381,19 @@ export class ThreadManager {
 	}
 
 	async stop(command: StopCommand): Promise<StopOutcome> {
-		const thread = this.#requiredByTarget(command.id);
+		let thread = this.#requiredByTarget(command.id);
 		const id = thread.id;
 
+		if (thread.state === "closed") return { kind: "stopped", thread: snapshot(thread) };
+		if (thread.session.kind !== "known") await this.#refreshSession(thread);
+
+		thread = this.#required(id);
 		if (thread.state === "closed") return { kind: "stopped", thread: snapshot(thread) };
 
 		thread.stopRequested = true;
 		thread.phase = "stopping";
 		pushEvent(thread, { kind: "state", at: nowIso(), message: "stopping" });
+		this.#emitChange();
 
 		if (command.force === true) {
 			thread.child.kill("SIGKILL");
@@ -339,6 +405,7 @@ export class ThreadManager {
 		}
 
 		await Promise.race([thread.closed, delay(STOP_GRACE_MS)]);
+		this.#emitChange();
 		return { kind: "stopped", thread: snapshot(this.#required(id)) };
 	}
 
@@ -396,6 +463,7 @@ export class ThreadManager {
 				if (this.#threads.get(thread.id)?.state === "live") thread.child.kill("SIGKILL");
 			}),
 		);
+		this.#emitChange();
 	}
 
 	#assertStartAllowed(): void {
@@ -521,6 +589,7 @@ export class ThreadManager {
 		pushEvent(closed, { kind: "state", at: nowIso(), message: `closed: ${exit.kind}` });
 		this.#threads.set(id, closed);
 		thread.resolveClosed();
+		this.#emitChange();
 	}
 
 	#handleRpcEvent(id: ThreadId, clientEvent: RpcClientEvent): void {
@@ -531,6 +600,7 @@ export class ThreadManager {
 
 		if (clientEvent.kind === "parse_error") {
 			pushEvent(thread, { kind: "error", at: nowIso(), message: clientEvent.message });
+			this.#emitChange();
 			return;
 		}
 
@@ -543,12 +613,14 @@ export class ThreadManager {
 				thread.phase = "busy";
 				thread.hasRun = true;
 				pushEvent(thread, { kind: "state", at: nowIso(), message: "agent started" });
+				this.#emitChange();
 				return;
 			}
 			case "agent_end": {
 				thread.phase = "idle";
 				thread.lastPartialText = null;
 				pushEvent(thread, { kind: "state", at: nowIso(), message: "agent ended" });
+				this.#emitChange();
 				return;
 			}
 			case "message_update": {
@@ -562,6 +634,7 @@ export class ThreadManager {
 					thread.lastAssistantText = text;
 					thread.lastPartialText = null;
 					pushEvent(thread, { kind: "assistant", at: nowIso(), text: tail(text, 2_000) });
+					this.#emitChange();
 				}
 				return;
 			}
@@ -574,6 +647,7 @@ export class ThreadManager {
 					name: stringField(event, "toolName") ?? "unknown",
 					error: false,
 				});
+				this.#emitChange();
 				return;
 			}
 			case "tool_execution_end": {
@@ -584,6 +658,7 @@ export class ThreadManager {
 					name: stringField(event, "toolName") ?? "unknown",
 					error: event["isError"] === true,
 				});
+				this.#emitChange();
 				return;
 			}
 			case "extension_ui_request": {
@@ -598,6 +673,7 @@ export class ThreadManager {
 					autoCancelled: shouldAutoCancel,
 				});
 				if (shouldAutoCancel) thread.rpc.respondToUiRequest(requestId);
+				this.#emitChange();
 				return;
 			}
 			default:
@@ -605,33 +681,40 @@ export class ThreadManager {
 		}
 	}
 
-	async #refreshState(thread: LiveThread): Promise<void> {
+	async #requestState(
+		thread: LiveThread,
+		options: { readonly recordErrors: boolean },
+	): Promise<Record<string, unknown> | null> {
 		const response = await thread.rpc
 			.request({ type: "get_state" }, RPC_QUICK_TIMEOUT_MS)
 			.catch((error: unknown) => {
-				pushEvent(thread, {
-					kind: "error",
-					at: nowIso(),
-					message: error instanceof Error ? error.message : String(error),
-				});
+				if (options.recordErrors) {
+					pushEvent(thread, {
+						kind: "error",
+						at: nowIso(),
+						message: error instanceof Error ? error.message : String(error),
+					});
+				}
 				return null;
 			});
 
-		if (!response?.success || !isRecord(response.data)) return;
+		if (!response?.success || !isRecord(response.data)) return null;
+		return response.data;
+	}
 
-		const file = stringField(response.data, "sessionFile");
-		const id = stringField(response.data, "sessionId");
-		if (file !== null && id !== null) {
-			thread.session = {
-				kind: "known",
-				file,
-				id,
-				name: stringField(response.data, "sessionName"),
-				pendingMessageCount: numberField(response.data, "pendingMessageCount"),
-			};
-		}
+	async #refreshSession(thread: LiveThread): Promise<void> {
+		const data = await this.#requestState(thread, { recordErrors: false });
+		if (data === null) return;
+		if (captureSession(thread, data)) this.#emitChange();
+	}
 
-		const isStreaming = response.data["isStreaming"] === true;
+	async #refreshState(thread: LiveThread): Promise<void> {
+		const data = await this.#requestState(thread, { recordErrors: true });
+		if (data === null) return;
+
+		captureSession(thread, data);
+
+		const isStreaming = data["isStreaming"] === true;
 		if (isStreaming) thread.hasRun = true;
 		if (thread.phase !== "stopping") {
 			if (isStreaming) {
@@ -644,7 +727,47 @@ export class ThreadManager {
 				thread.phase = "idle";
 			}
 		}
+		this.#emitChange();
 	}
+
+	#emitChange(): void {
+		if (this.#listeners.size === 0) return;
+		const threads = Array.from(this.#threads.values())
+			.toSorted((left, right) => left.path.localeCompare(right.path))
+			.map((thread) => snapshot(thread));
+		for (const listener of this.#listeners) {
+			try {
+				listener(threads);
+			} catch {
+				// UI observers must not affect thread lifecycle management.
+			}
+		}
+	}
+}
+
+function captureSession(thread: LiveThread, data: Record<string, unknown>): boolean {
+	const file = stringField(data, "sessionFile");
+	const id = stringField(data, "sessionId");
+	if (file !== null && id !== null) {
+		const nextSession = {
+			kind: "known",
+			file,
+			id,
+			name: stringField(data, "sessionName"),
+			pendingMessageCount: numberField(data, "pendingMessageCount"),
+		} satisfies ThreadSession;
+
+		const changed =
+			thread.session.kind !== "known" ||
+			thread.session.file !== nextSession.file ||
+			thread.session.id !== nextSession.id ||
+			thread.session.name !== nextSession.name ||
+			thread.session.pendingMessageCount !== nextSession.pendingMessageCount;
+		thread.session = nextSession;
+		return changed;
+	}
+
+	return false;
 }
 
 export function buildPiArgs(input: {
@@ -739,6 +862,10 @@ function pushEvent(thread: ThreadBase, event: ThreadEvent): void {
 function resolveCwd(parentCwd: string, childCwd: string | undefined): string {
 	if (childCwd === undefined) return parentCwd;
 	return path.resolve(parentCwd, childCwd);
+}
+
+function sameSessionFile(left: string, right: string): boolean {
+	return path.resolve(left) === path.resolve(right);
 }
 
 function defaultSendMode(phase: ThreadPhase): SendMode {
