@@ -1,10 +1,12 @@
-import type { ThreadEvent, ThreadSnapshot } from "./domain.ts";
+import { threadPathBasename, type ThreadEvent, type ThreadSnapshot } from "./domain.ts";
 import type { SendOutcome, StartOutcome, StopOutcome, WaitOutcome } from "./thread-manager.ts";
 
 export function formatStart(outcome: StartOutcome): string {
+	const title = formatThreadTitle(outcome.thread);
 	const lines = [
-		`Started Pi thread ${outcome.thread.id} (${outcome.thread.name}).`,
+		`Started Pi thread "${title}".`,
 		`Path: ${outcome.thread.path}`,
+		`ID: ${outcome.thread.id}`,
 		`Status: ${formatStatus(outcome.thread)}`,
 		`Prompt accepted: ${outcome.promptAccepted ? "yes" : "no"}`,
 	];
@@ -14,21 +16,26 @@ export function formatStart(outcome: StartOutcome): string {
 		);
 	}
 	if (outcome.note !== null) lines.push(`Note: ${outcome.note}`);
-	lines.push(`Poll with: { "action": "poll", "id": "${outcome.thread.id}" }`);
+	lines.push(`Poll with: { "action": "poll", "id": "${outcome.thread.path}" }`);
 	return lines.join("\n");
 }
 
 export function formatList(threads: readonly ThreadSnapshot[]): string {
 	if (threads.length === 0) return "No Pi threads are managed by this parent session.";
 	return threads
-		.map((thread) => `${thread.id} ${thread.path} (${thread.name}) - ${formatStatus(thread)}`)
+		.map(
+			(thread) =>
+				`${formatThreadTitle(thread)} ${thread.path} - ${formatStatus(thread)} [id: ${thread.id}]`,
+		)
 		.join("\n");
 }
 
 export function formatPoll(thread: ThreadSnapshot): string {
+	const title = formatThreadTitle(thread);
 	const lines = [
-		`Pi thread ${thread.id} (${thread.name})`,
+		`Pi thread "${title}"`,
 		`Path: ${thread.path}`,
+		`ID: ${thread.id}`,
 		`Parent: ${thread.parentPath}${thread.parentThreadId ? ` (${thread.parentThreadId})` : ""}`,
 		`Depth: ${thread.depth}`,
 		`Status: ${formatStatus(thread)}`,
@@ -58,7 +65,8 @@ export function formatPoll(thread: ThreadSnapshot): string {
 
 export function formatSend(outcome: SendOutcome): string {
 	const lines = [
-		`Sent message to ${outcome.thread.id} with mode ${outcome.mode}.`,
+		`Sent message to "${formatThreadTitle(outcome.thread)}" with mode ${outcome.mode}.`,
+		`Path: ${outcome.thread.path}`,
 		`Accepted: ${outcome.accepted ? "yes" : "no"}`,
 		`Status: ${formatStatus(outcome.thread)}`,
 	];
@@ -67,12 +75,12 @@ export function formatSend(outcome: SendOutcome): string {
 }
 
 export function formatStop(outcome: StopOutcome): string {
-	return `Stopped ${outcome.thread.id}.\nStatus: ${formatStatus(outcome.thread)}`;
+	return `Stopped "${formatThreadTitle(outcome.thread)}".\nPath: ${outcome.thread.path}\nStatus: ${formatStatus(outcome.thread)}`;
 }
 
 export function formatWait(outcome: WaitOutcome): string {
 	const status = outcome.timedOut ? "timed out" : "completed";
-	return `Wait ${status} after ${outcome.waitedMs}ms for ${outcome.thread.id}.\nStatus: ${formatStatus(outcome.thread)}`;
+	return `Wait ${status} after ${outcome.waitedMs}ms for "${formatThreadTitle(outcome.thread)}".\nPath: ${outcome.thread.path}\nStatus: ${formatStatus(outcome.thread)}`;
 }
 
 function formatStatus(thread: ThreadSnapshot): string {
@@ -98,7 +106,111 @@ function formatEvent(event: ThreadEvent): string {
 	}
 }
 
+export function formatThreadLabel(idText: string, threads: readonly ThreadSnapshot[]): string {
+	// Try to find a thread by id, path, or taskName
+	for (const t of threads) {
+		if (t.id === idText || t.path === idText || t.taskName === idText || t.name === idText) {
+			return formatThreadTitle(t);
+		}
+	}
+	// Fall back to path basename or raw id
+	if (idText.startsWith("/")) {
+		return humanizeTaskName(idText.slice(idText.lastIndexOf("/") + 1));
+	}
+	return idText;
+}
+
+export function formatThreadTitle(thread: ThreadSnapshot): string {
+	const sessionName =
+		thread.session.kind === "known" ? cleanDisplayText(thread.session.name) : null;
+	if (sessionName !== null) return sessionName;
+
+	const explicitName = cleanDisplayText(thread.name);
+	if (explicitName !== null && explicitName !== thread.id && explicitName !== thread.taskName) {
+		return explicitName;
+	}
+
+	const taskName = cleanDisplayText(thread.taskName);
+	if (taskName !== null && taskName !== thread.id) return humanizeTaskName(taskName);
+
+	const basename = threadPathBasename(thread.path);
+	if (basename !== thread.id) return humanizeTaskName(basename);
+
+	return shortThreadId(thread.id);
+}
+
+export function formatThreadReference(thread: ThreadSnapshot): string {
+	return `${formatThreadTitle(thread)} (${thread.path})`;
+}
+
+export function formatThreadUserStatus(
+	thread: ThreadSnapshot,
+): "working" | "blocked" | "done" | "failed" {
+	if (thread.state === "closed") return thread.exit.kind === "failed" ? "failed" : "done";
+	return thread.phase === "idle" ? "blocked" : "working";
+}
+
+export function formatThreadStateBadge(
+	thread: ThreadSnapshot,
+	theme: { fg: (color: "error" | "dim" | "muted" | "warning" | "success", text: string) => string },
+): string {
+	if (thread.state === "closed") {
+		const exitKind = thread.exit.kind;
+		if (exitKind === "failed") {
+			return theme.fg("error", "✕");
+		}
+		return theme.fg("dim", "○");
+	}
+
+	switch (thread.phase) {
+		case "starting":
+			return theme.fg("muted", "◌");
+		case "busy":
+			return theme.fg("warning", "●");
+		case "idle":
+			return theme.fg("success", "●");
+		case "stopping":
+			return theme.fg("warning", "◌");
+	}
+}
+
+export function formatThreadSummary(thread: ThreadSnapshot, maxLen?: number): string {
+	const statePart =
+		thread.state === "closed" ? `closed/${thread.exit.kind}` : `live/${thread.phase}`;
+	const pidPart = thread.state === "live" ? ` pid=${thread.pid}` : "";
+
+	const text =
+		thread.state === "live"
+			? (thread.lastPartialText ?? thread.lastAssistantText)
+			: thread.lastAssistantText;
+
+	let summary = `(${statePart}${pidPart})`;
+	if (text && text.trim()) {
+		const preview = text.trim().replaceAll("\n", " ");
+		const truncated =
+			maxLen && preview.length > maxLen ? preview.slice(0, maxLen - 3) + "..." : preview;
+		summary += ` ${truncated}`;
+	}
+	return summary;
+}
+
 function trimForDisplay(text: string, maxLength: number): string {
 	if (text.length <= maxLength) return text;
 	return `${text.slice(0, maxLength)}\n[truncated ${text.length - maxLength} chars]`;
+}
+
+function cleanDisplayText(value: string | null): string | null {
+	if (value === null) return null;
+	const trimmed = value.trim();
+	return trimmed === "" ? null : trimmed;
+}
+
+function humanizeTaskName(value: string): string {
+	const trimmed = value.trim();
+	if (trimmed === "") return trimmed;
+	return trimmed.replaceAll("_", " ");
+}
+
+function shortThreadId(value: string): string {
+	return value.startsWith("thread_") ? value.slice(0, "thread_".length + 6) : value;
 }

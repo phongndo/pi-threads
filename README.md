@@ -43,6 +43,32 @@ Threads also get a stable canonical path like `/root/review_tests`. Pass
 `taskName` on `start` to choose the final path segment, then refer to the thread
 later by id, full path, or unambiguous task name.
 
+## Observability
+
+Use `/threads` in Pi's TUI to open an interactive thread browser for the current
+session. It defaults to all known threads so completed work remains visible;
+pass `/threads live`, `/threads all`, or `/threads closed` to filter the list.
+The TUI still opens when the selected filter is empty.
+
+The browser follows Pi's native tree-like UI style with state badges, friendly
+thread titles, search, and keyboard controls. Use `↑`/`↓` to navigate, type to
+search, `tab` to cycle filters (`all` → `live` → `closed`), `enter` to enter a
+closed/stopped thread's Pi session, `ctrl+p` to poll/refresh that row, `ctrl+r`
+to refresh the list, `ctrl+x` to stop it, and `esc` to clear search or close.
+The control legend is shown in the browser footer.
+
+When you enter a closed/stopped thread from `/threads`, pi switches to that child
+session and records the parent session. Live threads must be stopped or closed
+before they can be opened. Use `/exit` from inside the child session to switch
+back to the parent. Entering is disabled when Pi was started with `--no-session`,
+because there is no saved parent session to return to. `/thread exit` is kept as
+an explicit alias.
+
+Friendly titles (generated session name, `name`, then `taskName` or short id)
+are for display in the TUI and tool call labels. For automation and follow-up
+tool calls, prefer stable references: the `thread_...` id, the canonical path
+such as `/root/review_tests`, or an unambiguous task name.
+
 `start` accepts `forkTurns` for lightweight context forking into the child
 prompt: `none` (default), `all`, or a positive number of recent user turns.
 This keeps the implementation process-isolated while giving Pi an explicit,
