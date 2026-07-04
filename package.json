@@ -1,6 +1,6 @@
 {
   "name": "@phongndo/pi-threads",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "A minimal Pi extension that lets Pi sessions start, poll, message, list, and stop other Pi sessions.",
   "keywords": [
     "agents",
