@@ -20,9 +20,9 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
 
 ## 2. Keep one model-facing tool
 
-- [ ] Keep a single `thread` tool with action-based input.
-- [ ] Do not split into `thread_start`, `thread_poll`, `thread_wait`, etc.
-- [ ] Keep the top-level tool surface small and stable.
+- [x] Keep a single `thread` tool with action-based input.
+- [x] Do not split into `thread_start`, `thread_poll`, `thread_wait`, etc.
+- [x] Keep the top-level tool surface small and stable.
 
 ## 3. Improve validation and repairability
 
@@ -171,7 +171,7 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
 
 ## Suggested implementation order
 
-1. Guidance mode config and shorter neutral description.
+1. Registry-only prompt metadata and shorter neutral description.
 2. Better validation and repair errors.
 3. Auto-generated `taskName` and display name.
 4. Shared structured snapshot shape for all actions.

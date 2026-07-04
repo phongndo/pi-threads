@@ -36,7 +36,9 @@ the user.
 
 ## Commands
 
-Pi calls the `thread` tool with one action:
+Pi calls a single model-facing `thread` tool with an `action` field. The
+extension does not expose separate `thread_start`, `thread_poll`, or other split
+tools:
 
 | Action  | What it does                                                      |
 | ------- | ----------------------------------------------------------------- |

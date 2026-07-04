@@ -9,6 +9,7 @@ import { describe, expect, it, vi } from "vitest";
 import { asThreadId, asThreadPath, type ThreadSnapshot } from "../src/domain.ts";
 import { PI_THREAD_ENTRY_MESSAGE_TYPE } from "../src/threads-command.ts";
 import extension from "../src/index.ts";
+import { PiThreadParamsSchema } from "../src/schema.ts";
 import {
 	getThreadsSessionShutdownAction,
 	prepareThreadsForSessionShutdown,
@@ -92,18 +93,24 @@ function managerWithThread(thread: ThreadSnapshot | null): ThreadManager {
 type CommandHandler = (args: string, ctx: ExtensionCommandContext) => Promise<void>;
 type RegisteredTool = Parameters<ExtensionAPI["registerTool"]>[0];
 
-function registeredThreadTool(): RegisteredTool {
-	let registered: RegisteredTool | undefined;
+function registeredThreadTools(): RegisteredTool[] {
+	const tools: RegisteredTool[] = [];
 	const pi = {
 		registerCommand: () => undefined,
 		registerMessageRenderer: () => undefined,
 		on: () => undefined,
 		registerTool: (tool: RegisteredTool) => {
-			registered = tool;
+			tools.push(tool);
 		},
 	} as unknown as ExtensionAPI;
 
 	extension(pi);
+	return tools;
+}
+
+function registeredThreadTool(): RegisteredTool {
+	const tools = registeredThreadTools();
+	const registered = tools.find((tool) => tool.name === "thread");
 	if (registered === undefined) throw new Error("thread tool was not registered");
 	return registered;
 }
@@ -145,10 +152,19 @@ function commandCtx(branch: readonly unknown[] = []): ExtensionCommandContext & 
 }
 
 describe("thread prompt metadata", () => {
+	it("registers exactly one model-facing thread tool", () => {
+		const tools = registeredThreadTools();
+
+		expect(tools.map((tool) => tool.name)).toEqual(["thread"]);
+	});
+
 	it("uses only registry metadata with a neutral description", () => {
 		const tool = registeredThreadTool();
 
+		expect(tool.name).toBe("thread");
+		expect(tool.label).toBe("Thread");
 		expect(tool.description).toBe("Start and manage background Pi child sessions.");
+		expect(tool.parameters).toBe(PiThreadParamsSchema);
 		expect(tool).not.toHaveProperty("promptSnippet");
 		expect(tool).not.toHaveProperty("promptGuidelines");
 	});
