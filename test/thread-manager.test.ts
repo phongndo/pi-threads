@@ -173,6 +173,46 @@ describe("ThreadManager session metadata", () => {
 		);
 	});
 
+	it("sends the initial prompt verbatim", async () => {
+		const child = new FakeChildProcess();
+		const requests: string[] = [];
+		const prompts: string[] = [];
+		spawnMock.mockReturnValue(child);
+		attachRpc(child, (request) => {
+			requests.push(String(request["type"]));
+			if (request["type"] === "get_state") {
+				respond(child, request, {
+					sessionFile: "/tmp/verbatim.jsonl",
+					sessionId: "session-verbatim",
+					pendingMessageCount: 0,
+					isStreaming: false,
+				});
+				return;
+			}
+
+			if (request["type"] === "prompt") {
+				prompts.push(String(request["message"]));
+				respond(child, request);
+			}
+		});
+
+		const manager = new ThreadManager({
+			PI_THREADS_DEPTH: "0",
+			PI_THREADS_MAX_DEPTH: "2",
+			PI_THREADS_MAX_THREADS: "8",
+			PI_THREADS_PATH: "/root",
+			PI_THREADS_ROOT_SESSION_ID: "test-root",
+		} as NodeJS.ProcessEnv);
+
+		await manager.start(
+			{ action: "start", prompt: "/review ignored\n\nUse only this prompt.", taskName: "verbatim" },
+			context(),
+		);
+
+		expect(requests).toEqual(["get_state", "prompt"]);
+		expect(prompts).toEqual(["/review ignored\n\nUse only this prompt."]);
+	});
+
 	it("emits one change notification for a successful poll refresh", async () => {
 		const child = new FakeChildProcess();
 		spawnMock.mockReturnValue(child);

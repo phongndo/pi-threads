@@ -23,7 +23,7 @@ describe("thread schemas", () => {
 
 	it("accepts each valid action shape", () => {
 		const valid: readonly PiThreadParams[] = [
-			{ action: "start", prompt: "Inspect the repo", taskName: "inspect_repo", forkTurns: "2" },
+			{ action: "start", prompt: "Inspect the repo", taskName: "inspect_repo" },
 			{ action: "list", state: "live", ancestor: "/root" },
 			{ action: "poll", id: "/root/inspect_repo" },
 			{ action: "send", id: "thread_012345abcdef", message: "Continue", mode: "follow_up" },
@@ -47,7 +47,6 @@ describe("thread schemas", () => {
 			{ action: "stop", prompt: "nope" },
 			{ action: "wait", id: "thread_012345abcdef", timeoutMs: -1 },
 			{ action: "start", prompt: "x", taskName: "Bad Name" },
-			{ action: "start", prompt: "x", forkTurns: "0" },
 			{ action: "list", parent: "/root/a", ancestor: "/root" },
 			{ action: "unknown" },
 		] as const;

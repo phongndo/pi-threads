@@ -4,14 +4,14 @@
 [![npm](https://img.shields.io/npm/v/%40phongndo%2Fpi-threads)](https://www.npmjs.com/package/@phongndo/pi-threads)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Let your Pi agent create **dynamic workflows on its own** — forking, delegating, reviewing, or parallelizing work as it sees fit, with no hard-coded workflow graph.
+Let your Pi agent create **dynamic workflows on its own** — delegating, reviewing, or parallelizing work as it sees fit, with no hard-coded workflow graph.
 
 > Status: usable pre-1.0 Pi extension. The behavior is covered by CI and tests,
 > but compatibility follows Pi's evolving extension APIs.
 
 Pi threads are normal Pi sessions that run in the background. Your Pi agent can start them with a prompt, check on their progress, send follow-up messages, and stop them when done — all from within a single conversation. A child thread has its own working directory, its own context window, and its own tool access, so parallel investigations stay isolated and don't bloat the parent session.
 
-There are no baked-in roles (no "reviewer", no "planner", no "worker"). Pi decides what to fork and why. Recursion is supported: child sessions can spawn their own children, guarded by depth and concurrency limits.
+There are no baked-in roles (no "reviewer", no "planner", no "worker"). Pi decides what to delegate and why. Recursion is supported: child sessions can spawn their own children, guarded by depth and concurrency limits.
 
 ## How Pi learns to use it
 
@@ -52,8 +52,7 @@ Example tool calls:
 {
   "action": "start",
   "prompt": "Review the API docs for stale examples and report exact fixes.",
-  "taskName": "review_docs",
-  "forkTurns": "3"
+  "taskName": "review_docs"
 }
 ```
 
@@ -141,10 +140,9 @@ are for display in the TUI. Tool call headers and automation use stable
 references: the `thread_...` id, the canonical path such as
 `/root/review_tests`, or an unambiguous task name.
 
-`start` accepts `forkTurns` for lightweight context forking into the child
-prompt: `none` (default), `all`, or a positive number of recent user turns.
-This keeps the implementation process-isolated while giving Pi an explicit,
-bounded way to hand context to subthreads when useful.
+`start` sends the supplied prompt to the child session verbatim. Threads do not
+implicitly copy parent conversation context; include any context the child needs
+directly in the prompt.
 
 ## Installation
 
@@ -179,11 +177,10 @@ pi install /path/to/pi-threads
 
 ## Configuration
 
-| Variable                            | Default | Purpose                                                |
-| ----------------------------------- | ------- | ------------------------------------------------------ |
-| `PI_THREADS_MAX_DEPTH`              | `2`     | How deep threads can spawn threads.                    |
-| `PI_THREADS_MAX_THREADS`            | `8`     | Max concurrent live threads per parent.                |
-| `PI_THREADS_FORK_CONTEXT_MAX_CHARS` | `24000` | Max parent-context characters included by `forkTurns`. |
+| Variable                 | Default | Purpose                                 |
+| ------------------------ | ------- | --------------------------------------- |
+| `PI_THREADS_MAX_DEPTH`   | `2`     | How deep threads can spawn threads.     |
+| `PI_THREADS_MAX_THREADS` | `8`     | Max concurrent live threads per parent. |
 
 ## Safety
 

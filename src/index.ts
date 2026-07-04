@@ -347,9 +347,6 @@ export default function (pi: ExtensionAPI) {
 					const taskName =
 						"taskName" in args && typeof args["taskName"] === "string" ? args["taskName"] : "";
 					if (taskName) text += " " + theme.fg("muted", `[${taskName}]`);
-					const forkTurns =
-						"forkTurns" in args && typeof args["forkTurns"] === "string" ? args["forkTurns"] : "";
-					if (forkTurns) text += " " + theme.fg("muted", `fork=${forkTurns}`);
 					break;
 				}
 				case "poll":

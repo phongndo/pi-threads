@@ -17,11 +17,6 @@ export const ListStateSchema = StringEnum(["all", "live", "closed"] as const, {
 	description: "Filter listed threads by runtime state.",
 });
 
-export const ForkTurnsSchema = Type.String({
-	pattern: "^(none|all|[1-9][0-9]*)$",
-	description: "Parent context to include: none, all, or recent N user turns.",
-});
-
 const TargetDescription = "Thread id, canonical path (/root/task), or unambiguous task name.";
 
 export const StartCommandSchema = Type.Object(
@@ -40,7 +35,6 @@ export const StartCommandSchema = Type.Object(
 				description: "Stable lower_snake_case path segment.",
 			}),
 		),
-		forkTurns: Type.Optional(ForkTurnsSchema),
 		args: Type.Optional(
 			Type.Array(Type.String(), {
 				description: "Extra Pi CLI args. RPC mode is enforced; one-shot modes are rejected.",
@@ -165,7 +159,6 @@ export const PiThreadParamsSchema = Type.Object(
 				description: "For start: stable lower_snake_case path segment.",
 			}),
 		),
-		forkTurns: Type.Optional(ForkTurnsSchema),
 		args: Type.Optional(
 			Type.Array(Type.String(), {
 				description: "For start: extra Pi CLI args. RPC mode is enforced.",
@@ -271,7 +264,7 @@ function isAction(value: unknown): value is Action {
 function allowedFieldsForAction(action: Action): ReadonlySet<string> {
 	switch (action) {
 		case "start":
-			return new Set(["action", "prompt", "name", "taskName", "forkTurns", "args", "cwd"]);
+			return new Set(["action", "prompt", "name", "taskName", "args", "cwd"]);
 		case "list":
 			return new Set(["action", "state", "parent", "ancestor"]);
 		case "poll":

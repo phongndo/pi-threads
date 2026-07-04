@@ -21,11 +21,6 @@ export function formatStart(outcome: StartOutcome): string {
 		`Status: ${formatStatus(outcome.thread)}`,
 		`Prompt accepted: ${outcome.promptAccepted ? "yes" : "no"}`,
 	];
-	if (outcome.forkContext.mode !== "none") {
-		lines.push(
-			`Fork context: ${outcome.forkContext.requested} (${outcome.forkContext.includedMessages} messages${outcome.forkContext.truncated ? ", truncated" : ""})`,
-		);
-	}
 	if (outcome.note !== null) lines.push(`Note: ${outcome.note}`);
 	lines.push(`Poll with: { "action": "poll", "id": "${outcome.thread.path}" }`);
 	return lines.join("\n");

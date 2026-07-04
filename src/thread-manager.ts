@@ -34,7 +34,6 @@ import type {
 	StopCommand,
 	WaitCommand,
 } from "./schema.ts";
-import { buildForkContext, buildInitialPrompt, type ForkContextSummary } from "./thread-context.ts";
 
 const DEFAULT_MAX_DEPTH = 2;
 const DEFAULT_MAX_THREADS = 8;
@@ -48,7 +47,6 @@ const STOP_KILL_WAIT_MS = 300;
 const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
 const WAIT_POLL_INTERVAL_MS = 250;
 const BUSY_SEND_IDLE_SETTLE_REFRESHES = 2;
-const DEFAULT_FORK_CONTEXT_MAX_CHARS = 24_000;
 // Pi resolves CLI resource flags from the process startup cwd, while ctx.cwd can
 // later point at a resumed or switched session in another project.
 const PROCESS_START_CWD = process.cwd();
@@ -128,7 +126,6 @@ export type StartOutcome = {
 	readonly kind: "started";
 	readonly promptAccepted: boolean;
 	readonly note: string | null;
-	readonly forkContext: ForkContextSummary;
 	readonly thread: ThreadSnapshot;
 };
 
@@ -172,7 +169,6 @@ export class ThreadManager {
 	#selfThreadId: ThreadId | null;
 	#currentPath: ThreadPath;
 	readonly #rootSessionId: string;
-	readonly #forkContextMaxChars: number;
 
 	constructor(environment: NodeJS.ProcessEnv = process.env) {
 		const baseDepth = readInteger(environment["PI_THREADS_DEPTH"], 0);
@@ -189,10 +185,6 @@ export class ThreadManager {
 		this.#selfThreadId = baseSelfThreadId;
 		this.#currentPath = baseCurrentPath;
 		this.#rootSessionId = environment["PI_THREADS_ROOT_SESSION_ID"] ?? `root_${process.pid}`;
-		this.#forkContextMaxChars = readInteger(
-			environment["PI_THREADS_FORK_CONTEXT_MAX_CHARS"],
-			DEFAULT_FORK_CONTEXT_MAX_CHARS,
-		);
 	}
 
 	onChange(listener: ThreadChangeListener): () => void {
@@ -266,19 +258,6 @@ export class ThreadManager {
 		const extraArgs = command.args ?? [];
 		assertAllowedExtraArgs(extraArgs);
 		const inheritedArgs = collectInheritedPiArgs(process.argv, PROCESS_START_CWD);
-		const forkContext = buildForkContext(
-			ctx,
-			command.forkTurns ?? "none",
-			this.#forkContextMaxChars,
-		);
-		const initialPrompt = buildInitialPrompt({
-			prompt: command.prompt,
-			threadId: id,
-			threadPath,
-			parentPath: this.#currentPath,
-			forkContextText: forkContext.text,
-		});
-
 		const argv = buildPiArgs({
 			name,
 			extraArgs,
@@ -405,7 +384,7 @@ export class ThreadManager {
 		let promptAccepted = false;
 		try {
 			const request = thread.rpc.requestWithHandle(
-				{ type: "prompt", message: initialPrompt },
+				{ type: "prompt", message: command.prompt },
 				PROMPT_ACCEPT_TIMEOUT_MS,
 			);
 			thread.pendingInitialPrompt = { requestId: request.id };
@@ -429,7 +408,6 @@ export class ThreadManager {
 			kind: "started",
 			promptAccepted,
 			note,
-			forkContext: forkContext.summary,
 			thread: snapshot(this.#required(id)),
 		};
 	}
