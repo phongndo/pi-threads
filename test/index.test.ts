@@ -90,6 +90,23 @@ function managerWithThread(thread: ThreadSnapshot | null): ThreadManager {
 }
 
 type CommandHandler = (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+type RegisteredTool = Parameters<ExtensionAPI["registerTool"]>[0];
+
+function registeredThreadTool(): RegisteredTool {
+	let registered: RegisteredTool | undefined;
+	const pi = {
+		registerCommand: () => undefined,
+		registerMessageRenderer: () => undefined,
+		on: () => undefined,
+		registerTool: (tool: RegisteredTool) => {
+			registered = tool;
+		},
+	} as unknown as ExtensionAPI;
+
+	extension(pi);
+	if (registered === undefined) throw new Error("thread tool was not registered");
+	return registered;
+}
 
 function registeredCommandHandlers(): Map<string, CommandHandler> {
 	const handlers = new Map<string, CommandHandler>();
@@ -126,6 +143,16 @@ function commandCtx(branch: readonly unknown[] = []): ExtensionCommandContext & 
 		readonly switchSession: ReturnType<typeof vi.fn>;
 	};
 }
+
+describe("thread prompt metadata", () => {
+	it("uses only registry metadata with a neutral description", () => {
+		const tool = registeredThreadTool();
+
+		expect(tool.description).toBe("Start and manage background Pi child sessions.");
+		expect(tool).not.toHaveProperty("promptSnippet");
+		expect(tool).not.toHaveProperty("promptGuidelines");
+	});
+});
 
 describe("session shutdown thread lifecycle", () => {
 	it("preserves thread management when switching into a closed managed child session", () => {

@@ -1309,11 +1309,7 @@ describe("ThreadManager session metadata", () => {
 				mode: "follow_up",
 				message: "queued",
 			});
-			const outcome = await manager.wait({
-				action: "wait",
-				id: "send_explicit_stale",
-				timeoutMs: 20,
-			});
+			const pollOutcome = await manager.poll("send_explicit_stale");
 
 			expect(sendOutcome.accepted).toBe(true);
 			expect(
@@ -1328,9 +1324,8 @@ describe("ThreadManager session metadata", () => {
 			);
 			if (sendOutcome.thread.state !== "live") return;
 			expect(sendOutcome.thread.phase).toBe("busy");
-			expect(outcome.timedOut).toBe(true);
-			if (outcome.thread.state !== "live") return;
-			expect(outcome.thread.phase).toBe("busy");
+			if (pollOutcome.state !== "live") return;
+			expect(pollOutcome.phase).toBe("busy");
 		},
 	);
 

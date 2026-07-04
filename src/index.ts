@@ -29,11 +29,7 @@ import { isRecord, stringField } from "./json.ts";
 import { assertPiThreadParams, PiThreadParamsSchema } from "./schema.ts";
 import { PI_THREAD_ENTRY_MESSAGE_TYPE, registerThreadsCommand } from "./threads-command.ts";
 import { ThreadManager, type ThreadManagerScope, type WaitProgress } from "./thread-manager.ts";
-import {
-	PI_THREAD_DESCRIPTION,
-	PI_THREAD_PROMPT_GUIDELINES,
-	PI_THREAD_PROMPT_SNIPPET,
-} from "./prompt.ts";
+import { PI_THREAD_DESCRIPTION } from "./prompt.ts";
 
 const PROCESS_MANAGER_KEY = "__piThreadsProcessManager";
 
@@ -266,8 +262,6 @@ export default function (pi: ExtensionAPI) {
 		name: "thread",
 		label: "Thread",
 		description: PI_THREAD_DESCRIPTION,
-		promptSnippet: PI_THREAD_PROMPT_SNIPPET,
-		promptGuidelines: [...PI_THREAD_PROMPT_GUIDELINES],
 		parameters: PiThreadParamsSchema,
 
 		async execute(_toolCallId, rawParams, signal, onUpdate, ctx) {

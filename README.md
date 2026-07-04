@@ -15,15 +15,16 @@ There are no baked-in roles (no "reviewer", no "planner", no "worker"). Pi decid
 
 ## How Pi learns to use it
 
-This extension teaches Pi through the tool metadata in `src/prompt.ts`, not by
-expecting the user to mention threads. The `thread` tool contributes a prompt
-snippet plus usage guidelines that tell Pi to use threads proactively when they
-materially improve the workflow: sidecar research, parallel independent tasks,
-bounded implementation slices, or second-pass review.
+By default, this extension is a minimal background-session primitive. It
+registers a single `thread` tool with Pi and relies on the tool registry,
+description, and schema. It does not inject proactive delegation guidance into
+the system prompt. Users can add their own system prompt, skills, prompt
+templates, or extension policy when they want Pi to use threads more
+aggressively.
 
-The behavior is intentionally emergent rather than workflow-specific. There is
-no fixed planner/reviewer/worker graph; Pi receives enough guidance to decide
-when to spawn, what to ask, when to wait, and when to keep work local.
+There is no fixed planner/reviewer/worker graph and no built-in agent profile
+system. `pi-threads` exposes thread capability; orchestration style belongs to
+the user.
 
 ## What Pi can do with threads
 

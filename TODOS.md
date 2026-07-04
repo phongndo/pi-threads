@@ -9,15 +9,14 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
 
 ## 1. Reduce prompt dependence
 
-- [x] Make proactive prompt guidance opt-in, not default.
-- [x] Add guidance mode via `PI_THREADS_GUIDANCE`:
-  - `off`: registry/schema only.
-  - `minimal`: one-line availability hint only.
-  - `full`: current proactive guidance.
-- [x] Default to `minimal` or `off`.
+- [x] Remove proactive prompt guidance from the tool registration.
+- [x] Do not add prompt guidance modes; users should customize their own agent
+      prompt/context if they want different thread behavior.
+- [x] Rely on the tool registry, description, and schema for model-facing
+      metadata.
 - [x] Shorten the tool description to something neutral, e.g.
       `Start and manage background Pi child sessions.`
-- [x] Remove default language that tells the model to use threads proactively.
+- [x] Remove language that tells the model to use threads proactively.
 
 ## 2. Keep one model-facing tool
 
