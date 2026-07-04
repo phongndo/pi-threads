@@ -94,6 +94,9 @@ Threads also get a stable canonical path like `/root/review_tests`. Pass
 `taskName` on `start` to choose the final path segment, then refer to the thread
 later by id, full path, or unambiguous task name.
 
+If `start.cwd` is provided, it must resolve to an existing directory. Omit it to
+use the parent session's current working directory.
+
 `start.args` is intentionally allowlisted. Children always run in RPC mode;
 one-shot modes, session selection, approval flags, package subcommands, bare
 positional args, and `--flag=value` forms are rejected. Safe narrowing flags such

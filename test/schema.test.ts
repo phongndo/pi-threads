@@ -56,6 +56,36 @@ describe("thread schemas", () => {
 			expect(() => assertPiThreadParams(input)).toThrow(/Invalid thread parameters/u);
 		}
 	});
+
+	it("reports invalid actions with repair examples", () => {
+		expect(() => assertPiThreadParams({ action: "spawn" })).toThrow(
+			/action must be one of .*Valid shapes: start: \{ "action": "start"/u,
+		);
+	});
+
+	it("reports missing, unexpected, and conflicting fields with action-specific repairs", () => {
+		expect(() => assertPiThreadParams({ action: "send", id: "alpha" })).toThrow(
+			/missing required field message.*Repair: use the send shape/u,
+		);
+		expect(() => assertPiThreadParams({ action: "poll", id: "alpha", message: "nope" })).toThrow(
+			/unexpected field message.*allowed for poll: action, id.*Repair: use the poll shape/u,
+		);
+		expect(() =>
+			assertPiThreadParams({ action: "list", parent: "/root/a", ancestor: "/root" }),
+		).toThrow(/parent and ancestor are mutually exclusive.*Choose one filter/u);
+	});
+
+	it("reports schema failures with field repair hints", () => {
+		expect(() =>
+			assertPiThreadParams({ action: "start", prompt: "x", taskName: "Bad Name" }),
+		).toThrow(/taskName must be lower_snake_case.*Use shape/u);
+		expect(() => assertPiThreadParams({ action: "wait", id: "alpha", timeoutMs: -1 })).toThrow(
+			/timeoutMs must be an integer from 0 to 600000/u,
+		);
+		expect(() =>
+			assertPiThreadParams({ action: "send", id: "alpha", message: "x", mode: "later" }),
+		).toThrow(/mode must be one of "prompt", "steer", or "follow_up"/u);
+	});
 });
 
 describe("ThreadId", () => {
@@ -380,6 +410,18 @@ describe("child Pi argv", () => {
 		for (const args of rejected) {
 			expect(() => assertAllowedExtraArgs(args)).toThrow(/Unsupported/u);
 		}
+	});
+
+	it("reports child arg repairs for inline assignments, missing values, and unsupported flags", () => {
+		expect(() => assertAllowedExtraArgs(["--model=sonnet"])).toThrow(
+			/inline --flag=value forms are not allowed.*"args": \["--model", "sonnet"\]/u,
+		);
+		expect(() => assertAllowedExtraArgs(["--model"])).toThrow(
+			/requires a value.*pass the value as the next array item/u,
+		);
+		expect(() => assertAllowedExtraArgs(["--extension", "."])).toThrow(
+			/remove this flag or replace it with an allowlisted restriction/u,
+		);
 	});
 
 	it("allows only safe model and restrictive child args", () => {

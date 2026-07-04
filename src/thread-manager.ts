@@ -228,13 +228,13 @@ export class ThreadManager {
 
 		const parent = command && "parent" in command ? command.parent : undefined;
 		if (parent !== undefined) {
-			const parentPath = this.#resolvePathReference(parent);
+			const parentPath = this.#resolveListPathReference(parent);
 			threads = threads.filter((thread) => thread.parentPath === parentPath);
 		}
 
 		const ancestor = command && "ancestor" in command ? command.ancestor : undefined;
 		if (ancestor !== undefined) {
-			const ancestorPath = this.#resolvePathReference(ancestor);
+			const ancestorPath = this.#resolveListPathReference(ancestor);
 			threads = threads.filter(
 				(thread) => thread.path !== ancestorPath && thread.path.startsWith(`${ancestorPath}/`),
 			);
@@ -588,7 +588,7 @@ export class ThreadManager {
 
 	#required(id: ThreadId): ManagedThread {
 		const thread = this.#threads.get(id);
-		if (!thread) throw new Error(`Unknown thread id: ${id}`);
+		if (!thread) throw this.#unknownThreadReferenceError(id);
 		return thread;
 	}
 
@@ -604,7 +604,11 @@ export class ThreadManager {
 
 	#resolveTarget(targetText: string): ThreadId {
 		const target = targetText.trim();
-		if (isThreadIdText(target)) return asThreadId(target);
+		if (isThreadIdText(target)) {
+			const id = asThreadId(target);
+			if (this.#threads.has(id)) return id;
+			throw this.#unknownThreadReferenceError(targetText);
+		}
 
 		const pathReference = this.#tryResolvePathReference(target);
 		if (pathReference !== null) {
@@ -623,25 +627,29 @@ export class ThreadManager {
 		if (matches.length === 1) return matches[0]!.id;
 		if (matches.length > 1) {
 			throw new Error(
-				`Ambiguous thread reference ${targetText}; use one of: ${matches
+				`Ambiguous thread reference "${targetText}". Candidate paths: ${matches
 					.map((thread) => thread.path)
-					.join(", ")}`,
+					.join(", ")}. Repair: use one of the candidate paths or a thread id instead.`,
 			);
 		}
 
-		throw new Error(`Unknown thread reference: ${targetText}`);
+		throw this.#unknownThreadReferenceError(targetText);
 	}
 
-	#resolvePathReference(reference: string): ThreadPath {
+	#resolveListPathReference(reference: string): ThreadPath {
 		const trimmed = reference.trim();
 		if (trimmed === "." || trimmed === "self") return this.#currentPath;
 		if (isThreadIdText(trimmed)) {
 			const id = asThreadId(trimmed);
 			if (this.#selfThreadId === id) return this.#currentPath;
-			return this.#required(id).path;
+			const thread = this.#threads.get(id);
+			if (thread !== undefined) return thread.path;
+			throw this.#unknownThreadReferenceError(reference);
 		}
 
 		const pathReference = this.#tryResolvePathReference(reference);
+		// List filters only compare stored parentPath/path prefixes, so a syntactically
+		// valid path is useful even when no managed thread exists at that exact path.
 		if (pathReference !== null) return pathReference;
 
 		const thread = this.#requiredByTarget(reference);
@@ -664,7 +672,22 @@ export class ThreadManager {
 		const existing = Array.from(this.#threads.values()).find(
 			(thread) => thread.path === threadPath,
 		);
-		if (existing) throw new Error(`Thread path already exists: ${threadPath}`);
+		if (existing) {
+			throw new Error(
+				`Thread path already exists: ${threadPath} (id: ${existing.id}). Repair: choose a unique start.taskName for this parent, or omit taskName to use a generated thread id.`,
+			);
+		}
+	}
+
+	#unknownThreadReferenceError(reference: string): Error {
+		const suggestions = knownThreadSuggestions(this.#threads.values());
+		const known =
+			suggestions.length === 0
+				? " No threads are currently managed by this parent."
+				: ` Known threads: ${suggestions.join("; ")}.`;
+		return new Error(
+			`Unknown thread reference: "${reference}". Accepted reference forms: thread id (thread_012345abcdef), canonical path (/root/task), relative path from the current thread (task or parent/task), or unambiguous taskName/name.${known} Repair: use a known path/id, run { "action": "list" }, or start the thread first.`,
+		);
 	}
 
 	#closeThread(id: ThreadId, exit: ThreadExit): void {
@@ -1106,6 +1129,8 @@ const PROMPT_TEMPLATE_FLAGS = new Set(["--prompt-template"]);
 const THEME_FLAGS = new Set(["--theme"]);
 const EXCLUDE_TOOLS_FLAGS = new Set(["--exclude-tools", "-xt"]);
 const MODEL_SCOPE_FLAGS = new Set(["--models"]);
+const ALLOWED_EXTRA_ARGS_HELP =
+	"allowed start.args are safe narrowing flags such as --provider <value>, --model <value>, --models <value>, --thinking <value>, --exclude-tools <value>, --no-tools, --no-builtin-tools, --offline, --no-extensions, --no-skills, --no-prompt-templates, --no-themes, and --no-context-files";
 // Pi applies --thinking after scoped model thinking, so it can widen an inherited
 // --models scope just like selecting a different model/provider can.
 const MODEL_SCOPE_OVERRIDE_FLAGS = new Set(["--provider", "--model", "--models", "--thinking"]);
@@ -1263,20 +1288,31 @@ function parseAllowedExtraArgs(args: readonly string[]): readonly string[] {
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
 		if (arg === undefined) continue;
-		if (arg === "--" || PACKAGE_SUBCOMMANDS.has(arg) || !isFlagLike(arg) || arg.includes("=")) {
-			throw new Error(`Unsupported child Pi arg for pi-threads: ${arg}`);
+		if (arg.includes("=")) {
+			throw new Error(
+				`Unsupported child Pi arg for pi-threads: ${arg}. Repair: inline --flag=value forms are not allowed; pass flag and value as separate array items, e.g. "args": ["--model", "sonnet"].`,
+			);
+		}
+		if (arg === "--" || PACKAGE_SUBCOMMANDS.has(arg) || !isFlagLike(arg)) {
+			throw new Error(
+				`Unsupported child Pi arg for pi-threads: ${arg}. Repair: remove package subcommands, prompts, and positional args; ${ALLOWED_EXTRA_ARGS_HELP}.`,
+			);
 		}
 
 		const spec = CLI_FLAG_SPECS.get(arg);
 		if (spec?.allowExtra !== true) {
-			throw new Error(`Unsupported child Pi arg for pi-threads: ${arg}`);
+			throw new Error(
+				`Unsupported child Pi arg for pi-threads: ${arg}. Repair: remove this flag or replace it with an allowlisted restriction; ${ALLOWED_EXTRA_ARGS_HELP}. Children always run in RPC mode and cannot set session, approval, extension-loading, or one-shot flags through start.args.`,
+			);
 		}
 
 		allowed.push(arg);
 		if (spec.takesValue) {
 			const value = args[i + 1];
 			if (value === undefined || isFlagLike(value)) {
-				throw new Error(`Unsupported child Pi arg for pi-threads: ${arg} requires a value`);
+				throw new Error(
+					`Unsupported child Pi arg for pi-threads: ${arg} requires a value. Repair: pass the value as the next array item, e.g. "args": ["${arg}", "value"].`,
+				);
 			}
 			allowed.push(value);
 			i++;
@@ -1352,7 +1388,7 @@ function assertNoInheritedModelScopeOverride(
 	if (!hasFlag(allowedExtraArgs, MODEL_SCOPE_OVERRIDE_FLAGS)) return;
 
 	throw new Error(
-		"Unsupported child Pi arg for pi-threads: child model/provider/thinking args cannot override an inherited --models scope",
+		"Unsupported child Pi arg for pi-threads: child model/provider/thinking args cannot override an inherited --models scope. Repair: omit --provider/--model/--models/--thinking from start.args or start the parent with a narrower model scope.",
 	);
 }
 
@@ -1532,8 +1568,32 @@ function pushEvent(thread: ThreadBase, event: ThreadEvent): void {
 }
 
 function resolveCwd(parentCwd: string, childCwd: string | undefined): string {
-	if (childCwd === undefined) return parentCwd;
-	return path.resolve(parentCwd, childCwd);
+	const cwd = childCwd === undefined ? path.resolve(parentCwd) : path.resolve(parentCwd, childCwd);
+	let stats: fs.Stats;
+	try {
+		stats = fs.statSync(cwd);
+	} catch (error) {
+		const reason = error instanceof Error ? ` (${error.message})` : "";
+		throw new Error(
+			`Invalid child cwd: ${cwd} does not exist or cannot be accessed${reason}. Repair: set start.cwd to an existing directory path, create the directory first, or omit cwd to use the parent session cwd.`,
+			{ cause: error },
+		);
+	}
+
+	if (!stats.isDirectory()) {
+		throw new Error(
+			`Invalid child cwd: ${cwd} is not a directory. Repair: set start.cwd to an existing directory path, not a file, or omit cwd to use the parent session cwd.`,
+		);
+	}
+
+	return cwd;
+}
+
+function knownThreadSuggestions(threads: Iterable<ManagedThread>): readonly string[] {
+	return Array.from(threads)
+		.toSorted((left, right) => left.path.localeCompare(right.path))
+		.slice(0, 8)
+		.map((thread) => `${thread.path} (id: ${thread.id}, taskName: ${thread.taskName})`);
 }
 
 function sameSessionFile(left: string, right: string): boolean {

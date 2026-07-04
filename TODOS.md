@@ -26,9 +26,9 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
 
 ## 3. Improve validation and repairability
 
-- [ ] Tighten per-action validation for required and forbidden fields.
-- [ ] Improve error messages so they include exact repair examples.
-- [ ] Include clear errors for:
+- [x] Tighten per-action validation for required and forbidden fields.
+- [x] Improve error messages so they include exact repair examples.
+- [x] Include clear errors for:
   - missing required fields,
   - unexpected fields for an action,
   - invalid action names,
@@ -36,7 +36,7 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
   - duplicate `taskName` paths,
   - invalid `cwd`,
   - disallowed child CLI args.
-- [ ] Prefer errors that teach the valid shape without relying on global prompt
+- [x] Prefer errors that teach the valid shape without relying on global prompt
       instructions.
 
 ## 4. Better defaults

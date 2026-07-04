@@ -33,7 +33,7 @@ function context(
 	options: { readonly cwd?: string; readonly trusted?: boolean } = {},
 ): ExtensionContext {
 	return {
-		cwd: options.cwd ?? "/tmp/project",
+		cwd: options.cwd ?? process.cwd(),
 		isProjectTrusted: () => options.trusted ?? true,
 		sessionManager: { getBranch: () => [] },
 	} as unknown as ExtensionContext;
@@ -69,9 +69,104 @@ function attachRpc(child: FakeChildProcess, onRequest: (request: Record<string, 
 	});
 }
 
+function managerEnvironment(): NodeJS.ProcessEnv {
+	return {
+		PI_THREADS_DEPTH: "0",
+		PI_THREADS_MAX_DEPTH: "2",
+		PI_THREADS_MAX_THREADS: "8",
+		PI_THREADS_PATH: "/root",
+		PI_THREADS_ROOT_SESSION_ID: "test-root",
+	} as NodeJS.ProcessEnv;
+}
+
+function mockResponsiveChild(sessionId: string): FakeChildProcess {
+	const child = new FakeChildProcess();
+	spawnMock.mockReturnValueOnce(child);
+	attachRpc(child, (request) => {
+		if (request["type"] === "get_state") {
+			respond(child, request, {
+				sessionFile: `/tmp/${sessionId}.jsonl`,
+				sessionId,
+				pendingMessageCount: 0,
+				isStreaming: false,
+			});
+			return;
+		}
+
+		if (request["type"] === "prompt") respond(child, request);
+	});
+	return child;
+}
+
 describe("ThreadManager session metadata", () => {
 	beforeEach(() => {
 		spawnMock.mockReset();
+	});
+
+	it("reports unknown references with accepted forms and known suggestions", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+		mockResponsiveChild("session-alpha");
+		await manager.start({ action: "start", prompt: "work", taskName: "alpha" }, context());
+
+		await expect(manager.poll("missing")).rejects.toThrow(/Unknown thread reference: "missing"/u);
+		await expect(manager.poll("missing")).rejects.toThrow(/Accepted reference forms/u);
+		await expect(manager.poll("missing")).rejects.toThrow(/\/root\/alpha/u);
+		await expect(manager.poll("missing")).rejects.toThrow(/\{ "action": "list" \}/u);
+	});
+
+	it("reports ambiguous references with candidate paths", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+		mockResponsiveChild("session-alpha");
+		await manager.start(
+			{ action: "start", prompt: "one", taskName: "alpha", name: "Shared" },
+			context(),
+		);
+		mockResponsiveChild("session-beta");
+		await manager.start(
+			{ action: "start", prompt: "two", taskName: "beta", name: "Shared" },
+			context(),
+		);
+
+		await expect(manager.poll("Shared")).rejects.toThrow(
+			/Ambiguous thread reference "Shared".*Candidate paths: \/root\/alpha, \/root\/beta.*Repair/u,
+		);
+	});
+
+	it("reports duplicate taskName paths with a repair hint", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+		mockResponsiveChild("session-alpha");
+		await manager.start({ action: "start", prompt: "one", taskName: "alpha" }, context());
+
+		await expect(
+			manager.start({ action: "start", prompt: "two", taskName: "alpha" }, context()),
+		).rejects.toThrow(
+			/Thread path already exists: \/root\/alpha.*choose a unique start\.taskName/u,
+		);
+	});
+
+	it("validates child cwd exists and is a directory", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-cwd-"));
+		try {
+			const filePath = path.join(root, "file.txt");
+			fs.writeFileSync(filePath, "not a directory");
+			const manager = new ThreadManager(managerEnvironment());
+
+			await expect(
+				manager.start(
+					{ action: "start", prompt: "missing", taskName: "missing", cwd: "missing" },
+					context({ cwd: root }),
+				),
+			).rejects.toThrow(/Invalid child cwd: .*missing.*existing directory/u);
+			await expect(
+				manager.start(
+					{ action: "start", prompt: "file", taskName: "file", cwd: "file.txt" },
+					context({ cwd: root }),
+				),
+			).rejects.toThrow(/Invalid child cwd: .*file\.txt is not a directory.*Repair/u);
+			expect(spawnMock).not.toHaveBeenCalled();
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("records a child session before a fast-finishing child closes", async () => {
@@ -173,6 +268,27 @@ describe("ThreadManager session metadata", () => {
 		);
 	});
 
+	it("allows list filters to use unmanaged path-only ancestors", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+		manager.rebindScope({
+			currentPath: asThreadPath("/root/alpha"),
+			depth: 1,
+			selfThreadId: asThreadId("thread_aaaaaaaaaaaa"),
+		});
+		mockResponsiveChild("session-beta");
+
+		await manager.start({ action: "start", prompt: "nested", taskName: "beta" }, context());
+		manager.resetScope();
+
+		expect(
+			manager.list({ action: "list", parent: "/root/alpha" }).map((thread) => thread.path),
+		).toEqual(["/root/alpha/beta"]);
+		expect(
+			manager.list({ action: "list", ancestor: "/root/alpha" }).map((thread) => thread.path),
+		).toEqual(["/root/alpha/beta"]);
+		expect(manager.list({ action: "list", ancestor: "/root/missing" })).toEqual([]);
+	});
+
 	it("sends the initial prompt verbatim", async () => {
 		const child = new FakeChildProcess();
 		const requests: string[] = [];
@@ -249,38 +365,47 @@ describe("ThreadManager session metadata", () => {
 	});
 
 	it("forces no-approve for a child cwd outside the trusted parent cwd", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-outside-"));
+		const parentCwd = path.join(root, "parent");
+		const outsideCwd = path.join(root, "outside");
+		fs.mkdirSync(parentCwd);
+		fs.mkdirSync(outsideCwd);
 		const child = new FakeChildProcess();
-		spawnMock.mockReturnValue(child);
-		attachRpc(child, (request) => {
-			if (request["type"] === "get_state") {
-				respond(child, request, {
-					sessionFile: "/tmp/outside.jsonl",
-					sessionId: "session-outside",
-					pendingMessageCount: 0,
-					isStreaming: false,
-				});
-				return;
-			}
+		try {
+			spawnMock.mockReturnValue(child);
+			attachRpc(child, (request) => {
+				if (request["type"] === "get_state") {
+					respond(child, request, {
+						sessionFile: "/tmp/outside.jsonl",
+						sessionId: "session-outside",
+						pendingMessageCount: 0,
+						isStreaming: false,
+					});
+					return;
+				}
 
-			if (request["type"] === "prompt") respond(child, request);
-		});
+				if (request["type"] === "prompt") respond(child, request);
+			});
 
-		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
-		} as NodeJS.ProcessEnv);
+			const manager = new ThreadManager({
+				PI_THREADS_DEPTH: "0",
+				PI_THREADS_MAX_DEPTH: "2",
+				PI_THREADS_MAX_THREADS: "8",
+				PI_THREADS_PATH: "/root",
+				PI_THREADS_ROOT_SESSION_ID: "test-root",
+			} as NodeJS.ProcessEnv);
 
-		await manager.start(
-			{ action: "start", prompt: "outside", taskName: "outside", cwd: "../outside" },
-			context(),
-		);
+			await manager.start(
+				{ action: "start", prompt: "outside", taskName: "outside", cwd: "../outside" },
+				context({ cwd: parentCwd }),
+			);
 
-		const args = spawnMock.mock.calls[0]?.[1] as readonly string[];
-		expect(args).toContain("--no-approve");
-		expect(args).not.toContain("--approve");
+			const args = spawnMock.mock.calls[0]?.[1] as readonly string[];
+			expect(args).toContain("--no-approve");
+			expect(args).not.toContain("--approve");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("resolves inherited relative resource paths against the process startup cwd", async () => {
@@ -309,7 +434,8 @@ describe("ThreadManager session metadata", () => {
 		} as NodeJS.ProcessEnv);
 		const originalArgv = process.argv;
 		const startupCwd = process.cwd();
-		const activeSessionCwd = "/tmp/other-project";
+		const activeSessionCwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-active-"));
+		fs.mkdirSync(path.join(activeSessionCwd, "child"));
 
 		try {
 			process.argv = [
@@ -327,6 +453,7 @@ describe("ThreadManager session metadata", () => {
 			);
 		} finally {
 			process.argv = originalArgv;
+			fs.rmSync(activeSessionCwd, { recursive: true, force: true });
 		}
 
 		const args = spawnMock.mock.calls[0]?.[1] as readonly string[];

@@ -1,5 +1,6 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
+import type { TLocalizedValidationError } from "typebox/error";
 import { Value } from "typebox/value";
 
 const Strict = { additionalProperties: false } as const;
@@ -213,44 +214,155 @@ export type WaitCommand = Static<typeof WaitCommandSchema>;
 export type PiThreadParams = Static<typeof StrictPiThreadParamsSchema>;
 type Action = Static<typeof ActionSchema>;
 
+const ActionExamples = {
+	start: `{ "action": "start", "prompt": "Inspect the failing tests.", "taskName": "inspect_tests" }`,
+	list: `{ "action": "list", "state": "live" }`,
+	poll: `{ "action": "poll", "id": "/root/inspect_tests" }`,
+	send: `{ "action": "send", "id": "/root/inspect_tests", "message": "Continue", "mode": "follow_up" }`,
+	stop: `{ "action": "stop", "id": "/root/inspect_tests", "force": false }`,
+	wait: `{ "action": "wait", "id": "/root/inspect_tests", "timeoutMs": 30000 }`,
+} satisfies Record<Action, string>;
+
+const FieldRepairHints = {
+	start: {
+		prompt: "prompt must be a non-empty string",
+		name: "name must be a non-empty string when provided",
+		taskName:
+			"taskName must be lower_snake_case: start with a lowercase letter or digit, then use lowercase letters, digits, or underscores (max 64 chars)",
+		args: `args must be an array of strings, e.g. "args": ["--model", "sonnet"]`,
+		cwd: "cwd must be a non-empty string path to an existing directory",
+	},
+	list: {
+		state: `state must be one of "all", "live", or "closed"`,
+		parent: "parent must be a non-empty thread path/reference",
+		ancestor: "ancestor must be a non-empty thread path/reference",
+	},
+	poll: {
+		id: "id must be a non-empty thread id, canonical path, or unambiguous task name",
+	},
+	send: {
+		id: "id must be a non-empty thread id, canonical path, or unambiguous task name",
+		message: "message must be a non-empty string",
+		mode: `mode must be one of "prompt", "steer", or "follow_up"`,
+	},
+	stop: {
+		id: "id must be a non-empty thread id, canonical path, or unambiguous task name",
+		force: "force must be true or false when provided",
+	},
+	wait: {
+		id: "id must be a non-empty thread id, canonical path, or unambiguous task name",
+		timeoutMs: "timeoutMs must be an integer from 0 to 600000 milliseconds",
+	},
+} satisfies Record<Action, Record<string, string>>;
+
 export function assertPiThreadParams(value: unknown): asserts value is PiThreadParams {
 	if (Value.Check(StrictPiThreadParamsSchema, value)) return;
-	if (!isRecord(value)) throw new Error("Invalid thread parameters: expected object");
+	if (!isRecord(value)) {
+		throw new Error(
+			`Invalid thread parameters: expected an object with an action field. Repair: call the single thread tool with one valid action shape. Valid shapes: ${allActionExamples()}`,
+		);
+	}
 
 	const action = value["action"];
 	if (!isAction(action)) {
 		throw new Error(
-			"Invalid thread parameters: action must be start, list, poll, send, stop, or wait",
+			`Invalid thread parameters: action must be one of ${ActionValues.join(", ")}. Repair: set "action" to a supported value and use the matching shape. Valid shapes: ${allActionExamples()}`,
 		);
 	}
 
 	const allowed = allowedFieldsForAction(action);
 	const unexpected = Object.keys(value).filter((field) => !allowed.has(field));
-	if (unexpected.length > 0) {
-		throw new Error(
-			`Invalid thread parameters for ${action}: unexpected field${unexpected.length === 1 ? "" : "s"} ${unexpected.join(", ")}`,
-		);
-	}
-
 	const missing = requiredFieldsForAction(action).filter((field) => !(field in value));
+	const problems: string[] = [];
+	if (unexpected.length > 0) {
+		problems.push(
+			`unexpected field${unexpected.length === 1 ? "" : "s"} ${unexpected.join(", ")} (allowed for ${action}: ${[...allowed].join(", ")})`,
+		);
+	}
 	if (missing.length > 0) {
-		throw new Error(
-			`Invalid thread parameters for ${action}: missing required field${missing.length === 1 ? "" : "s"} ${missing.join(", ")}`,
-		);
+		problems.push(`missing required field${missing.length === 1 ? "" : "s"} ${missing.join(", ")}`);
 	}
-
 	if (action === "list" && "parent" in value && "ancestor" in value) {
+		problems.push("parent and ancestor are mutually exclusive");
+	}
+	if (problems.length > 0) {
+		const listConflictRepair =
+			action === "list" && "parent" in value && "ancestor" in value
+				? ` Choose one filter, e.g. { "action": "list", "parent": "/root" } or { "action": "list", "ancestor": "/root" }.`
+				: "";
 		throw new Error(
-			"Invalid thread parameters for list: parent and ancestor are mutually exclusive",
+			`Invalid thread parameters for ${action}: ${problems.join("; ")}. Repair: use the ${action} shape ${ActionExamples[action]}.${listConflictRepair}`,
 		);
 	}
 
-	const errors = [...Value.Errors(strictSchemaForAction(action), value)];
+	const errors = relevantSchemaErrors(action, [
+		...Value.Errors(strictSchemaForAction(action), value),
+	]);
 	const summary = errors
 		.slice(0, 5)
-		.map((error) => error.message)
+		.map((error) => `${formatInstancePath(error.instancePath)} ${error.message}`)
 		.join("; ");
-	throw new Error(`Invalid thread parameters${summary ? `: ${summary}` : ""}`);
+	const hint = schemaRepairHint(action, errors);
+	throw new Error(
+		`Invalid thread parameters for ${action}${summary ? `: ${summary}` : ""}. Repair: ${hint} Use shape ${ActionExamples[action]}.`,
+	);
+}
+
+function allActionExamples(): string {
+	return ActionValues.map((action) => `${action}: ${ActionExamples[action]}`).join("; ");
+}
+
+function relevantSchemaErrors(
+	action: Action,
+	errors: readonly TLocalizedValidationError[],
+): readonly TLocalizedValidationError[] {
+	const filtered = errors.filter((error) => {
+		if (error.keyword === "anyOf") return false;
+		if (
+			action === "list" &&
+			error.instancePath === "" &&
+			(error.keyword === "required" || error.keyword === "additionalProperties")
+		) {
+			return false;
+		}
+		return true;
+	});
+	const source = filtered.length === 0 ? errors : filtered;
+	const seen = new Set<string>();
+	return source.filter((error) => {
+		const key = `${error.instancePath}:${error.message}`;
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
+}
+
+function schemaRepairHint(action: Action, errors: readonly TLocalizedValidationError[]): string {
+	const hints: string[] = [];
+	const seen = new Set<string>();
+	const fieldHints = FieldRepairHints[action] as Record<string, string | undefined>;
+	for (const error of errors) {
+		const field = fieldNameFromInstancePath(error.instancePath);
+		const hint = field === null ? null : fieldHints[field];
+		if (hint === null || hint === undefined || seen.has(hint)) continue;
+		seen.add(hint);
+		hints.push(hint);
+	}
+	return hints.length === 0 ? `fix the invalid ${action} field values.` : `${hints.join("; ")}.`;
+}
+
+function formatInstancePath(instancePath: string): string {
+	const field = fieldNameFromInstancePath(instancePath);
+	return field === null ? "input" : field;
+}
+
+function fieldNameFromInstancePath(instancePath: string): string | null {
+	if (instancePath === "") return null;
+	return instancePath
+		.slice(1)
+		.split("/")
+		.map((part) => part.replaceAll("~1", "/").replaceAll("~0", "~"))
+		.join(".");
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
