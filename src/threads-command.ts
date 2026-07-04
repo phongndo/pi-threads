@@ -11,6 +11,7 @@ import {
 import type { ThreadSnapshot } from "./domain.ts";
 import {
 	formatPoll,
+	formatThreadEvent,
 	formatThreadStateBadge,
 	formatThreadSummary,
 	formatThreadTitle,
@@ -194,6 +195,13 @@ export class ThreadsTreeComponent implements Component {
 			lines.push(
 				truncateToWidth(t.fg("muted", `  (${this.selectedIndex + 1}/${filtered.length})`), width),
 			);
+
+			const lastEvent = this.selectedThread()?.recentEvents.at(-1);
+			if (lastEvent !== undefined) {
+				lines.push(
+					truncateToWidth(t.fg("muted", `  Last event: ${formatThreadEvent(lastEvent)}`), width),
+				);
+			}
 		}
 
 		lines.push("");

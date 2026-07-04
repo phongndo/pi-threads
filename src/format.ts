@@ -4,6 +4,7 @@ import {
 	nextSuggestedThreadActions,
 	threadPathBasename,
 	type ThreadEvent,
+	type ThreadExit,
 	type ThreadSnapshot,
 } from "./domain.ts";
 import type {
@@ -63,7 +64,7 @@ export function formatPoll(thread: ThreadSnapshot): string {
 
 	if (thread.recentEvents.length > 0) {
 		lines.push("", "Recent events:");
-		for (const event of thread.recentEvents.slice(-8)) lines.push(`- ${formatEvent(event)}`);
+		for (const event of thread.recentEvents.slice(-8)) lines.push(`- ${formatThreadEvent(event)}`);
 	}
 
 	if (thread.stderrTail.trim() !== "") {
@@ -122,18 +123,46 @@ function formatStatus(thread: ThreadSnapshot): string {
 	return `live/${thread.phase} pid=${thread.pid}`;
 }
 
-function formatEvent(event: ThreadEvent): string {
-	switch (event.kind) {
-		case "state":
-			return `${event.at} state: ${event.message}`;
-		case "assistant":
-			return `${event.at} assistant: ${trimForDisplay(event.text.replaceAll("\n", " "), 240)}`;
-		case "tool":
-			return `${event.at} tool ${event.phase}: ${event.name}${event.error ? " (error)" : ""}`;
-		case "ui":
-			return `${event.at} ui ${event.method}${event.title ? `: ${event.title}` : ""}${event.autoCancelled ? " (auto-cancelled)" : ""}`;
-		case "error":
-			return `${event.at} error: ${event.message}`;
+export function formatThreadEvent(event: ThreadEvent): string {
+	const prefix = `${event.at} #${event.seq}`;
+	switch (event.type) {
+		case "thread_started":
+			return `${prefix} thread started pid=${event.pid}`;
+		case "thread_stopping":
+			return `${prefix} thread stopping`;
+		case "turn_started":
+			return `${prefix} turn started`;
+		case "turn_completed":
+			return `${prefix} turn completed`;
+		case "tool_started":
+			return `${prefix} tool started: ${event.toolName}`;
+		case "tool_completed":
+			return `${prefix} tool completed: ${event.toolName}${event.error ? " (error)" : ""}`;
+		case "assistant_message":
+			return `${prefix} assistant: ${trimForDisplay(event.text.replaceAll("\n", " "), 240)}`;
+		case "ui_request":
+			return `${prefix} ui ${event.method}${event.title ? `: ${event.title}` : ""}${event.autoCancelled ? " (auto-cancelled)" : ""}`;
+		case "thread_closed":
+			return `${prefix} thread closed: ${formatExit(event.exit)}`;
+		case "thread_error":
+			return `${prefix} error: ${event.message}`;
+	}
+}
+
+function formatExit(exit: ThreadExit): string {
+	switch (exit.kind) {
+		case "failed":
+			return `failed (${exit.message})`;
+		case "exited":
+		case "stopped": {
+			const details = [
+				exit.code === null ? null : `code ${exit.code}`,
+				exit.signal === null ? null : `signal ${exit.signal}`,
+			]
+				.filter((part): part is string => part !== null)
+				.join(", ");
+			return details === "" ? exit.kind : `${exit.kind} (${details})`;
+		}
 	}
 }
 

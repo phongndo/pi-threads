@@ -76,8 +76,8 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
 
 ## 6. Lifecycle event log
 
-- [ ] Track canonical lifecycle events internally.
-- [ ] Consider event names such as:
+- [x] Track canonical lifecycle events internally.
+- [x] Consider event names such as:
   - `thread_started`,
   - `turn_started`,
   - `tool_started`,
@@ -85,8 +85,8 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
   - `assistant_message`,
   - `turn_completed`,
   - `thread_closed`.
-- [ ] Use the same event log for tool results and `/threads` UI.
-- [ ] Keep event payloads compact and stable.
+- [x] Use the same event log for tool results and `/threads` UI.
+- [x] Keep event payloads compact and stable.
 
 ## 7. Summaries and detail control
 

@@ -71,6 +71,7 @@ type ThreadBase = {
 	session: ThreadSession;
 	lastAssistantText: string | null;
 	recentEvents: ThreadEvent[];
+	nextEventSeq: number;
 	stderrTail: string;
 };
 
@@ -87,6 +88,7 @@ type LiveThread = ThreadBase & {
 	userMessageStartGeneration: number;
 	awaitingSend: AwaitingSend | null;
 	pendingInitialPrompt: PendingInitialPrompt | null;
+	turnOpen: boolean;
 	readonly closed: Promise<void>;
 	readonly resolveClosed: () => void;
 };
@@ -349,6 +351,7 @@ export class ThreadManager {
 			lastAssistantText: null,
 			lastPartialText: null,
 			recentEvents: [],
+			nextEventSeq: 1,
 			stderrTail: "",
 			phase: "starting",
 			pid: child.pid,
@@ -360,12 +363,13 @@ export class ThreadManager {
 			userMessageStartGeneration: 0,
 			awaitingSend: null,
 			pendingInitialPrompt: null,
+			turnOpen: false,
 			closed: closedDeferred.promise,
 			resolveClosed: closedDeferred.resolve,
 		};
 
 		this.#threads.set(id, thread);
-		pushEvent(thread, { kind: "state", at: nowIso(), message: `started pid ${child.pid}` });
+		appendThreadEvent(thread, { type: "thread_started", pid: child.pid });
 		this.#emitChange();
 
 		child.stderr.on("data", (chunk: Buffer | string) => {
@@ -472,7 +476,7 @@ export class ThreadManager {
 
 		thread.stopRequested = true;
 		thread.phase = "stopping";
-		pushEvent(thread, { kind: "state", at: nowIso(), message: "stopping" });
+		appendThreadEvent(thread, { type: "thread_stopping" });
 		this.#emitChange();
 
 		if (command.force === true) {
@@ -750,11 +754,12 @@ export class ThreadManager {
 			session: thread.session,
 			lastAssistantText: thread.lastAssistantText,
 			recentEvents: thread.recentEvents,
+			nextEventSeq: thread.nextEventSeq,
 			stderrTail: thread.stderrTail,
 			exit,
 		};
 
-		pushEvent(closed, { kind: "state", at: nowIso(), message: `closed: ${exit.kind}` });
+		appendThreadEvent(closed, { type: "thread_closed", exit });
 		this.#threads.set(id, closed);
 		thread.resolveClosed();
 		this.#emitChange();
@@ -783,7 +788,7 @@ export class ThreadManager {
 		thread.lastEventAt = nowIso();
 
 		if (clientEvent.kind === "parse_error") {
-			pushEvent(thread, { kind: "error", at: nowIso(), message: clientEvent.message });
+			appendThreadEvent(thread, { type: "thread_error", message: clientEvent.message });
 			this.#emitChange();
 			return;
 		}
@@ -800,7 +805,7 @@ export class ThreadManager {
 				recordPromptRunActivity(thread);
 				thread.phase = "busy";
 				thread.hasRun = true;
-				pushEvent(thread, { kind: "state", at: nowIso(), message: "agent started" });
+				recordThreadTurnStarted(thread);
 				this.#emitChange();
 				return;
 			}
@@ -810,7 +815,7 @@ export class ThreadManager {
 				thread.lastPartialText = null;
 				allowAwaitingSendRunActivity(thread);
 				clearObservedSendIfIdle(thread);
-				pushEvent(thread, { kind: "state", at: nowIso(), message: "agent ended" });
+				recordThreadTurnCompleted(thread);
 				this.#emitChange();
 				return;
 			}
@@ -818,6 +823,8 @@ export class ThreadManager {
 				recordPromptRunActivity(thread);
 				thread.phase = "busy";
 				thread.hasRun = true;
+				recordThreadTurnStarted(thread);
+				this.#emitChange();
 				return;
 			}
 			case "message_start": {
@@ -825,11 +832,15 @@ export class ThreadManager {
 				if (isUserMessage(event["message"])) thread.userMessageStartGeneration++;
 				thread.phase = "busy";
 				thread.hasRun = true;
+				recordThreadTurnStarted(thread);
+				this.#emitChange();
 				return;
 			}
 			case "turn_end": {
 				recordPromptRunActivity(thread);
 				allowAwaitingSendRunActivity(thread);
+				recordThreadTurnCompleted(thread);
+				this.#emitChange();
 				return;
 			}
 			case "message_update": {
@@ -845,7 +856,7 @@ export class ThreadManager {
 					thread.lastAssistantText = text;
 					thread.lastPartialText = null;
 					clearObservedSendIfIdle(thread);
-					pushEvent(thread, { kind: "assistant", at: nowIso(), text: tail(text, 2_000) });
+					appendThreadEvent(thread, { type: "assistant_message", text: tail(text, 2_000) });
 					this.#emitChange();
 				}
 				return;
@@ -853,12 +864,10 @@ export class ThreadManager {
 			case "tool_execution_start": {
 				recordPromptRunActivity(thread);
 				thread.phase = "busy";
-				pushEvent(thread, {
-					kind: "tool",
-					at: nowIso(),
-					phase: "start",
-					name: stringField(event, "toolName") ?? "unknown",
-					error: false,
+				recordThreadTurnStarted(thread);
+				appendThreadEvent(thread, {
+					type: "tool_started",
+					toolName: stringField(event, "toolName") ?? "unknown",
 				});
 				this.#emitChange();
 				return;
@@ -869,11 +878,9 @@ export class ThreadManager {
 			}
 			case "tool_execution_end": {
 				recordPromptRunActivity(thread);
-				pushEvent(thread, {
-					kind: "tool",
-					at: nowIso(),
-					phase: "end",
-					name: stringField(event, "toolName") ?? "unknown",
+				appendThreadEvent(thread, {
+					type: "tool_completed",
+					toolName: stringField(event, "toolName") ?? "unknown",
 					error: event["isError"] === true,
 				});
 				this.#emitChange();
@@ -884,9 +891,8 @@ export class ThreadManager {
 				const requestId = stringField(event, "id");
 				const method = stringField(event, "method") ?? "unknown";
 				const shouldAutoCancel = requestId !== null && isDialogUiMethod(method);
-				pushEvent(thread, {
-					kind: "ui",
-					at: nowIso(),
+				appendThreadEvent(thread, {
+					type: "ui_request",
 					method,
 					title: stringField(event, "title"),
 					autoCancelled: shouldAutoCancel,
@@ -908,9 +914,8 @@ export class ThreadManager {
 			.request({ type: "get_state" }, options.timeoutMs ?? RPC_QUICK_TIMEOUT_MS)
 			.catch((error: unknown) => {
 				if (options.recordErrors) {
-					pushEvent(thread, {
-						kind: "error",
-						at: nowIso(),
+					appendThreadEvent(thread, {
+						type: "thread_error",
 						message: error instanceof Error ? error.message : String(error),
 					});
 				}
@@ -945,6 +950,7 @@ export class ThreadManager {
 		const pendingMessageCount = numberField(data, "pendingMessageCount");
 		const hasPendingMessages = pendingMessageCount !== null && pendingMessageCount !== 0;
 		const hasRunActivity = isStreaming || isCompacting;
+		const childAppearsIdle = !hasRunActivity && !hasPendingMessages;
 		if (hasRunActivity) {
 			thread.hasRun = true;
 			recordPromptRunActivity(thread);
@@ -989,6 +995,7 @@ export class ThreadManager {
 				thread.phase = "idle";
 			}
 		}
+		if (childAppearsIdle && thread.phase !== "stopping") recordThreadTurnCompleted(thread);
 		if (options.emitChange ?? true) this.#emitChange();
 		return true;
 	}
@@ -1672,11 +1679,32 @@ function snapshot(thread: ManagedThread): ThreadSnapshot {
 	} satisfies LiveThreadSnapshot;
 }
 
-function pushEvent(thread: ThreadBase, event: ThreadEvent): void {
-	thread.lastEventAt = event.at;
-	thread.recentEvents.push(event);
+type ThreadEventInput = ThreadEvent extends infer Event
+	? Event extends ThreadEvent
+		? Omit<Event, "seq" | "at">
+		: never
+	: never;
+
+function appendThreadEvent(thread: ThreadBase, event: ThreadEventInput): void {
+	const at = nowIso();
+	const nextEvent = { ...event, seq: thread.nextEventSeq, at } as ThreadEvent;
+	thread.nextEventSeq++;
+	thread.lastEventAt = at;
+	thread.recentEvents.push(nextEvent);
 	if (thread.recentEvents.length > RECENT_EVENT_LIMIT)
 		thread.recentEvents.splice(0, thread.recentEvents.length - RECENT_EVENT_LIMIT);
+}
+
+function recordThreadTurnStarted(thread: LiveThread): void {
+	if (thread.turnOpen) return;
+	thread.turnOpen = true;
+	appendThreadEvent(thread, { type: "turn_started" });
+}
+
+function recordThreadTurnCompleted(thread: LiveThread): void {
+	if (!thread.turnOpen) return;
+	thread.turnOpen = false;
+	appendThreadEvent(thread, { type: "turn_completed" });
 }
 
 function resolveCwd(parentCwd: string, childCwd: string | undefined): string {

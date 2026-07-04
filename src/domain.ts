@@ -26,23 +26,54 @@ export type ThreadExit =
 	| { readonly kind: "failed"; readonly message: string };
 
 export type ThreadEvent =
-	| { readonly kind: "state"; readonly at: string; readonly message: string }
-	| { readonly kind: "assistant"; readonly at: string; readonly text: string }
 	| {
-			readonly kind: "tool";
+			readonly seq: number;
 			readonly at: string;
-			readonly phase: "start" | "end";
-			readonly name: string;
+			readonly type: "thread_started";
+			readonly pid: number;
+	  }
+	| { readonly seq: number; readonly at: string; readonly type: "thread_stopping" }
+	| { readonly seq: number; readonly at: string; readonly type: "turn_started" }
+	| { readonly seq: number; readonly at: string; readonly type: "turn_completed" }
+	| {
+			readonly seq: number;
+			readonly at: string;
+			readonly type: "tool_started";
+			readonly toolName: string;
+	  }
+	| {
+			readonly seq: number;
+			readonly at: string;
+			readonly type: "tool_completed";
+			readonly toolName: string;
 			readonly error: boolean;
 	  }
 	| {
-			readonly kind: "ui";
+			readonly seq: number;
 			readonly at: string;
+			readonly type: "assistant_message";
+			readonly text: string;
+	  }
+	| {
+			readonly seq: number;
+			readonly at: string;
+			readonly type: "ui_request";
 			readonly method: string;
 			readonly title: string | null;
 			readonly autoCancelled: boolean;
 	  }
-	| { readonly kind: "error"; readonly at: string; readonly message: string };
+	| {
+			readonly seq: number;
+			readonly at: string;
+			readonly type: "thread_closed";
+			readonly exit: ThreadExit;
+	  }
+	| {
+			readonly seq: number;
+			readonly at: string;
+			readonly type: "thread_error";
+			readonly message: string;
+	  };
 
 export type LiveThreadSnapshot = {
 	readonly state: "live";

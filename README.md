@@ -101,7 +101,10 @@ use the parent session's current working directory.
 Tool results include concise text plus structured `details`. Single-thread
 actions (`start`, `poll`, `send`, `wait`, and `stop`) include a normalized
 `snapshot` with `id`, `path`, `status`, `phase`, `running`, recent events, and
-`nextSuggestedActions`; `list` returns the same shape in `snapshots`.
+`nextSuggestedActions`; `list` returns the same shape in `snapshots`. Recent
+events use compact canonical lifecycle names such as `thread_started`,
+`turn_started`, `tool_started`, `tool_completed`, `assistant_message`,
+`turn_completed`, and `thread_closed`.
 
 `start.args` is intentionally allowlisted. Children always run in RPC mode;
 one-shot modes, session selection, approval flags, package subcommands, bare

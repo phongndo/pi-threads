@@ -387,6 +387,125 @@ describe("ThreadManager session metadata", () => {
 		expect(prompts).toEqual(["/review ignored\n\nUse only this prompt."]);
 	});
 
+	it("records canonical lifecycle events with stable sequence numbers", async () => {
+		const child = new FakeChildProcess();
+		spawnMock.mockReturnValue(child);
+		attachRpc(child, (request) => {
+			if (request["type"] === "get_state") {
+				respond(child, request, {
+					sessionFile: "/tmp/events.jsonl",
+					sessionId: "session-events",
+					pendingMessageCount: 0,
+					isStreaming: false,
+				});
+				return;
+			}
+
+			if (request["type"] === "prompt") respond(child, request);
+		});
+
+		const manager = new ThreadManager(managerEnvironment());
+		await manager.start({ action: "start", prompt: "events", taskName: "events" }, context());
+
+		emitRpcEvent(child, { type: "agent_start" });
+		emitRpcEvent(child, { type: "turn_start" });
+		emitRpcEvent(child, { type: "message_start", message: { role: "assistant" } });
+		emitRpcEvent(child, { type: "tool_execution_start", toolName: "read" });
+		emitRpcEvent(child, { type: "tool_execution_end", toolName: "read", isError: false });
+		emitRpcEvent(child, {
+			type: "message_end",
+			message: { role: "assistant", content: [{ type: "text", text: "Found it" }] },
+		});
+		emitRpcEvent(child, { type: "turn_end" });
+		emitRpcEvent(child, { type: "agent_end" });
+		emitRpcEvent(child, {
+			type: "extension_ui_request",
+			id: "ui-1",
+			method: "confirm",
+			title: "Approve?",
+		});
+		child.emit("close", 0, null);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		const snapshot = manager.list({ action: "list", state: "all" })[0];
+		expect(snapshot?.state).toBe("closed");
+		expect(snapshot?.recentEvents.map((event) => event.type)).toEqual([
+			"thread_started",
+			"turn_started",
+			"tool_started",
+			"tool_completed",
+			"assistant_message",
+			"turn_completed",
+			"ui_request",
+			"thread_closed",
+		]);
+		expect(snapshot?.recentEvents.map((event) => event.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+		expect(snapshot?.recentEvents).toContainEqual(
+			expect.objectContaining({ type: "thread_started", pid: child.pid }),
+		);
+		expect(snapshot?.recentEvents).toContainEqual(
+			expect.objectContaining({ type: "tool_started", toolName: "read" }),
+		);
+		expect(snapshot?.recentEvents).toContainEqual(
+			expect.objectContaining({ type: "assistant_message", text: "Found it" }),
+		);
+		expect(snapshot?.recentEvents).toContainEqual(
+			expect.objectContaining({ type: "ui_request", method: "confirm", autoCancelled: true }),
+		);
+		expect(snapshot?.recentEvents).toContainEqual(
+			expect.objectContaining({
+				type: "thread_closed",
+				exit: { kind: "exited", code: 0, signal: null },
+			}),
+		);
+	});
+
+	it("infers turn completion from an idle poll when end events are missing", async () => {
+		const child = new FakeChildProcess();
+		spawnMock.mockReturnValue(child);
+		attachRpc(child, (request) => {
+			if (request["type"] === "get_state") {
+				respond(child, request, {
+					sessionFile: "/tmp/inferred-turn-completion.jsonl",
+					sessionId: "session-inferred-turn-completion",
+					pendingMessageCount: 0,
+					isStreaming: false,
+					isCompacting: false,
+				});
+				return;
+			}
+
+			if (request["type"] === "prompt") respond(child, request);
+		});
+
+		const manager = new ThreadManager(managerEnvironment());
+		await manager.start(
+			{ action: "start", prompt: "events", taskName: "inferred_turn_completion" },
+			context(),
+		);
+
+		emitRpcEvent(child, { type: "agent_start" });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		const polled = await manager.poll("inferred_turn_completion");
+		expect(polled.recentEvents.map((event) => event.type)).toEqual([
+			"thread_started",
+			"turn_started",
+			"turn_completed",
+		]);
+
+		emitRpcEvent(child, { type: "agent_start" });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		const refreshed = manager.list({ action: "list", state: "all" })[0];
+		expect(refreshed?.recentEvents.map((event) => event.type)).toEqual([
+			"thread_started",
+			"turn_started",
+			"turn_completed",
+			"turn_started",
+		]);
+	});
+
 	it("emits one change notification for a successful poll refresh", async () => {
 		const child = new FakeChildProcess();
 		spawnMock.mockReturnValue(child);
