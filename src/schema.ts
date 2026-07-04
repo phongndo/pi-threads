@@ -28,12 +28,16 @@ export const StartCommandSchema = Type.Object(
 			description: "Initial child task prompt.",
 		}),
 		name: Type.Optional(
-			Type.String({ minLength: 1, description: "Display name for the child Pi session." }),
+			Type.String({
+				minLength: 1,
+				description: "Display name for the child Pi session. Generated from prompt when omitted.",
+			}),
 		),
 		taskName: Type.Optional(
 			Type.String({
 				pattern: "^[a-z0-9][a-z0-9_]{0,63}$",
-				description: "Stable lower_snake_case path segment.",
+				description:
+					"Stable lower_snake_case path segment. Generated from name or prompt when omitted.",
 			}),
 		),
 		args: Type.Optional(
@@ -152,12 +156,17 @@ export const PiThreadParamsSchema = Type.Object(
 			}),
 		),
 		name: Type.Optional(
-			Type.String({ minLength: 1, description: "For start: display name for the child session." }),
+			Type.String({
+				minLength: 1,
+				description:
+					"For start: display name for the child session. Generated from prompt when omitted.",
+			}),
 		),
 		taskName: Type.Optional(
 			Type.String({
 				pattern: "^[a-z0-9][a-z0-9_]{0,63}$",
-				description: "For start: stable lower_snake_case path segment.",
+				description:
+					"For start: stable lower_snake_case path segment. Generated from name or prompt when omitted.",
 			}),
 		),
 		args: Type.Optional(
@@ -215,7 +224,7 @@ export type PiThreadParams = Static<typeof StrictPiThreadParamsSchema>;
 type Action = Static<typeof ActionSchema>;
 
 const ActionExamples = {
-	start: `{ "action": "start", "prompt": "Inspect the failing tests.", "taskName": "inspect_tests" }`,
+	start: `{ "action": "start", "prompt": "Inspect the failing tests." }`,
 	list: `{ "action": "list", "state": "live" }`,
 	poll: `{ "action": "poll", "id": "/root/inspect_tests" }`,
 	send: `{ "action": "send", "id": "/root/inspect_tests", "message": "Continue", "mode": "follow_up" }`,

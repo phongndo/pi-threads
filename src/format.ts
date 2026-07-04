@@ -45,6 +45,8 @@ export function formatPoll(thread: ThreadSnapshot): string {
 		`Parent: ${thread.parentPath}${thread.parentThreadId ? ` (${thread.parentThreadId})` : ""}`,
 		`Depth: ${thread.depth}`,
 		`Status: ${formatStatus(thread)}`,
+		`Running: ${isThreadRunning(thread) ? "yes" : "no"}`,
+		formatNextLine(thread),
 		`Cwd: ${thread.cwd}`,
 	];
 	if (thread.session.kind === "known") lines.push(`Session: ${thread.session.file}`);
@@ -86,11 +88,34 @@ export function formatStop(outcome: StopOutcome): string {
 
 export function formatWait(outcome: WaitOutcome): string {
 	const status = outcome.timedOut ? "timed out" : "completed";
-	return `Wait ${status} after ${outcome.waitedMs}ms for "${formatThreadTitle(outcome.thread)}".\nPath: ${outcome.thread.path}\nStatus: ${formatStatus(outcome.thread)}`;
+	return [
+		`Wait ${status} after ${outcome.waitedMs}ms for "${formatThreadTitle(outcome.thread)}".`,
+		`Path: ${outcome.thread.path}`,
+		`Status: ${formatStatus(outcome.thread)}`,
+		`Running: ${isThreadRunning(outcome.thread) ? "yes" : "no"}`,
+		formatNextLine(outcome.thread),
+	].join("\n");
 }
 
 export function formatWaitProgress(progress: WaitProgress): string {
-	return `Waiting ${progress.waitedMs}ms for "${formatThreadTitle(progress.thread)}".\nPath: ${progress.thread.path}\nStatus: ${formatStatus(progress.thread)}`;
+	return [
+		`Waiting ${progress.waitedMs}ms for "${formatThreadTitle(progress.thread)}".`,
+		`Path: ${progress.thread.path}`,
+		`Status: ${formatStatus(progress.thread)}`,
+		`Running: ${isThreadRunning(progress.thread) ? "yes" : "no"}`,
+		formatNextLine(progress.thread),
+	].join("\n");
+}
+
+export function isThreadRunning(thread: ThreadSnapshot): boolean {
+	return thread.state === "live";
+}
+
+export function nextThreadActions(thread: ThreadSnapshot): readonly string[] {
+	if (thread.state === "closed") return ["list"];
+	if (thread.phase === "idle") return ["send prompt", "poll", "stop"];
+	if (thread.phase === "stopping") return ["poll", "wait"];
+	return ["wait", "poll", "send follow_up", "stop"];
 }
 
 function formatStatus(thread: ThreadSnapshot): string {
@@ -115,6 +140,17 @@ function formatEvent(event: ThreadEvent): string {
 		case "error":
 			return `${event.at} error: ${event.message}`;
 	}
+}
+
+function formatNextLine(thread: ThreadSnapshot): string {
+	if (thread.state === "closed") return "Next: review output or list threads";
+	return `Next: ${formatActionList(nextThreadActions(thread))}`;
+}
+
+function formatActionList(actions: readonly string[]): string {
+	if (actions.length === 0) return "none";
+	if (actions.length === 1) return actions[0]!;
+	return `${actions.slice(0, -1).join(", ")}, or ${actions[actions.length - 1]!}`;
 }
 
 export function formatThreadLabel(idText: string, threads: readonly ThreadSnapshot[]): string {

@@ -41,15 +41,15 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
 
 ## 4. Better defaults
 
-- [ ] Auto-generate `taskName` when omitted.
+- [x] Auto-generate `taskName` when omitted.
   - Prefer `name` when present.
   - Otherwise derive from the prompt.
   - Fall back to a short id.
   - Ensure uniqueness and valid `lower_snake_case`.
-- [ ] Auto-generate a useful display name when omitted.
-- [ ] Keep `cwd` defaulting to the parent session cwd.
-- [ ] Keep `wait` timeout bounded and safe by default.
-- [ ] Make `poll` and `wait` results clearly state whether the thread is still
+- [x] Auto-generate a useful display name when omitted.
+- [x] Keep `cwd` defaulting to the parent session cwd.
+- [x] Keep `wait` timeout bounded and safe by default.
+- [x] Make `poll` and `wait` results clearly state whether the thread is still
       running and what action is possible next.
 
 ## 5. Structured runtime model

@@ -24,6 +24,8 @@ import {
 	formatThreadTitle,
 	formatWaitProgress,
 	formatWait,
+	isThreadRunning,
+	nextThreadActions,
 } from "./format.ts";
 import { isRecord, stringField } from "./json.ts";
 import { assertPiThreadParams, PiThreadParamsSchema } from "./schema.ts";
@@ -289,7 +291,12 @@ export default function (pi: ExtensionAPI) {
 					const thread = await manager.poll(params.id);
 					return {
 						content: [{ type: "text", text: formatPoll(thread) }],
-						details: { kind: "polled", thread },
+						details: {
+							kind: "polled",
+							running: isThreadRunning(thread),
+							nextSuggestedActions: nextThreadActions(thread),
+							thread,
+						},
 					};
 				}
 				case "send": {
@@ -312,14 +319,23 @@ export default function (pi: ExtensionAPI) {
 						onProgress: (progress: WaitProgress) => {
 							onUpdate?.({
 								content: [{ type: "text", text: formatWaitProgress(progress) }],
-								details: { kind: "waiting", ...progress },
+								details: {
+									kind: "waiting",
+									running: isThreadRunning(progress.thread),
+									nextSuggestedActions: nextThreadActions(progress.thread),
+									...progress,
+								},
 							});
 						},
 					};
 					const outcome = await manager.wait(params, waitOptions);
 					return {
 						content: [{ type: "text", text: formatWait(outcome) }],
-						details: outcome,
+						details: {
+							...outcome,
+							running: isThreadRunning(outcome.thread),
+							nextSuggestedActions: nextThreadActions(outcome.thread),
+						},
 					};
 				}
 				default:

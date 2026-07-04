@@ -54,8 +54,8 @@ Example tool calls:
 ```json
 {
   "action": "start",
-  "prompt": "Review the API docs for stale examples and report exact fixes.",
-  "taskName": "review_docs"
+  "name": "Review docs",
+  "prompt": "Review the API docs for stale examples and report exact fixes."
 }
 ```
 
@@ -90,9 +90,10 @@ Example tool calls:
 { "action": "list", "state": "live" }
 ```
 
-Threads also get a stable canonical path like `/root/review_tests`. Pass
-`taskName` on `start` to choose the final path segment, then refer to the thread
-later by id, full path, or unambiguous task name.
+Threads also get a stable canonical path like `/root/review_tests`. Omit
+`taskName` to generate a unique lower_snake_case path segment from `name` or the
+prompt, or pass `taskName` on `start` to choose the final path segment yourself.
+Refer to the thread later by id, full path, or unambiguous task name.
 
 If `start.cwd` is provided, it must resolve to an existing directory. Omit it to
 use the parent session's current working directory.

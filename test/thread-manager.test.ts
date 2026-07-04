@@ -144,6 +144,64 @@ describe("ThreadManager session metadata", () => {
 		);
 	});
 
+	it("auto-generates task names from display names when taskName is omitted", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-default-cwd-"));
+		try {
+			const manager = new ThreadManager(managerEnvironment());
+			mockResponsiveChild("session-review-api");
+
+			const outcome = await manager.start(
+				{
+					action: "start",
+					prompt: "Review API docs for stale examples",
+					name: "Review API Docs!",
+				},
+				context({ cwd: root }),
+			);
+
+			expect(outcome.thread.taskName).toBe("review_api_docs");
+			expect(outcome.thread.path).toBe("/root/review_api_docs");
+			expect(outcome.thread.name).toBe("Review API Docs!");
+			const args = spawnMock.mock.calls[0]?.[1] as readonly string[];
+			expect(args[args.indexOf("--name") + 1]).toBe("Review API Docs!");
+			expect(spawnMock.mock.calls[0]?.[2]).toEqual(expect.objectContaining({ cwd: root }));
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("auto-generates unique task names and display names from prompts", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+		mockResponsiveChild("session-auth-1");
+
+		const first = await manager.start(
+			{ action: "start", prompt: "Find the auth refresh code" },
+			context(),
+		);
+		mockResponsiveChild("session-auth-2");
+		const second = await manager.start(
+			{ action: "start", prompt: "Find the auth refresh code" },
+			context(),
+		);
+
+		expect(first.thread.taskName).toBe("find_the_auth_refresh_code");
+		expect(first.thread.path).toBe("/root/find_the_auth_refresh_code");
+		expect(first.thread.name).toBe("Find the auth refresh code");
+		expect(second.thread.taskName).toBe("find_the_auth_refresh_code_2");
+		expect(second.thread.path).toBe("/root/find_the_auth_refresh_code_2");
+	});
+
+	it("falls back to a short id when no useful task text is available", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+		mockResponsiveChild("session-fallback");
+
+		const outcome = await manager.start({ action: "start", prompt: "!!!" }, context());
+
+		expect(outcome.thread.taskName).toMatch(/^thread_[0-9a-f]{6}$/u);
+		expect(outcome.thread.path).toBe(`/root/${outcome.thread.taskName}`);
+		expect(outcome.thread.name).toMatch(/^thread [0-9a-f]{6}$/u);
+	});
+
 	it("validates child cwd exists and is a directory", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-cwd-"));
 		try {
@@ -542,6 +600,16 @@ describe("ThreadManager session metadata", () => {
 
 		expect(outcome.timedOut).toBe(true);
 		expect(requests).toHaveLength(requestCount);
+	});
+
+	it("rejects direct wait timeouts outside the safe bound", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+		mockResponsiveChild("session-wait-bound");
+		await manager.start({ action: "start", prompt: "wait", taskName: "wait_bound" }, context());
+
+		await expect(
+			manager.wait({ action: "wait", id: "wait_bound", timeoutMs: 600_001 }),
+		).rejects.toThrow(/Invalid wait timeoutMs.*0 to 600000/u);
 	});
 
 	it("reports wait progress while a thread remains busy", async () => {

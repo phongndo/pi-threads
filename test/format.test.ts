@@ -2,10 +2,19 @@ import { describe, expect, it } from "vitest";
 import {
 	asThreadId,
 	asThreadPath,
+	type ClosedThreadSnapshot,
 	type LiveThreadSnapshot,
 	type ThreadSnapshot,
 } from "../src/domain.ts";
-import { formatThreadLabel, formatThreadTitle, formatThreadUserStatus } from "../src/format.ts";
+import {
+	formatPoll,
+	formatThreadLabel,
+	formatThreadTitle,
+	formatThreadUserStatus,
+	formatWait,
+	formatWaitProgress,
+	nextThreadActions,
+} from "../src/format.ts";
 
 function liveThread(overrides: Partial<LiveThreadSnapshot> = {}): ThreadSnapshot {
 	return {
@@ -26,6 +35,29 @@ function liveThread(overrides: Partial<LiveThreadSnapshot> = {}): ThreadSnapshot
 		session: { kind: "unknown" },
 		lastAssistantText: null,
 		lastPartialText: null,
+		recentEvents: [],
+		stderrTail: "",
+		...overrides,
+	};
+}
+
+function closedThread(overrides: Partial<ClosedThreadSnapshot> = {}): ThreadSnapshot {
+	return {
+		state: "closed",
+		id: asThreadId("thread_012345abcdef"),
+		name: "inspect_repo",
+		taskName: "inspect_repo",
+		path: asThreadPath("/root/inspect_repo"),
+		parentPath: asThreadPath("/root"),
+		parentThreadId: null,
+		depth: 1,
+		cwd: "/tmp/project",
+		args: [],
+		createdAt: "2026-01-01T00:00:00.000Z",
+		lastEventAt: "2026-01-01T00:00:00.000Z",
+		exit: { kind: "exited", code: 0, signal: null },
+		session: { kind: "unknown" },
+		lastAssistantText: null,
 		recentEvents: [],
 		stderrTail: "",
 		...overrides,
@@ -70,5 +102,33 @@ describe("thread display formatting", () => {
 	it("describes live idle threads as idle", () => {
 		expect(formatThreadUserStatus(liveThread({ phase: "idle" }))).toBe("idle");
 		expect(formatThreadUserStatus(liveThread({ phase: "busy" }))).toBe("working");
+	});
+
+	it("shows running state and next actions in poll output", () => {
+		const output = formatPoll(liveThread({ phase: "busy" }));
+
+		expect(output).toContain("Running: yes");
+		expect(output).toContain("Next: wait, poll, send follow_up, or stop");
+		expect(nextThreadActions(liveThread({ phase: "busy" }))).toEqual([
+			"wait",
+			"poll",
+			"send follow_up",
+			"stop",
+		]);
+	});
+
+	it("shows running state and next actions in wait output", () => {
+		const idleOutput = formatWait({
+			kind: "waited",
+			timedOut: false,
+			waitedMs: 12,
+			thread: liveThread({ phase: "idle" }),
+		});
+		const closedOutput = formatWaitProgress({ waitedMs: 12, thread: closedThread() });
+
+		expect(idleOutput).toContain("Running: yes");
+		expect(idleOutput).toContain("Next: send prompt, poll, or stop");
+		expect(closedOutput).toContain("Running: no");
+		expect(closedOutput).toContain("Next: review output or list threads");
 	});
 });

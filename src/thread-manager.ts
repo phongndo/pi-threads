@@ -45,8 +45,11 @@ const RPC_SEND_TIMEOUT_MS = 5_000;
 const STOP_GRACE_MS = 1_500;
 const STOP_KILL_WAIT_MS = 300;
 const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
+const MAX_WAIT_TIMEOUT_MS = 600_000;
 const WAIT_POLL_INTERVAL_MS = 250;
 const BUSY_SEND_IDLE_SETTLE_REFRESHES = 2;
+const TASK_NAME_MAX_LENGTH = 64;
+const DISPLAY_NAME_MAX_LENGTH = 80;
 // Pi resolves CLI resource flags from the process startup cwd, while ctx.cwd can
 // later point at a resumed or switched session in another project.
 const PROCESS_START_CWD = process.cwd();
@@ -248,12 +251,12 @@ export class ThreadManager {
 		this.#assertStartAllowed();
 
 		const id = newThreadId();
-		const taskName = command.taskName ?? id;
+		const taskName = command.taskName ?? this.#generateUniqueTaskName(command, id);
 		assertTaskName(taskName);
 		const threadPath = joinThreadPath(this.#currentPath, taskName);
 		this.#assertPathAvailable(threadPath);
 
-		const name = command.name ?? command.taskName ?? id;
+		const name = command.name ?? generateDisplayName(command.prompt, taskName, id);
 		const cwd = resolveCwd(ctx.cwd, command.cwd);
 		const extraArgs = command.args ?? [];
 		assertAllowedExtraArgs(extraArgs);
@@ -480,7 +483,7 @@ export class ThreadManager {
 
 	async wait(command: WaitCommand, options: WaitOptions = {}): Promise<WaitOutcome> {
 		const startedAt = Date.now();
-		const timeoutMs = command.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
+		const timeoutMs = normalizeWaitTimeoutMs(command.timeoutMs);
 		throwIfAborted(options.signal);
 		const id = this.#requiredByTarget(command.id).id;
 
@@ -668,13 +671,42 @@ export class ThreadManager {
 		}
 	}
 
-	#assertPathAvailable(threadPath: ThreadPath): void {
-		const existing = Array.from(this.#threads.values()).find(
-			(thread) => thread.path === threadPath,
+	#generateUniqueTaskName(command: StartCommand, id: ThreadId): string {
+		const base =
+			taskNameFromText(command.name) ?? taskNameFromText(command.prompt) ?? shortTaskName(id);
+		return this.#uniqueTaskName(base, id);
+	}
+
+	#uniqueTaskName(base: string, id: ThreadId): string {
+		for (let attempt = 1; attempt <= 10_000; attempt += 1) {
+			const candidate = taskNameWithNumericSuffix(base, attempt);
+			if (this.#findByPath(joinThreadPath(this.#currentPath, candidate)) === undefined) {
+				return candidate;
+			}
+		}
+
+		const idBase = assertTaskName(id);
+		for (let attempt = 1; attempt <= 100; attempt += 1) {
+			const candidate = taskNameWithNumericSuffix(idBase, attempt);
+			if (this.#findByPath(joinThreadPath(this.#currentPath, candidate)) === undefined) {
+				return candidate;
+			}
+		}
+
+		throw new Error(
+			`Unable to generate a unique taskName under ${this.#currentPath}. Repair: provide an explicit unique start.taskName.`,
 		);
+	}
+
+	#findByPath(threadPath: ThreadPath): ManagedThread | undefined {
+		return Array.from(this.#threads.values()).find((thread) => thread.path === threadPath);
+	}
+
+	#assertPathAvailable(threadPath: ThreadPath): void {
+		const existing = this.#findByPath(threadPath);
 		if (existing) {
 			throw new Error(
-				`Thread path already exists: ${threadPath} (id: ${existing.id}). Repair: choose a unique start.taskName for this parent, or omit taskName to use a generated thread id.`,
+				`Thread path already exists: ${threadPath} (id: ${existing.id}). Repair: choose a unique start.taskName for this parent, or omit taskName so pi-threads generates a unique lower_snake_case path segment.`,
 			);
 		}
 	}
@@ -1512,6 +1544,70 @@ function looksLikeNodeScript(value: string): boolean {
 
 function isFlagLike(value: string): boolean {
 	return value.startsWith("-") && !value.startsWith("---");
+}
+
+function normalizeWaitTimeoutMs(timeoutMs: number | undefined): number {
+	if (timeoutMs === undefined) return DEFAULT_WAIT_TIMEOUT_MS;
+	if (Number.isInteger(timeoutMs) && timeoutMs >= 0 && timeoutMs <= MAX_WAIT_TIMEOUT_MS) {
+		return timeoutMs;
+	}
+
+	throw new Error(
+		`Invalid wait timeoutMs: ${timeoutMs}. Repair: set wait.timeoutMs to an integer from 0 to ${MAX_WAIT_TIMEOUT_MS}, or omit it to use ${DEFAULT_WAIT_TIMEOUT_MS}ms.`,
+	);
+}
+
+function taskNameFromText(value: string | undefined): string | null {
+	if (value === undefined) return null;
+	const normalized = value
+		.normalize("NFKD")
+		.replace(/[\u0300-\u036f]/gu, "")
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/gu, "_")
+		.replace(/_+/gu, "_")
+		.replace(/^_+|_+$/gu, "");
+	if (normalized === "") return null;
+	return assertTaskName(truncateTaskName(normalized));
+}
+
+function taskNameWithNumericSuffix(base: string, attempt: number): string {
+	const suffix = attempt === 1 ? "" : `_${attempt}`;
+	const stemMaxLength = TASK_NAME_MAX_LENGTH - suffix.length;
+	if (stemMaxLength < 1) throw new Error(`Unable to generate taskName suffix: ${suffix}`);
+	const stem = truncateTaskName(base, stemMaxLength);
+	return assertTaskName(`${stem}${suffix}`);
+}
+
+function truncateTaskName(value: string, maxLength = TASK_NAME_MAX_LENGTH): string {
+	const truncated = value.slice(0, maxLength).replace(/_+$/u, "");
+	return truncated === "" ? value.slice(0, maxLength) : truncated;
+}
+
+function generateDisplayName(prompt: string, taskName: string, id: ThreadId): string {
+	return displayNameFromPrompt(prompt) ?? humanizeTaskName(taskName) ?? shortTaskName(id);
+}
+
+function displayNameFromPrompt(prompt: string): string | null {
+	const firstUsefulLine = prompt
+		.split(/\r?\n/u)
+		.map((line) => line.replace(/\s+/gu, " ").trim())
+		.find((line) => line !== "" && /[\p{L}\p{N}]/u.test(line));
+	if (firstUsefulLine === undefined) return null;
+	return truncateDisplayName(firstUsefulLine);
+}
+
+function truncateDisplayName(value: string): string {
+	if (value.length <= DISPLAY_NAME_MAX_LENGTH) return value;
+	return `${value.slice(0, DISPLAY_NAME_MAX_LENGTH - 3).trimEnd()}...`;
+}
+
+function humanizeTaskName(taskName: string): string | null {
+	const text = taskName.replaceAll("_", " ").trim();
+	return text === "" ? null : text;
+}
+
+function shortTaskName(id: ThreadId): string {
+	return assertTaskName(id.slice(0, "thread_".length + 6));
 }
 
 function snapshot(thread: ManagedThread): ThreadSnapshot {
