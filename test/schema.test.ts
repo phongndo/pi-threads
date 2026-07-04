@@ -25,7 +25,7 @@ describe("thread schemas", () => {
 		const valid: readonly PiThreadParams[] = [
 			{ action: "start", prompt: "Inspect the repo", taskName: "inspect_repo" },
 			{ action: "list", state: "live", ancestor: "/root" },
-			{ action: "poll", id: "/root/inspect_repo" },
+			{ action: "poll", id: "/root/inspect_repo", detail: "summary" },
 			{ action: "send", id: "thread_012345abcdef", message: "Continue", mode: "follow_up" },
 			{ action: "wait", id: "inspect_repo", timeoutMs: 10_000 },
 			{ action: "stop", id: "thread_012345abcdef", force: true },
@@ -68,7 +68,7 @@ describe("thread schemas", () => {
 			/missing required field message.*Repair: use the send shape/u,
 		);
 		expect(() => assertPiThreadParams({ action: "poll", id: "alpha", message: "nope" })).toThrow(
-			/unexpected field message.*allowed for poll: action, id.*Repair: use the poll shape/u,
+			/unexpected field message.*allowed for poll: action, id, detail.*Repair: use the poll shape/u,
 		);
 		expect(() =>
 			assertPiThreadParams({ action: "list", parent: "/root/a", ancestor: "/root" }),
@@ -85,6 +85,9 @@ describe("thread schemas", () => {
 		expect(() =>
 			assertPiThreadParams({ action: "send", id: "alpha", message: "x", mode: "later" }),
 		).toThrow(/mode must be one of "prompt", "steer", or "follow_up"/u);
+		expect(() => assertPiThreadParams({ action: "poll", id: "alpha", detail: "verbose" })).toThrow(
+			/detail must be one of "summary", "tail", or "full"/u,
+		);
 	});
 });
 

@@ -109,6 +109,7 @@ describe("thread display formatting", () => {
 		const output = formatPoll(liveThread({ phase: "busy" }));
 
 		expect(output).toContain("Running: yes");
+		expect(output).toContain("Detail: summary");
 		expect(output).toContain("Next: wait, poll, send follow_up, or stop");
 		expect(nextThreadActions(liveThread({ phase: "busy" }))).toEqual([
 			"wait",
@@ -116,6 +117,54 @@ describe("thread display formatting", () => {
 			"send follow_up",
 			"stop",
 		]);
+	});
+
+	it("keeps default poll details summarized and makes full output explicit", () => {
+		const longText = `FIRST\n${"x".repeat(5_000)}\nLAST`;
+		const thread = closedThread({ lastAssistantText: longText });
+
+		const summarySnapshot = toThreadRuntimeSnapshot(thread);
+		expect(summarySnapshot.detail).toBe("summary");
+		expect(summarySnapshot.resultSummary).toContain("FIRST");
+		expect(summarySnapshot.result.truncated).toBe(true);
+		expect(summarySnapshot).not.toHaveProperty("lastAssistantText");
+		expect(summarySnapshot).not.toHaveProperty("outputTail");
+
+		const summaryOutput = formatPoll(thread);
+		expect(summaryOutput).toContain("Result summary");
+		expect(summaryOutput).toContain("truncated; use detail=tail or detail=full for more");
+		expect(summaryOutput).not.toContain("LAST");
+
+		const tailSnapshot = toThreadRuntimeSnapshot(thread, { detail: "tail" });
+		expect(tailSnapshot.outputTail).toContain("LAST");
+		expect(tailSnapshot.outputTruncated).toBe(true);
+		expect(tailSnapshot).not.toHaveProperty("lastAssistantText");
+		expect(formatPoll(thread, "tail")).toContain("Assistant output tail (truncated):");
+
+		const fullSnapshot = toThreadRuntimeSnapshot(thread, { detail: "full" });
+		expect(fullSnapshot.lastAssistantText).toBe(longText);
+		expect(formatPoll(thread, "full")).toContain("Last assistant output (full retained):");
+	});
+
+	it("falls back to the last assistant output when a live partial is blank", () => {
+		const thread = liveThread({
+			lastAssistantText: "Previous answer",
+			lastPartialText: " \n\t ",
+		});
+
+		const summarySnapshot = toThreadRuntimeSnapshot(thread);
+		expect(summarySnapshot.result).toEqual(
+			expect.objectContaining({
+				status: "completed",
+				source: "assistant_message",
+				text: "Previous answer",
+			}),
+		);
+		expect(summarySnapshot.resultSummary).toBe("Previous answer");
+
+		const tailSnapshot = toThreadRuntimeSnapshot(thread, { detail: "tail" });
+		expect(tailSnapshot.outputTail).toBe("Previous answer");
+		expect(formatPoll(thread, "full")).toContain("Previous answer");
 	});
 
 	it("shows running state and next actions in wait output", () => {

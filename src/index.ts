@@ -7,11 +7,13 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import {
+	DEFAULT_THREAD_DETAIL,
 	assertNever,
 	asThreadId,
 	asThreadPath,
 	isThreadIdText,
 	toThreadRuntimeSnapshot,
+	type ThreadDetail,
 	type ThreadId,
 	type ThreadPath,
 	type ThreadRuntimeSnapshot,
@@ -78,35 +80,50 @@ type ThreadsSessionShutdownAction =
 
 type SingleThreadResultDetails = {
 	readonly kind: string;
-	readonly thread: ThreadSnapshot;
+	readonly thread: ThreadRuntimeSnapshot;
 	readonly snapshot: ThreadRuntimeSnapshot;
 	readonly running: boolean;
 	readonly nextSuggestedActions: readonly string[];
+	readonly detail: ThreadDetail;
 };
 
 function withThreadResultDetails<
 	T extends { readonly kind: string; readonly thread: ThreadSnapshot },
->(details: T): T & SingleThreadResultDetails {
-	const snapshot =
-		(details as { readonly snapshot?: ThreadRuntimeSnapshot }).snapshot ??
-		toThreadRuntimeSnapshot(details.thread);
+>(
+	details: T,
+	detail: ThreadDetail = DEFAULT_THREAD_DETAIL,
+): Omit<T, "thread" | "snapshot"> & SingleThreadResultDetails {
+	const snapshot = toThreadRuntimeSnapshot(details.thread, { detail });
+	const {
+		thread: _thread,
+		snapshot: _snapshot,
+		...rest
+	} = details as T & {
+		readonly snapshot?: ThreadRuntimeSnapshot;
+	};
 	return {
-		...details,
+		...rest,
 		snapshot,
+		thread: snapshot,
 		running: snapshot.running,
 		nextSuggestedActions: snapshot.nextSuggestedActions,
+		detail,
 	};
 }
 
-function listResultDetails(threads: readonly ThreadSnapshot[]) {
-	const snapshots = threads.map((thread) => toThreadRuntimeSnapshot(thread));
+function listResultDetails(
+	threads: readonly ThreadSnapshot[],
+	detail: ThreadDetail = DEFAULT_THREAD_DETAIL,
+) {
+	const snapshots = threads.map((thread) => toThreadRuntimeSnapshot(thread, { detail }));
 	return {
 		kind: "listed" as const,
-		threads,
+		threads: snapshots,
 		snapshots,
 		count: snapshots.length,
 		liveCount: snapshots.filter((snapshot) => snapshot.status === "live").length,
 		closedCount: snapshots.filter((snapshot) => snapshot.status === "closed").length,
+		detail,
 	};
 }
 
@@ -323,9 +340,10 @@ export default function (pi: ExtensionAPI) {
 				}
 				case "poll": {
 					const thread = await manager.poll(params.id);
+					const detail = params.detail ?? DEFAULT_THREAD_DETAIL;
 					return {
-						content: [{ type: "text", text: formatPoll(thread) }],
-						details: withThreadResultDetails({ kind: "polled", thread }),
+						content: [{ type: "text", text: formatPoll(thread, detail) }],
+						details: withThreadResultDetails({ kind: "polled", thread }, detail),
 					};
 				}
 				case "send": {
@@ -343,19 +361,20 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 				case "wait": {
+					const detail = params.detail ?? DEFAULT_THREAD_DETAIL;
 					const waitOptions = {
 						...(signal === undefined ? {} : { signal }),
 						onProgress: (progress: WaitProgress) => {
 							onUpdate?.({
 								content: [{ type: "text", text: formatWaitProgress(progress) }],
-								details: withThreadResultDetails({ kind: "waiting", ...progress }),
+								details: withThreadResultDetails({ kind: "waiting", ...progress }, detail),
 							});
 						},
 					};
 					const outcome = await manager.wait(params, waitOptions);
 					return {
-						content: [{ type: "text", text: formatWait(outcome) }],
-						details: withThreadResultDetails(outcome),
+						content: [{ type: "text", text: formatWait(outcome, detail) }],
+						details: withThreadResultDetails(outcome, detail),
 					};
 				}
 				default:
@@ -383,6 +402,8 @@ export default function (pi: ExtensionAPI) {
 				case "stop": {
 					const id = typeof args["id"] === "string" ? args["id"] : "";
 					if (id) text += " " + theme.fg("accent", id);
+					const detail = typeof args["detail"] === "string" ? args["detail"] : "";
+					if (action === "poll" && detail) text += " " + theme.fg("muted", detail);
 					break;
 				}
 				case "send": {
@@ -411,6 +432,8 @@ export default function (pi: ExtensionAPI) {
 				case "wait": {
 					const id = typeof args["id"] === "string" ? args["id"] : "";
 					if (id) text += " " + theme.fg("accent", id);
+					const detail = typeof args["detail"] === "string" ? args["detail"] : "";
+					if (detail) text += " " + theme.fg("muted", detail);
 					const timeoutMs =
 						"timeoutMs" in args && typeof args["timeoutMs"] === "number"
 							? args["timeoutMs"]

@@ -90,12 +90,12 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
 
 ## 7. Summaries and detail control
 
-- [ ] Add summarized child results for completed threads.
-- [ ] Default poll output to a concise summary/tail instead of noisy transcript
+- [x] Add summarized child results for completed threads.
+- [x] Default poll output to a concise summary/tail instead of noisy transcript
       dumps.
-- [ ] Add an optional detail control, e.g.
+- [x] Add an optional detail control, e.g.
       `detail: "summary" | "tail" | "full"`.
-- [ ] Keep full transcript/detail access explicit and opt-in.
+- [x] Keep full transcript/detail access explicit and opt-in.
 
 ## 8. Explicit context passing
 

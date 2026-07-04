@@ -123,6 +123,20 @@ export type ThreadRuntimeStatus = "live" | "closed";
 
 export type ThreadRuntimePhase = ThreadPhase | "failed";
 
+export type ThreadDetail = "summary" | "tail" | "full";
+
+export type ThreadResultStatus = "none" | "partial" | "completed";
+
+export type ThreadResultSummary = {
+	readonly status: ThreadResultStatus;
+	readonly source: "none" | "assistant_message" | "assistant_partial";
+	readonly text: string | null;
+	readonly charCount: number;
+	readonly truncated: boolean;
+};
+
+export const DEFAULT_THREAD_DETAIL: ThreadDetail = "summary";
+
 export type ThreadRuntimeSnapshot = {
 	readonly id: ThreadId;
 	readonly path: ThreadPath;
@@ -141,6 +155,14 @@ export type ThreadRuntimeSnapshot = {
 	readonly pid?: number;
 	readonly exit?: ThreadExit;
 	readonly session: ThreadSession;
+	readonly detail: ThreadDetail;
+	readonly result: ThreadResultSummary;
+	readonly resultSummary?: string;
+	readonly outputTail?: string;
+	readonly outputCharCount?: number;
+	readonly outputTruncated?: boolean;
+	readonly stderrTail?: string;
+	readonly stderrTruncated?: boolean;
 	readonly lastAssistantText?: string;
 	readonly lastPartialText?: string;
 	readonly recentEvents: readonly ThreadEvent[];
@@ -204,7 +226,20 @@ export function nextSuggestedThreadActions(thread: ThreadSnapshot): readonly str
 	return ["wait", "poll", "send follow_up", "stop"];
 }
 
-export function toThreadRuntimeSnapshot(thread: ThreadSnapshot): ThreadRuntimeSnapshot {
+export function toThreadRuntimeSnapshot(
+	thread: ThreadSnapshot,
+	options: { readonly detail?: ThreadDetail } = {},
+): ThreadRuntimeSnapshot {
+	const detail = options.detail ?? DEFAULT_THREAD_DETAIL;
+	const outputText = currentAssistantOutputText(thread);
+	const result = summarizeThreadResult(thread, detail);
+	const outputTail = detail === "tail" && outputText !== null ? tailText(outputText, 4_000) : null;
+	const shouldIncludeStderrTail = detail !== "summary" && thread.stderrTail.trim() !== "";
+	const stderrTail = shouldIncludeStderrTail
+		? detail === "full"
+			? { text: thread.stderrTail, truncated: false }
+			: tailText(thread.stderrTail, 4_000)
+		: null;
 	const common = {
 		id: thread.id,
 		path: thread.path,
@@ -220,9 +255,27 @@ export function toThreadRuntimeSnapshot(thread: ThreadSnapshot): ThreadRuntimeSn
 		createdAt: thread.createdAt,
 		lastEventAt: thread.lastEventAt,
 		session: thread.session,
-		recentEvents: [...thread.recentEvents],
+		detail,
+		result,
+		...(result.text === null ? {} : { resultSummary: result.text }),
+		...(outputTail === null
+			? {}
+			: {
+					outputTail: outputTail.text,
+					outputCharCount: outputTail.charCount,
+					outputTruncated: outputTail.truncated,
+				}),
+		...(stderrTail === null
+			? {}
+			: {
+					stderrTail: stderrTail.text,
+					stderrTruncated: stderrTail.truncated,
+				}),
+		recentEvents: projectThreadEvents(thread.recentEvents, detail),
 		nextSuggestedActions: nextSuggestedThreadActions(thread),
-		...(thread.lastAssistantText === null ? {} : { lastAssistantText: thread.lastAssistantText }),
+		...(detail === "full" && thread.lastAssistantText !== null
+			? { lastAssistantText: thread.lastAssistantText }
+			: {}),
 	};
 
 	if (thread.state === "live") {
@@ -230,7 +283,9 @@ export function toThreadRuntimeSnapshot(thread: ThreadSnapshot): ThreadRuntimeSn
 			...common,
 			phase: thread.phase,
 			pid: thread.pid,
-			...(thread.lastPartialText === null ? {} : { lastPartialText: thread.lastPartialText }),
+			...(detail === "full" && thread.lastPartialText !== null
+				? { lastPartialText: thread.lastPartialText }
+				: {}),
 		};
 	}
 
@@ -238,6 +293,78 @@ export function toThreadRuntimeSnapshot(thread: ThreadSnapshot): ThreadRuntimeSn
 		...common,
 		phase: isThreadExitFailed(thread.exit) ? "failed" : "idle",
 		exit: thread.exit,
+	};
+}
+
+function summarizeThreadResult(thread: ThreadSnapshot, detail: ThreadDetail): ThreadResultSummary {
+	const partialText = thread.state === "live" ? nonBlankText(thread.lastPartialText) : null;
+	const sourceText = partialText ?? nonBlankText(thread.lastAssistantText);
+	if (sourceText === null) {
+		return { status: "none", source: "none", text: null, charCount: 0, truncated: false };
+	}
+
+	const compact = compactText(sourceText);
+	const limit = detail === "summary" ? 700 : detail === "tail" ? 1_200 : Number.POSITIVE_INFINITY;
+	const text = limit === Number.POSITIVE_INFINITY ? compact : truncateText(compact, limit);
+	return {
+		status: partialText === null ? "completed" : "partial",
+		source: partialText === null ? "assistant_message" : "assistant_partial",
+		text,
+		charCount: sourceText.length,
+		truncated: text.length < compact.length,
+	};
+}
+
+function currentAssistantOutputText(thread: ThreadSnapshot): string | null {
+	const assistantText = nonBlankText(thread.lastAssistantText);
+	if (thread.state === "closed") return assistantText;
+	return nonBlankText(thread.lastPartialText) ?? assistantText;
+}
+
+function nonBlankText(text: string | null): string | null {
+	return text === null || text.trim() === "" ? null : text;
+}
+
+function projectThreadEvents(
+	events: readonly ThreadEvent[],
+	detail: ThreadDetail,
+): readonly ThreadEvent[] {
+	const limit = detail === "summary" ? 5 : detail === "tail" ? 12 : events.length;
+	const selected = events.slice(Math.max(0, events.length - limit));
+	if (detail === "full") return [...selected];
+
+	const textLimit = detail === "summary" ? 180 : 700;
+	return selected.map((event) => projectThreadEvent(event, textLimit));
+}
+
+function projectThreadEvent(event: ThreadEvent, textLimit: number): ThreadEvent {
+	if (event.type !== "assistant_message") return event;
+	return { ...event, text: truncateText(compactText(event.text), textLimit) };
+}
+
+function compactText(text: string): string {
+	return text.trim().replace(/\s+/gu, " ");
+}
+
+function truncateText(text: string, maxLength: number): string {
+	if (text.length <= maxLength) return text;
+	if (maxLength <= 1) return "…";
+	return `${text.slice(0, maxLength - 1)}…`;
+}
+
+function tailText(
+	text: string,
+	maxLength: number,
+): {
+	readonly text: string;
+	readonly charCount: number;
+	readonly truncated: boolean;
+} {
+	if (text.length <= maxLength) return { text, charCount: text.length, truncated: false };
+	return {
+		text: `[truncated first ${text.length - maxLength} chars]\n${text.slice(-maxLength)}`,
+		charCount: text.length,
+		truncated: true,
 	};
 }
 

@@ -18,6 +18,10 @@ export const ListStateSchema = StringEnum(["all", "live", "closed"] as const, {
 	description: "Filter listed threads by runtime state.",
 });
 
+export const DetailSchema = StringEnum(["summary", "tail", "full"] as const, {
+	description: "Output/detail level. Defaults to summary; full is explicit opt-in.",
+});
+
 const TargetDescription = "Thread id, canonical path (/root/task), or unambiguous task name.";
 
 export const StartCommandSchema = Type.Object(
@@ -92,6 +96,7 @@ export const PollCommandSchema = Type.Object(
 	{
 		action: Type.Literal("poll", { description: "Poll one child Pi session." }),
 		id: Type.String({ minLength: 1, description: TargetDescription }),
+		detail: Type.Optional(DetailSchema),
 	},
 	Strict,
 );
@@ -121,6 +126,7 @@ export const WaitCommandSchema = Type.Object(
 			description: "Wait until a child Pi session becomes idle, closes, or the timeout expires.",
 		}),
 		id: Type.String({ minLength: 1, description: TargetDescription }),
+		detail: Type.Optional(DetailSchema),
 		timeoutMs: Type.Optional(
 			Type.Integer({
 				minimum: 0,
@@ -190,6 +196,11 @@ export const PiThreadParamsSchema = Type.Object(
 		id: Type.Optional(
 			Type.String({ minLength: 1, description: `For poll/send/stop/wait: ${TargetDescription}` }),
 		),
+		detail: Type.Optional(
+			StringEnum(["summary", "tail", "full"] as const, {
+				description: "For poll/wait: output detail level. Defaults to summary.",
+			}),
+		),
 		message: Type.Optional(
 			Type.String({ minLength: 1, description: "For send: message for the child." }),
 		),
@@ -208,12 +219,13 @@ export const PiThreadParamsSchema = Type.Object(
 	{
 		...Strict,
 		description:
-			"Manage child Pi sessions. Action-specific fields: start needs prompt; poll/send/stop/wait need id; send needs message; list may use state plus parent or ancestor, not both.",
+			"Manage child Pi sessions. Action-specific fields: start needs prompt; poll/send/stop/wait need id; poll/wait may use detail; send needs message; list may use state plus parent or ancestor, not both.",
 	},
 );
 
 export type SendMode = Static<typeof SendModeSchema>;
 export type ListState = Static<typeof ListStateSchema>;
+export type ThreadDetail = Static<typeof DetailSchema>;
 export type StartCommand = Static<typeof StartCommandSchema>;
 export type ListCommand = Static<typeof ListCommandSchema>;
 export type PollCommand = Static<typeof PollCommandSchema>;
@@ -248,6 +260,7 @@ const FieldRepairHints = {
 	},
 	poll: {
 		id: "id must be a non-empty thread id, canonical path, or unambiguous task name",
+		detail: `detail must be one of "summary", "tail", or "full"`,
 	},
 	send: {
 		id: "id must be a non-empty thread id, canonical path, or unambiguous task name",
@@ -260,6 +273,7 @@ const FieldRepairHints = {
 	},
 	wait: {
 		id: "id must be a non-empty thread id, canonical path, or unambiguous task name",
+		detail: `detail must be one of "summary", "tail", or "full"`,
 		timeoutMs: "timeoutMs must be an integer from 0 to 600000 milliseconds",
 	},
 } satisfies Record<Action, Record<string, string>>;
@@ -389,13 +403,13 @@ function allowedFieldsForAction(action: Action): ReadonlySet<string> {
 		case "list":
 			return new Set(["action", "state", "parent", "ancestor"]);
 		case "poll":
-			return new Set(["action", "id"]);
+			return new Set(["action", "id", "detail"]);
 		case "send":
 			return new Set(["action", "id", "message", "mode"]);
 		case "stop":
 			return new Set(["action", "id", "force"]);
 		case "wait":
-			return new Set(["action", "id", "timeoutMs"]);
+			return new Set(["action", "id", "detail", "timeoutMs"]);
 	}
 }
 

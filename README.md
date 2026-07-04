@@ -40,14 +40,14 @@ Pi calls a single model-facing `thread` tool with an `action` field. The
 extension does not expose separate `thread_start`, `thread_poll`, or other split
 tools:
 
-| Action  | What it does                                                      |
-| ------- | ----------------------------------------------------------------- |
-| `start` | Spawn a child Pi session with a prompt. Returns a thread id.      |
-| `poll`  | Check a thread's status, see its latest output and recent events. |
-| `send`  | Send a follow-up message to a running thread.                     |
-| `wait`  | Wait until a child session is idle/closed or a timeout expires.   |
-| `list`  | List all threads managed by this parent session.                  |
-| `stop`  | Stop a thread gracefully (or forcefully).                         |
+| Action  | What it does                                                    |
+| ------- | --------------------------------------------------------------- |
+| `start` | Spawn a child Pi session with a prompt. Returns a thread id.    |
+| `poll`  | Check a thread's status, summarized output, and recent events.  |
+| `send`  | Send a follow-up message to a running thread.                   |
+| `wait`  | Wait until a child session is idle/closed or a timeout expires. |
+| `list`  | List all threads managed by this parent session.                |
+| `stop`  | Stop a thread gracefully (or forcefully).                       |
 
 Example tool calls:
 
@@ -70,7 +70,11 @@ Example tool calls:
 ```
 
 ```json
-{ "action": "poll", "id": "/root/review_docs" }
+{ "action": "poll", "id": "/root/review_docs", "detail": "summary" }
+```
+
+```json
+{ "action": "poll", "id": "/root/review_docs", "detail": "full" }
 ```
 
 ```json
@@ -100,11 +104,16 @@ use the parent session's current working directory.
 
 Tool results include concise text plus structured `details`. Single-thread
 actions (`start`, `poll`, `send`, `wait`, and `stop`) include a normalized
-`snapshot` with `id`, `path`, `status`, `phase`, `running`, recent events, and
-`nextSuggestedActions`; `list` returns the same shape in `snapshots`. Recent
-events use compact canonical lifecycle names such as `thread_started`,
-`turn_started`, `tool_started`, `tool_completed`, `assistant_message`,
-`turn_completed`, and `thread_closed`.
+`snapshot` with `id`, `path`, `status`, `phase`, `running`, `detail`,
+`resultSummary`, recent events, and `nextSuggestedActions`; `list` returns the
+same shape in `snapshots`. Recent events use compact canonical lifecycle names
+such as `thread_started`, `turn_started`, `tool_started`, `tool_completed`,
+`assistant_message`, `turn_completed`, and `thread_closed`.
+
+`poll` and `wait` accept `detail: "summary" | "tail" | "full"`. The default is
+`summary`, which returns a compact child-result summary and a small event tail.
+`tail` adds bounded output/stderr tails. `full` is explicit opt-in and returns
+the full retained last assistant output in the structured snapshot.
 
 `start.args` is intentionally allowlisted. Children always run in RPC mode;
 one-shot modes, session selection, approval flags, package subcommands, bare

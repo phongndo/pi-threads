@@ -1,10 +1,14 @@
 import {
+	DEFAULT_THREAD_DETAIL,
 	isThreadExitFailed,
 	isThreadRunning,
 	nextSuggestedThreadActions,
 	threadPathBasename,
+	toThreadRuntimeSnapshot,
+	type ThreadDetail,
 	type ThreadEvent,
 	type ThreadExit,
+	type ThreadResultSummary,
 	type ThreadSnapshot,
 } from "./domain.ts";
 import type {
@@ -39,7 +43,11 @@ export function formatList(threads: readonly ThreadSnapshot[]): string {
 		.join("\n");
 }
 
-export function formatPoll(thread: ThreadSnapshot): string {
+export function formatPoll(
+	thread: ThreadSnapshot,
+	detail: ThreadDetail = DEFAULT_THREAD_DETAIL,
+): string {
+	const runtime = toThreadRuntimeSnapshot(thread, { detail });
 	const title = formatThreadTitle(thread);
 	const lines = [
 		`Pi thread "${title}"`,
@@ -51,24 +59,20 @@ export function formatPoll(thread: ThreadSnapshot): string {
 		`Running: ${isThreadRunning(thread) ? "yes" : "no"}`,
 		formatNextLine(thread),
 		`Cwd: ${thread.cwd}`,
+		`Detail: ${detail}`,
 	];
 	if (thread.session.kind === "known") lines.push(`Session: ${thread.session.file}`);
 
-	const text =
-		thread.state === "live"
-			? (thread.lastPartialText ?? thread.lastAssistantText)
-			: thread.lastAssistantText;
-	if (text !== null && text.trim() !== "") {
-		lines.push("", "Last assistant output:", trimForDisplay(text, 4_000));
-	}
+	lines.push(...formatResultLines(thread, detail));
 
-	if (thread.recentEvents.length > 0) {
+	if (runtime.recentEvents.length > 0) {
 		lines.push("", "Recent events:");
-		for (const event of thread.recentEvents.slice(-8)) lines.push(`- ${formatThreadEvent(event)}`);
+		for (const event of runtime.recentEvents) lines.push(`- ${formatThreadEvent(event)}`);
 	}
 
-	if (thread.stderrTail.trim() !== "") {
-		lines.push("", "stderr tail:", trimForDisplay(thread.stderrTail, 2_000));
+	if (runtime.stderrTail !== undefined && runtime.stderrTail.trim() !== "") {
+		const label = runtime.stderrTruncated === true ? "stderr tail (truncated):" : "stderr tail:";
+		lines.push("", label, runtime.stderrTail);
 	}
 
 	return lines.join("\n");
@@ -89,15 +93,21 @@ export function formatStop(outcome: StopOutcome): string {
 	return `Stopped "${formatThreadTitle(outcome.thread)}".\nPath: ${outcome.thread.path}\nStatus: ${formatStatus(outcome.thread)}`;
 }
 
-export function formatWait(outcome: WaitOutcome): string {
+export function formatWait(
+	outcome: WaitOutcome,
+	detail: ThreadDetail = DEFAULT_THREAD_DETAIL,
+): string {
 	const status = outcome.timedOut ? "timed out" : "completed";
-	return [
+	const lines = [
 		`Wait ${status} after ${outcome.waitedMs}ms for "${formatThreadTitle(outcome.thread)}".`,
 		`Path: ${outcome.thread.path}`,
 		`Status: ${formatStatus(outcome.thread)}`,
 		`Running: ${isThreadRunning(outcome.thread) ? "yes" : "no"}`,
 		formatNextLine(outcome.thread),
-	].join("\n");
+		`Detail: ${detail}`,
+	];
+	lines.push(...formatResultLines(outcome.thread, detail));
+	return lines.join("\n");
 }
 
 export function formatWaitProgress(progress: WaitProgress): string {
@@ -108,6 +118,52 @@ export function formatWaitProgress(progress: WaitProgress): string {
 		`Running: ${isThreadRunning(progress.thread) ? "yes" : "no"}`,
 		formatNextLine(progress.thread),
 	].join("\n");
+}
+
+function formatResultLines(thread: ThreadSnapshot, detail: ThreadDetail): string[] {
+	const runtime = toThreadRuntimeSnapshot(thread, { detail });
+	const lines: string[] = [];
+	if (detail === "full") {
+		const text = currentAssistantOutputText(thread);
+		if (text !== null && text.trim() !== "") {
+			lines.push("", "Last assistant output (full retained):", text);
+		}
+		return lines;
+	}
+
+	if (detail === "tail" && runtime.outputTail !== undefined) {
+		const label =
+			runtime.outputTruncated === true
+				? "Assistant output tail (truncated):"
+				: "Assistant output tail:";
+		lines.push("", label, runtime.outputTail);
+		return lines;
+	}
+
+	if (runtime.result.text !== null) {
+		lines.push("", `${formatResultLabel(runtime.result)}:`, runtime.result.text);
+	}
+
+	return lines;
+}
+
+function currentAssistantOutputText(thread: ThreadSnapshot): string | null {
+	const assistantText = nonBlankText(thread.lastAssistantText);
+	if (thread.state === "closed") return assistantText;
+	return nonBlankText(thread.lastPartialText) ?? assistantText;
+}
+
+function formatResultLabel(result: ThreadResultSummary): string {
+	const label = result.status === "partial" ? "Current assistant summary" : "Result summary";
+	const detail = formatResultMeta(result);
+	return detail === "" ? label : `${label} (${detail})`;
+}
+
+function formatResultMeta(result: ThreadResultSummary): string {
+	if (result.charCount === 0) return "";
+	const parts = [`${result.charCount} chars`];
+	if (result.truncated) parts.push("truncated; use detail=tail or detail=full for more");
+	return parts.join(", ");
 }
 
 export function nextThreadActions(thread: ThreadSnapshot): readonly string[] {
@@ -253,13 +309,14 @@ export function formatThreadSummary(thread: ThreadSnapshot, maxLen?: number): st
 			: `live/${thread.phase}`;
 	const pidPart = thread.state === "live" ? ` pid=${thread.pid}` : "";
 
+	const assistantText = nonBlankText(thread.lastAssistantText);
 	const text =
 		thread.state === "live"
-			? (thread.lastPartialText ?? thread.lastAssistantText)
-			: thread.lastAssistantText;
+			? (nonBlankText(thread.lastPartialText) ?? assistantText)
+			: assistantText;
 
 	let summary = `(${statePart}${pidPart})`;
-	if (text && text.trim()) {
+	if (text !== null) {
 		const preview = text.trim().replaceAll("\n", " ");
 		const truncated =
 			maxLen && preview.length > maxLen ? preview.slice(0, maxLen - 3) + "..." : preview;
@@ -277,6 +334,10 @@ function cleanDisplayText(value: string | null): string | null {
 	if (value === null) return null;
 	const trimmed = value.trim();
 	return trimmed === "" ? null : trimmed;
+}
+
+function nonBlankText(value: string | null): string | null {
+	return value === null || value.trim() === "" ? null : value;
 }
 
 function humanizeTaskName(value: string): string {

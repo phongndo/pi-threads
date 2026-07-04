@@ -256,6 +256,13 @@ describe("thread tool structured details", () => {
 				undefined,
 				context,
 			);
+			const fullPoll = await tool.execute(
+				"call-poll-full",
+				{ action: "poll", id: "alpha", detail: "full" },
+				undefined,
+				undefined,
+				context,
+			);
 			const send = await tool.execute(
 				"call-send",
 				{ action: "send", id: "alpha", message: "Continue", mode: "follow_up" },
@@ -269,6 +276,14 @@ describe("thread tool structured details", () => {
 				{ action: "wait", id: "alpha", timeoutMs: 0 },
 				undefined,
 				(update) => updates.push(update),
+				context,
+			);
+			const tailUpdates: unknown[] = [];
+			const tailWait = await tool.execute(
+				"call-wait-tail",
+				{ action: "wait", id: "alpha", detail: "tail", timeoutMs: 0 },
+				undefined,
+				(update) => tailUpdates.push(update),
 				context,
 			);
 			const stop = await tool.execute(
@@ -289,9 +304,15 @@ describe("thread tool structured details", () => {
 						path: liveThread.path,
 						status: "live",
 						phase: "busy",
-						lastAssistantText: "Working on it",
+						detail: "summary",
+						resultSummary: "Working on it",
 						recentEvents: expect.any(Array),
 						nextSuggestedActions: ["wait", "poll", "send follow_up", "stop"],
+					}),
+					thread: expect.objectContaining({
+						id: liveThread.id,
+						detail: "summary",
+						resultSummary: "Working on it",
 					}),
 				}),
 			);
@@ -314,6 +335,8 @@ describe("thread tool structured details", () => {
 							id: expect.any(String),
 							path: expect.any(String),
 							status: expect.stringMatching(/^(live|closed)$/u),
+							detail: "summary",
+							result: expect.objectContaining({ text: expect.any(String) }),
 							recentEvents: expect.any(Array),
 							nextSuggestedActions: expect.any(Array),
 						}),
@@ -321,12 +344,44 @@ describe("thread tool structured details", () => {
 					}),
 				);
 			}
+			expect(fullPoll.details).toEqual(
+				expect.objectContaining({
+					detail: "full",
+					snapshot: expect.objectContaining({
+						detail: "full",
+						lastAssistantText: "Working on it",
+					}),
+				}),
+			);
+			expect(tailWait.details).toEqual(
+				expect.objectContaining({
+					detail: "tail",
+					snapshot: expect.objectContaining({
+						detail: "tail",
+						outputTail: "Done",
+					}),
+				}),
+			);
 			expect(updates).toEqual([
 				expect.objectContaining({
 					details: expect.objectContaining({
 						kind: "waiting",
 						snapshot: expect.objectContaining({ status: "live", phase: "busy" }),
 						nextSuggestedActions: ["wait", "poll", "send follow_up", "stop"],
+					}),
+				}),
+			]);
+			expect(tailUpdates).toEqual([
+				expect.objectContaining({
+					details: expect.objectContaining({
+						kind: "waiting",
+						detail: "tail",
+						snapshot: expect.objectContaining({
+							status: "live",
+							phase: "busy",
+							detail: "tail",
+							outputTail: "Working on it",
+						}),
 					}),
 				}),
 			]);
