@@ -166,7 +166,9 @@ references: the `thread_...` id, the canonical path such as
 
 `start` sends the supplied prompt to the child session verbatim. Threads do not
 implicitly copy parent conversation context; include any context the child needs
-directly in the prompt.
+directly in the prompt. The extension does not provide context-transfer modes;
+context strategy belongs to the caller, prompt, skill, template, or another
+extension.
 
 ## Installation
 

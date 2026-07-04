@@ -47,6 +47,8 @@ describe("thread schemas", () => {
 			{ action: "stop", prompt: "nope" },
 			{ action: "wait", id: "thread_012345abcdef", timeoutMs: -1 },
 			{ action: "start", prompt: "x", taskName: "Bad Name" },
+			{ action: "start", prompt: "x", context: { mode: "none" } },
+			{ action: "poll", id: "thread_012345abcdef", context: { mode: "none" } },
 			{ action: "list", parent: "/root/a", ancestor: "/root" },
 			{ action: "unknown" },
 		] as const;
@@ -70,6 +72,14 @@ describe("thread schemas", () => {
 		expect(() => assertPiThreadParams({ action: "poll", id: "alpha", message: "nope" })).toThrow(
 			/unexpected field message.*allowed for poll: action, id, detail.*Repair: use the poll shape/u,
 		);
+		expect(() =>
+			assertPiThreadParams({ action: "start", prompt: "x", context: { mode: "none" } }),
+		).toThrow(
+			/unexpected field context.*allowed for start: action, prompt, name, taskName, args, cwd/u,
+		);
+		expect(() =>
+			assertPiThreadParams({ action: "poll", id: "alpha", context: { mode: "none" } }),
+		).toThrow(/unexpected field context.*allowed for poll: action, id, detail/u);
 		expect(() =>
 			assertPiThreadParams({ action: "list", parent: "/root/a", ancestor: "/root" }),
 		).toThrow(/parent and ancestor are mutually exclusive.*Choose one filter/u);

@@ -99,15 +99,14 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
 
 ## 8. Explicit context passing
 
-- [ ] Keep the default context behavior explicit and minimal: children do not
+- [x] Keep the default context behavior explicit and minimal: children do not
       inherit the parent conversation automatically.
-- [ ] Consider limited opt-in context modes later:
-  - `none`,
-  - `recent`,
-  - `summary`.
-- [ ] Avoid hidden parent-context injection.
-- [ ] Make child prompts self-contained unless the caller explicitly requests
-      context transfer.
+- [x] Send the supplied `start.prompt` to the child session verbatim.
+- [x] Avoid hidden parent-context injection.
+- [x] Make child prompts self-contained by requiring callers to include needed
+      context directly in the prompt.
+- [x] Do not reserve `recent`/`summary` context-transfer modes without a
+      concrete user need; keep context strategy outside this minimal primitive.
 
 ## 9. Durability and navigation
 
@@ -177,7 +176,7 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
 4. Shared structured snapshot shape for all actions.
 5. Lifecycle event log cleanup.
 6. Summary/detail controls.
-7. Explicit context passing modes.
+7. Explicit no-inherited-context behavior.
 8. Pi-native resume/fork/archive semantics.
 9. `/threads` browser improvements.
 10. Manual shorthand invocation.

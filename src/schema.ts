@@ -29,7 +29,8 @@ export const StartCommandSchema = Type.Object(
 		action: Type.Literal("start", { description: "Start a new child Pi session." }),
 		prompt: Type.String({
 			minLength: 1,
-			description: "Initial child task prompt.",
+			description:
+				"Initial child task prompt. Sent verbatim; parent conversation context is not inherited.",
 		}),
 		name: Type.Optional(
 			Type.String({
@@ -158,7 +159,8 @@ export const PiThreadParamsSchema = Type.Object(
 		prompt: Type.Optional(
 			Type.String({
 				minLength: 1,
-				description: "For start: initial child task prompt.",
+				description:
+					"For start: initial child task prompt. Sent verbatim; parent conversation context is not inherited.",
 			}),
 		),
 		name: Type.Optional(
@@ -219,7 +221,7 @@ export const PiThreadParamsSchema = Type.Object(
 	{
 		...Strict,
 		description:
-			"Manage child Pi sessions. Action-specific fields: start needs prompt; poll/send/stop/wait need id; poll/wait may use detail; send needs message; list may use state plus parent or ancestor, not both.",
+			"Manage child Pi sessions. Action-specific fields: start needs prompt; poll/send/stop/wait need id; poll/wait may use detail; send needs message; list may use state plus parent or ancestor, not both. Start prompts are sent verbatim without inherited parent conversation context.",
 	},
 );
 
