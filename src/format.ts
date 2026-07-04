@@ -1,7 +1,9 @@
 import {
+	isThreadExitFailed,
+	isThreadRunning,
+	nextSuggestedThreadActions,
 	threadPathBasename,
 	type ThreadEvent,
-	type ThreadExit,
 	type ThreadSnapshot,
 } from "./domain.ts";
 import type {
@@ -107,20 +109,13 @@ export function formatWaitProgress(progress: WaitProgress): string {
 	].join("\n");
 }
 
-export function isThreadRunning(thread: ThreadSnapshot): boolean {
-	return thread.state === "live";
-}
-
 export function nextThreadActions(thread: ThreadSnapshot): readonly string[] {
-	if (thread.state === "closed") return ["list"];
-	if (thread.phase === "idle") return ["send prompt", "poll", "stop"];
-	if (thread.phase === "stopping") return ["poll", "wait"];
-	return ["wait", "poll", "send follow_up", "stop"];
+	return nextSuggestedThreadActions(thread);
 }
 
 function formatStatus(thread: ThreadSnapshot): string {
 	if (thread.state === "closed") {
-		if (isFailedExit(thread.exit)) return "closed/failed";
+		if (isThreadExitFailed(thread.exit)) return "closed/failed";
 		return `closed/${thread.exit.kind}`;
 	}
 
@@ -193,7 +188,7 @@ export function formatThreadReference(thread: ThreadSnapshot): string {
 export function formatThreadUserStatus(
 	thread: ThreadSnapshot,
 ): "working" | "idle" | "done" | "failed" {
-	if (thread.state === "closed") return isFailedExit(thread.exit) ? "failed" : "done";
+	if (thread.state === "closed") return isThreadExitFailed(thread.exit) ? "failed" : "done";
 	return thread.phase === "idle" ? "idle" : "working";
 }
 
@@ -202,7 +197,7 @@ export function formatThreadStateBadge(
 	theme: { fg: (color: "error" | "dim" | "muted" | "warning" | "success", text: string) => string },
 ): string {
 	if (thread.state === "closed") {
-		if (isFailedExit(thread.exit)) {
+		if (isThreadExitFailed(thread.exit)) {
 			return theme.fg("error", "✕");
 		}
 		return theme.fg("dim", "○");
@@ -223,7 +218,7 @@ export function formatThreadStateBadge(
 export function formatThreadSummary(thread: ThreadSnapshot, maxLen?: number): string {
 	const statePart =
 		thread.state === "closed"
-			? isFailedExit(thread.exit)
+			? isThreadExitFailed(thread.exit)
 				? "closed/failed"
 				: `closed/${thread.exit.kind}`
 			: `live/${thread.phase}`;
@@ -242,12 +237,6 @@ export function formatThreadSummary(thread: ThreadSnapshot, maxLen?: number): st
 		summary += ` ${truncated}`;
 	}
 	return summary;
-}
-
-function isFailedExit(exit: ThreadExit): boolean {
-	return (
-		exit.kind === "failed" || (exit.kind === "exited" && (exit.code !== 0 || exit.signal !== null))
-	);
 }
 
 function trimForDisplay(text: string, maxLength: number): string {

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	asThreadId,
 	asThreadPath,
+	toThreadRuntimeSnapshot,
 	type ClosedThreadSnapshot,
 	type LiveThreadSnapshot,
 	type ThreadSnapshot,
@@ -122,9 +123,9 @@ describe("thread display formatting", () => {
 			kind: "waited",
 			timedOut: false,
 			waitedMs: 12,
-			thread: liveThread({ phase: "idle" }),
+			...snapshotPair(liveThread({ phase: "idle" })),
 		});
-		const closedOutput = formatWaitProgress({ waitedMs: 12, thread: closedThread() });
+		const closedOutput = formatWaitProgress({ waitedMs: 12, ...snapshotPair(closedThread()) });
 
 		expect(idleOutput).toContain("Running: yes");
 		expect(idleOutput).toContain("Next: send prompt, poll, or stop");
@@ -132,3 +133,7 @@ describe("thread display formatting", () => {
 		expect(closedOutput).toContain("Next: review output or list threads");
 	});
 });
+
+function snapshotPair(thread: ThreadSnapshot) {
+	return { thread, snapshot: toThreadRuntimeSnapshot(thread) };
+}

@@ -98,6 +98,11 @@ Refer to the thread later by id, full path, or unambiguous task name.
 If `start.cwd` is provided, it must resolve to an existing directory. Omit it to
 use the parent session's current working directory.
 
+Tool results include concise text plus structured `details`. Single-thread
+actions (`start`, `poll`, `send`, `wait`, and `stop`) include a normalized
+`snapshot` with `id`, `path`, `status`, `phase`, `running`, recent events, and
+`nextSuggestedActions`; `list` returns the same shape in `snapshots`.
+
 `start.args` is intentionally allowlisted. Children always run in RPC mode;
 one-shot modes, session selection, approval flags, package subcommands, bare
 positional args, and `--flag=value` forms are rejected. Safe narrowing flags such

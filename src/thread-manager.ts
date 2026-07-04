@@ -20,9 +20,11 @@ import {
 	type ThreadExit,
 	type ThreadId,
 	type ThreadPath,
+	type ThreadRuntimeSnapshot,
 	type ThreadPhase,
 	type ThreadSession,
 	type ThreadSnapshot,
+	toThreadRuntimeSnapshot,
 } from "./domain.ts";
 import { isRecord, numberField, stringField } from "./json.ts";
 import { RpcClient, type RpcClientEvent, type RpcResponse } from "./rpc.ts";
@@ -130,6 +132,7 @@ export type StartOutcome = {
 	readonly promptAccepted: boolean;
 	readonly note: string | null;
 	readonly thread: ThreadSnapshot;
+	readonly snapshot: ThreadRuntimeSnapshot;
 };
 
 export type SendOutcome = {
@@ -138,11 +141,13 @@ export type SendOutcome = {
 	readonly accepted: boolean;
 	readonly error: string | null;
 	readonly thread: ThreadSnapshot;
+	readonly snapshot: ThreadRuntimeSnapshot;
 };
 
 export type StopOutcome = {
 	readonly kind: "stopped";
 	readonly thread: ThreadSnapshot;
+	readonly snapshot: ThreadRuntimeSnapshot;
 };
 
 export type WaitOutcome = {
@@ -150,11 +155,13 @@ export type WaitOutcome = {
 	readonly timedOut: boolean;
 	readonly waitedMs: number;
 	readonly thread: ThreadSnapshot;
+	readonly snapshot: ThreadRuntimeSnapshot;
 };
 
 export type WaitProgress = {
 	readonly waitedMs: number;
 	readonly thread: ThreadSnapshot;
+	readonly snapshot: ThreadRuntimeSnapshot;
 };
 
 type WaitOptions = {
@@ -407,11 +414,12 @@ export class ThreadManager {
 		}
 		this.#emitChange();
 
+		const resultThread = snapshotPair(this.#required(id));
 		return {
 			kind: "started",
 			promptAccepted,
 			note,
-			thread: snapshot(this.#required(id)),
+			...resultThread,
 		};
 	}
 
@@ -448,7 +456,7 @@ export class ThreadManager {
 			mode,
 			accepted: response.success,
 			error: response.success ? null : (response.error ?? "Message was rejected by child Pi."),
-			thread: snapshot(this.#required(thread.id)),
+			...snapshotPair(this.#required(thread.id)),
 		};
 	}
 
@@ -456,11 +464,11 @@ export class ThreadManager {
 		let thread = this.#requiredByTarget(command.id);
 		const id = thread.id;
 
-		if (thread.state === "closed") return { kind: "stopped", thread: snapshot(thread) };
+		if (thread.state === "closed") return { kind: "stopped", ...snapshotPair(thread) };
 		if (thread.session.kind !== "known") await this.#refreshSession(thread);
 
 		thread = this.#required(id);
-		if (thread.state === "closed") return { kind: "stopped", thread: snapshot(thread) };
+		if (thread.state === "closed") return { kind: "stopped", ...snapshotPair(thread) };
 
 		thread.stopRequested = true;
 		thread.phase = "stopping";
@@ -478,7 +486,7 @@ export class ThreadManager {
 
 		await Promise.race([thread.closed, delay(STOP_GRACE_MS)]);
 		this.#emitChange();
-		return { kind: "stopped", thread: snapshot(this.#required(id)) };
+		return { kind: "stopped", ...snapshotPair(this.#required(id)) };
 	}
 
 	async wait(command: WaitCommand, options: WaitOptions = {}): Promise<WaitOutcome> {
@@ -495,7 +503,7 @@ export class ThreadManager {
 					kind: "waited",
 					timedOut: false,
 					waitedMs: Date.now() - startedAt,
-					thread: snapshot(thread),
+					...snapshotPair(thread),
 				};
 			}
 
@@ -505,7 +513,7 @@ export class ThreadManager {
 					kind: "waited",
 					timedOut: true,
 					waitedMs: Date.now() - startedAt,
-					thread: snapshot(thread),
+					...snapshotPair(thread),
 				};
 			}
 
@@ -530,7 +538,7 @@ export class ThreadManager {
 					kind: "waited",
 					timedOut: false,
 					waitedMs: Date.now() - startedAt,
-					thread: snapshot(refreshed),
+					...snapshotPair(refreshed),
 				};
 			}
 
@@ -541,7 +549,7 @@ export class ThreadManager {
 					kind: "waited",
 					timedOut: true,
 					waitedMs: elapsedMs,
-					thread: snapshot(refreshed),
+					...snapshotPair(refreshed),
 				};
 			}
 
@@ -1546,6 +1554,14 @@ function isFlagLike(value: string): boolean {
 	return value.startsWith("-") && !value.startsWith("---");
 }
 
+function snapshotPair(thread: ManagedThread): {
+	readonly thread: ThreadSnapshot;
+	readonly snapshot: ThreadRuntimeSnapshot;
+} {
+	const threadSnapshot = snapshot(thread);
+	return { thread: threadSnapshot, snapshot: toThreadRuntimeSnapshot(threadSnapshot) };
+}
+
 function normalizeWaitTimeoutMs(timeoutMs: number | undefined): number {
 	if (timeoutMs === undefined) return DEFAULT_WAIT_TIMEOUT_MS;
 	if (Number.isInteger(timeoutMs) && timeoutMs >= 0 && timeoutMs <= MAX_WAIT_TIMEOUT_MS) {
@@ -1801,7 +1817,7 @@ function hasNoPendingMessages(thread: ManagedThread): boolean {
 }
 
 function emitWaitProgress(options: WaitOptions, startedAt: number, thread: ManagedThread): void {
-	options.onProgress?.({ waitedMs: Date.now() - startedAt, thread: snapshot(thread) });
+	options.onProgress?.({ waitedMs: Date.now() - startedAt, ...snapshotPair(thread) });
 }
 
 function classifyProcessExit(input: {

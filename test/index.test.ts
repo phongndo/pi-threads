@@ -6,7 +6,12 @@ import type {
 	Theme,
 } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
-import { asThreadId, asThreadPath, type ThreadSnapshot } from "../src/domain.ts";
+import {
+	asThreadId,
+	asThreadPath,
+	toThreadRuntimeSnapshot,
+	type ThreadSnapshot,
+} from "../src/domain.ts";
 import { PI_THREAD_ENTRY_MESSAGE_TYPE } from "../src/threads-command.ts";
 import extension from "../src/index.ts";
 import { PiThreadParamsSchema } from "../src/schema.ts";
@@ -167,6 +172,167 @@ describe("thread prompt metadata", () => {
 		expect(tool.parameters).toBe(PiThreadParamsSchema);
 		expect(tool).not.toHaveProperty("promptSnippet");
 		expect(tool).not.toHaveProperty("promptGuidelines");
+	});
+});
+
+describe("thread tool structured details", () => {
+	it("returns normalized runtime snapshots for every action", async () => {
+		const liveThread = threadSnapshot({
+			state: "live",
+			pid: 123,
+			phase: "busy",
+			lastPartialText: null,
+			lastAssistantText: "Working on it",
+		} as Partial<ThreadSnapshot>);
+		const closedThread = threadSnapshot({
+			state: "closed",
+			exit: { kind: "exited", code: 0, signal: null },
+			lastAssistantText: "Done",
+		});
+		const liveSnapshot = toThreadRuntimeSnapshot(liveThread);
+		const closedSnapshot = toThreadRuntimeSnapshot(closedThread);
+		const manager = {
+			findBySessionFile: () => undefined,
+			resetScope: () => undefined,
+			start: async () => ({
+				kind: "started" as const,
+				promptAccepted: true,
+				note: null,
+				thread: liveThread,
+				snapshot: liveSnapshot,
+			}),
+			list: () => [liveThread, closedThread],
+			poll: async () => liveThread,
+			send: async () => ({
+				kind: "sent" as const,
+				mode: "follow_up" as const,
+				accepted: true,
+				error: null,
+				thread: liveThread,
+				snapshot: liveSnapshot,
+			}),
+			wait: async (
+				_command: unknown,
+				options: { readonly onProgress?: (progress: unknown) => void },
+			) => {
+				options.onProgress?.({ waitedMs: 1, thread: liveThread, snapshot: liveSnapshot });
+				return {
+					kind: "waited" as const,
+					timedOut: false,
+					waitedMs: 5,
+					thread: closedThread,
+					snapshot: closedSnapshot,
+				};
+			},
+			stop: async () => ({
+				kind: "stopped" as const,
+				thread: closedThread,
+				snapshot: closedSnapshot,
+			}),
+		} as unknown as ThreadManager;
+		const restoreManager = useProcessManager(manager);
+
+		try {
+			const tool = registeredThreadTool();
+			const context = ctx();
+			const start = await tool.execute(
+				"call-start",
+				{ action: "start", prompt: "Inspect" },
+				undefined,
+				undefined,
+				context,
+			);
+			const list = await tool.execute(
+				"call-list",
+				{ action: "list" },
+				undefined,
+				undefined,
+				context,
+			);
+			const poll = await tool.execute(
+				"call-poll",
+				{ action: "poll", id: "alpha" },
+				undefined,
+				undefined,
+				context,
+			);
+			const send = await tool.execute(
+				"call-send",
+				{ action: "send", id: "alpha", message: "Continue", mode: "follow_up" },
+				undefined,
+				undefined,
+				context,
+			);
+			const updates: unknown[] = [];
+			const wait = await tool.execute(
+				"call-wait",
+				{ action: "wait", id: "alpha", timeoutMs: 0 },
+				undefined,
+				(update) => updates.push(update),
+				context,
+			);
+			const stop = await tool.execute(
+				"call-stop",
+				{ action: "stop", id: "alpha" },
+				undefined,
+				undefined,
+				context,
+			);
+
+			expect(start.details).toEqual(
+				expect.objectContaining({
+					kind: "started",
+					running: true,
+					nextSuggestedActions: ["wait", "poll", "send follow_up", "stop"],
+					snapshot: expect.objectContaining({
+						id: liveThread.id,
+						path: liveThread.path,
+						status: "live",
+						phase: "busy",
+						lastAssistantText: "Working on it",
+						recentEvents: expect.any(Array),
+						nextSuggestedActions: ["wait", "poll", "send follow_up", "stop"],
+					}),
+				}),
+			);
+			expect(list.details).toEqual(
+				expect.objectContaining({
+					kind: "listed",
+					count: 2,
+					liveCount: 1,
+					closedCount: 1,
+					snapshots: [
+						expect.objectContaining({ status: "live", phase: "busy" }),
+						expect.objectContaining({ status: "closed", phase: "idle" }),
+					],
+				}),
+			);
+			for (const result of [poll, send, wait, stop]) {
+				expect(result.details).toEqual(
+					expect.objectContaining({
+						snapshot: expect.objectContaining({
+							id: expect.any(String),
+							path: expect.any(String),
+							status: expect.stringMatching(/^(live|closed)$/u),
+							recentEvents: expect.any(Array),
+							nextSuggestedActions: expect.any(Array),
+						}),
+						nextSuggestedActions: expect.any(Array),
+					}),
+				);
+			}
+			expect(updates).toEqual([
+				expect.objectContaining({
+					details: expect.objectContaining({
+						kind: "waiting",
+						snapshot: expect.objectContaining({ status: "live", phase: "busy" }),
+						nextSuggestedActions: ["wait", "poll", "send follow_up", "stop"],
+					}),
+				}),
+			]);
+		} finally {
+			restoreManager();
+		}
 	});
 });
 

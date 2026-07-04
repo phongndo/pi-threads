@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	asThreadId,
 	asThreadPath,
+	toThreadRuntimeSnapshot,
 	type ClosedThreadSnapshot,
 	type LiveThreadSnapshot,
 	type ThreadSnapshot,
@@ -302,10 +303,15 @@ describe("ThreadsTreeComponent input", () => {
 		let resolveStop!: (outcome: {
 			readonly kind: "stopped";
 			readonly thread: ThreadSnapshot;
+			readonly snapshot: ReturnType<typeof toThreadRuntimeSnapshot>;
 		}) => void;
 		const stop = vi.fn(
 			() =>
-				new Promise<{ readonly kind: "stopped"; readonly thread: ThreadSnapshot }>((resolve) => {
+				new Promise<{
+					readonly kind: "stopped";
+					readonly thread: ThreadSnapshot;
+					readonly snapshot: ReturnType<typeof toThreadRuntimeSnapshot>;
+				}>((resolve) => {
 					resolveStop = resolve;
 				}),
 		);
@@ -329,7 +335,12 @@ describe("ThreadsTreeComponent input", () => {
 		).handleStop();
 		tree.handleInput("\x1b");
 		stale = true;
-		resolveStop({ kind: "stopped", thread: thread() });
+		const stoppedThread = thread();
+		resolveStop({
+			kind: "stopped",
+			thread: stoppedThread,
+			snapshot: toThreadRuntimeSnapshot(stoppedThread),
+		});
 
 		await expect(stopPromise).resolves.toBeUndefined();
 		expect(done).toHaveBeenCalledWith(null);

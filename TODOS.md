@@ -54,9 +54,9 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
 
 ## 5. Structured runtime model
 
-- [ ] Normalize start/poll/wait/send/stop/list results around a shared thread
+- [x] Normalize start/poll/wait/send/stop/list results around a shared thread
       snapshot shape.
-- [ ] Include machine-readable fields such as:
+- [x] Include machine-readable fields such as:
 
 ```ts
 {
@@ -70,8 +70,8 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
 }
 ```
 
-- [ ] Keep prose summaries concise and secondary to structured `details`.
-- [ ] Ensure every action returns enough structured data for the model or UI to
+- [x] Keep prose summaries concise and secondary to structured `details`.
+- [x] Ensure every action returns enough structured data for the model or UI to
       continue without prompt-specific assumptions.
 
 ## 6. Lifecycle event log

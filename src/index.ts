@@ -11,8 +11,10 @@ import {
 	asThreadId,
 	asThreadPath,
 	isThreadIdText,
+	toThreadRuntimeSnapshot,
 	type ThreadId,
 	type ThreadPath,
+	type ThreadRuntimeSnapshot,
 	type ThreadSnapshot,
 } from "./domain.ts";
 import {
@@ -24,8 +26,6 @@ import {
 	formatThreadTitle,
 	formatWaitProgress,
 	formatWait,
-	isThreadRunning,
-	nextThreadActions,
 } from "./format.ts";
 import { isRecord, stringField } from "./json.ts";
 import { assertPiThreadParams, PiThreadParamsSchema } from "./schema.ts";
@@ -75,6 +75,40 @@ type ThreadsSessionShutdownAction =
 	| { readonly kind: "shutdown" }
 	| { readonly kind: "preserve" }
 	| { readonly kind: "stop_target"; readonly thread: ThreadSnapshot };
+
+type SingleThreadResultDetails = {
+	readonly kind: string;
+	readonly thread: ThreadSnapshot;
+	readonly snapshot: ThreadRuntimeSnapshot;
+	readonly running: boolean;
+	readonly nextSuggestedActions: readonly string[];
+};
+
+function withThreadResultDetails<
+	T extends { readonly kind: string; readonly thread: ThreadSnapshot },
+>(details: T): T & SingleThreadResultDetails {
+	const snapshot =
+		(details as { readonly snapshot?: ThreadRuntimeSnapshot }).snapshot ??
+		toThreadRuntimeSnapshot(details.thread);
+	return {
+		...details,
+		snapshot,
+		running: snapshot.running,
+		nextSuggestedActions: snapshot.nextSuggestedActions,
+	};
+}
+
+function listResultDetails(threads: readonly ThreadSnapshot[]) {
+	const snapshots = threads.map((thread) => toThreadRuntimeSnapshot(thread));
+	return {
+		kind: "listed" as const,
+		threads,
+		snapshots,
+		count: snapshots.length,
+		liveCount: snapshots.filter((snapshot) => snapshot.status === "live").length,
+		closedCount: snapshots.filter((snapshot) => snapshot.status === "closed").length,
+	};
+}
 
 function findThreadEntryDetails(ctx: ExtensionContext): ThreadEntryDetails | null {
 	const branch = ctx.sessionManager.getBranch();
@@ -277,40 +311,35 @@ export default function (pi: ExtensionAPI) {
 					const outcome = await manager.start(params, ctx);
 					return {
 						content: [{ type: "text", text: formatStart(outcome) }],
-						details: outcome,
+						details: withThreadResultDetails(outcome),
 					};
 				}
 				case "list": {
 					const threads = manager.list(params);
 					return {
 						content: [{ type: "text", text: formatList(threads) }],
-						details: { kind: "listed", threads },
+						details: listResultDetails(threads),
 					};
 				}
 				case "poll": {
 					const thread = await manager.poll(params.id);
 					return {
 						content: [{ type: "text", text: formatPoll(thread) }],
-						details: {
-							kind: "polled",
-							running: isThreadRunning(thread),
-							nextSuggestedActions: nextThreadActions(thread),
-							thread,
-						},
+						details: withThreadResultDetails({ kind: "polled", thread }),
 					};
 				}
 				case "send": {
 					const outcome = await manager.send(params);
 					return {
 						content: [{ type: "text", text: formatSend(outcome) }],
-						details: outcome,
+						details: withThreadResultDetails(outcome),
 					};
 				}
 				case "stop": {
 					const outcome = await manager.stop(params);
 					return {
 						content: [{ type: "text", text: formatStop(outcome) }],
-						details: outcome,
+						details: withThreadResultDetails(outcome),
 					};
 				}
 				case "wait": {
@@ -319,23 +348,14 @@ export default function (pi: ExtensionAPI) {
 						onProgress: (progress: WaitProgress) => {
 							onUpdate?.({
 								content: [{ type: "text", text: formatWaitProgress(progress) }],
-								details: {
-									kind: "waiting",
-									running: isThreadRunning(progress.thread),
-									nextSuggestedActions: nextThreadActions(progress.thread),
-									...progress,
-								},
+								details: withThreadResultDetails({ kind: "waiting", ...progress }),
 							});
 						},
 					};
 					const outcome = await manager.wait(params, waitOptions);
 					return {
 						content: [{ type: "text", text: formatWait(outcome) }],
-						details: {
-							...outcome,
-							running: isThreadRunning(outcome.thread),
-							nextSuggestedActions: nextThreadActions(outcome.thread),
-						},
+						details: withThreadResultDetails(outcome),
 					};
 				}
 				default:

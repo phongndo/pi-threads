@@ -88,6 +88,34 @@ export type ClosedThreadSnapshot = {
 
 export type ThreadSnapshot = LiveThreadSnapshot | ClosedThreadSnapshot;
 
+export type ThreadRuntimeStatus = "live" | "closed";
+
+export type ThreadRuntimePhase = ThreadPhase | "failed";
+
+export type ThreadRuntimeSnapshot = {
+	readonly id: ThreadId;
+	readonly path: ThreadPath;
+	readonly name: string;
+	readonly taskName: string;
+	readonly status: ThreadRuntimeStatus;
+	readonly phase: ThreadRuntimePhase;
+	readonly running: boolean;
+	readonly parentPath: ThreadPath;
+	readonly parentThreadId: ThreadId | null;
+	readonly depth: number;
+	readonly cwd: string;
+	readonly args: readonly string[];
+	readonly createdAt: string;
+	readonly lastEventAt: string;
+	readonly pid?: number;
+	readonly exit?: ThreadExit;
+	readonly session: ThreadSession;
+	readonly lastAssistantText?: string;
+	readonly lastPartialText?: string;
+	readonly recentEvents: readonly ThreadEvent[];
+	readonly nextSuggestedActions: readonly string[];
+};
+
 export function newThreadId(): ThreadId {
 	return asThreadId(`thread_${randomUUID().replaceAll("-", "").slice(0, 12)}`);
 }
@@ -126,6 +154,60 @@ export function joinThreadPath(parent: ThreadPath, taskName: string): ThreadPath
 
 export function threadPathBasename(threadPath: ThreadPath): string {
 	return threadPath.slice(threadPath.lastIndexOf("/") + 1);
+}
+
+export function isThreadExitFailed(exit: ThreadExit): boolean {
+	return (
+		exit.kind === "failed" || (exit.kind === "exited" && (exit.code !== 0 || exit.signal !== null))
+	);
+}
+
+export function isThreadRunning(thread: ThreadSnapshot): boolean {
+	return thread.state === "live";
+}
+
+export function nextSuggestedThreadActions(thread: ThreadSnapshot): readonly string[] {
+	if (thread.state === "closed") return ["list"];
+	if (thread.phase === "idle") return ["send prompt", "poll", "stop"];
+	if (thread.phase === "stopping") return ["poll", "wait"];
+	return ["wait", "poll", "send follow_up", "stop"];
+}
+
+export function toThreadRuntimeSnapshot(thread: ThreadSnapshot): ThreadRuntimeSnapshot {
+	const common = {
+		id: thread.id,
+		path: thread.path,
+		name: thread.name,
+		taskName: thread.taskName,
+		status: thread.state,
+		running: isThreadRunning(thread),
+		parentPath: thread.parentPath,
+		parentThreadId: thread.parentThreadId,
+		depth: thread.depth,
+		cwd: thread.cwd,
+		args: [...thread.args],
+		createdAt: thread.createdAt,
+		lastEventAt: thread.lastEventAt,
+		session: thread.session,
+		recentEvents: [...thread.recentEvents],
+		nextSuggestedActions: nextSuggestedThreadActions(thread),
+		...(thread.lastAssistantText === null ? {} : { lastAssistantText: thread.lastAssistantText }),
+	};
+
+	if (thread.state === "live") {
+		return {
+			...common,
+			phase: thread.phase,
+			pid: thread.pid,
+			...(thread.lastPartialText === null ? {} : { lastPartialText: thread.lastPartialText }),
+		};
+	}
+
+	return {
+		...common,
+		phase: isThreadExitFailed(thread.exit) ? "failed" : "idle",
+		exit: thread.exit,
+	};
 }
 
 export function assertNever(value: never): never {
