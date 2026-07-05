@@ -167,7 +167,7 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
   - Prefer `interface extends` for shared DTO fields.
   - Consider classes only for internal behavior-heavy collaborators that do not
     cross the JSON/session/tool-result boundary.
-- [ ] Split `ThreadManager` responsibilities where practical without a risky
+- [x] Split `ThreadManager` responsibilities where practical without a risky
       rewrite, e.g. target resolution, durable registry persistence, launch
       preparation, and snapshot helpers.
 - [x] Add regression tests for product boundaries so shorthand-looking

@@ -9,11 +9,9 @@ import {
 	asThreadPath,
 	asThreadId,
 	assertTaskName,
-	isThreadIdText,
 	joinThreadPath,
 	newThreadId,
 	nowIso,
-	threadPathBasename,
 	type ClosedThreadSnapshot,
 	type KnownThreadSession,
 	type LiveThreadSnapshot,
@@ -40,6 +38,11 @@ import type {
 	StopCommand,
 	WaitCommand,
 } from "./schema.ts";
+import {
+	resolveListPathReference,
+	resolveThreadTarget,
+	unknownThreadReferenceError,
+} from "./thread-references.ts";
 
 const DEFAULT_MAX_DEPTH = 2;
 const DEFAULT_MAX_THREADS = 8;
@@ -377,13 +380,21 @@ export class ThreadManager {
 
 		const parent = command && "parent" in command ? command.parent : undefined;
 		if (parent !== undefined) {
-			const parentPath = this.#resolveListPathReference(parent);
+			const parentPath = resolveListPathReference(parent, {
+				currentPath: this.#currentPath,
+				selfThreadId: this.#selfThreadId,
+				threads: this.#threads.values(),
+			});
 			threads = threads.filter((thread) => thread.parentPath === parentPath);
 		}
 
 		const ancestor = command && "ancestor" in command ? command.ancestor : undefined;
 		if (ancestor !== undefined) {
-			const ancestorPath = this.#resolveListPathReference(ancestor);
+			const ancestorPath = resolveListPathReference(ancestor, {
+				currentPath: this.#currentPath,
+				selfThreadId: this.#selfThreadId,
+				threads: this.#threads.values(),
+			});
 			threads = threads.filter(
 				(thread) => thread.path !== ancestorPath && thread.path.startsWith(`${ancestorPath}/`),
 			);
@@ -925,12 +936,17 @@ export class ThreadManager {
 
 	#required(id: ThreadId): ManagedThread {
 		const thread = this.#threads.get(id);
-		if (!thread) throw this.#unknownThreadReferenceError(id);
+		if (!thread) throw unknownThreadReferenceError(id, this.#threads.values());
 		return thread;
 	}
 
 	#requiredByTarget(target: string): ManagedThread {
-		return this.#required(this.#resolveTarget(target));
+		return this.#required(
+			resolveThreadTarget(target, {
+				currentPath: this.#currentPath,
+				threads: this.#threads.values(),
+			}),
+		);
 	}
 
 	#liveByTarget(target: string): LiveThread {
@@ -972,72 +988,6 @@ export class ThreadManager {
 		};
 	}
 
-	#resolveTarget(targetText: string): ThreadId {
-		const target = targetText.trim();
-		if (isThreadIdText(target)) {
-			const id = asThreadId(target);
-			if (this.#threads.has(id)) return id;
-			throw this.#unknownThreadReferenceError(targetText);
-		}
-
-		const pathReference = this.#tryResolvePathReference(target);
-		if (pathReference !== null) {
-			const thread = Array.from(this.#threads.values()).find(
-				(candidate) => candidate.path === pathReference,
-			);
-			if (thread) return thread.id;
-		}
-
-		const matches = Array.from(this.#threads.values()).filter(
-			(thread) =>
-				thread.taskName === target ||
-				threadPathBasename(thread.path) === target ||
-				thread.name === target,
-		);
-		if (matches.length === 1) return matches[0]!.id;
-		if (matches.length > 1) {
-			throw new Error(
-				`Ambiguous thread reference "${targetText}". Candidate paths: ${matches
-					.map((thread) => thread.path)
-					.join(", ")}. Repair: use one of the candidate paths or a thread id instead.`,
-			);
-		}
-
-		throw this.#unknownThreadReferenceError(targetText);
-	}
-
-	#resolveListPathReference(reference: string): ThreadPath {
-		const trimmed = reference.trim();
-		if (trimmed === "." || trimmed === "self") return this.#currentPath;
-		if (isThreadIdText(trimmed)) {
-			const id = asThreadId(trimmed);
-			if (this.#selfThreadId === id) return this.#currentPath;
-			const thread = this.#threads.get(id);
-			if (thread !== undefined) return thread.path;
-			throw this.#unknownThreadReferenceError(reference);
-		}
-
-		const pathReference = this.#tryResolvePathReference(reference);
-		// List filters only compare stored parentPath/path prefixes, so a syntactically
-		// valid path is useful even when no managed thread exists at that exact path.
-		if (pathReference !== null) return pathReference;
-
-		const thread = this.#requiredByTarget(reference);
-		return thread.path;
-	}
-
-	#tryResolvePathReference(referenceText: string): ThreadPath | null {
-		const reference = referenceText.trim();
-		try {
-			if (reference.startsWith("/")) return asThreadPath(reference);
-			if (reference.startsWith("root/")) return asThreadPath(`/${reference}`);
-			if (reference.includes("/")) return asThreadPath(`${this.#currentPath}/${reference}`);
-			return joinThreadPath(this.#currentPath, reference);
-		} catch {
-			return null;
-		}
-	}
-
 	#generateUniqueTaskName(command: StartCommand, id: ThreadId): string {
 		const base =
 			taskNameFromText(command.name) ?? taskNameFromText(command.prompt) ?? shortTaskName(id);
@@ -1076,17 +1026,6 @@ export class ThreadManager {
 				`Thread path already exists: ${threadPath} (id: ${existing.id}). Repair: choose a unique start.taskName for this parent, or omit taskName so pi-threads generates a unique lower_snake_case path segment.`,
 			);
 		}
-	}
-
-	#unknownThreadReferenceError(reference: string): Error {
-		const suggestions = knownThreadSuggestions(this.#threads.values());
-		const known =
-			suggestions.length === 0
-				? " No threads are currently managed by this parent."
-				: ` Known threads: ${suggestions.join("; ")}.`;
-		return new Error(
-			`Unknown thread reference: "${reference}". Accepted reference forms: thread id (thread_012345abcdef), canonical path (/root/task), relative path from the current thread (task or parent/task), or unambiguous taskName/name.${known} Repair: use a known path/id, run { "action": "list" }, or start the thread first.`,
-		);
 	}
 
 	#closeThread(id: ThreadId, exit: ThreadExit): void {
@@ -2534,13 +2473,6 @@ function resolveCwd(parentCwd: string, childCwd: string | undefined): string {
 	}
 
 	return cwd;
-}
-
-function knownThreadSuggestions(threads: Iterable<ManagedThread>): readonly string[] {
-	return Array.from(threads)
-		.toSorted((left, right) => left.path.localeCompare(right.path))
-		.slice(0, 8)
-		.map((thread) => `${thread.path} (id: ${thread.id}, taskName: ${thread.taskName})`);
 }
 
 function sameSessionFile(left: string, right: string): boolean {
