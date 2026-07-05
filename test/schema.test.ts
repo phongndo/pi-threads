@@ -29,6 +29,9 @@ describe("thread schemas", () => {
 			{ action: "send", id: "thread_012345abcdef", message: "Continue", mode: "follow_up" },
 			{ action: "wait", id: "inspect_repo", timeoutMs: 10_000 },
 			{ action: "stop", id: "thread_012345abcdef", force: true },
+			{ action: "resume", id: "/root/inspect_repo" },
+			{ action: "fork", id: "/root/inspect_repo", entryId: "abc12345", position: "at" },
+			{ action: "archive", id: "/root/inspect_repo", archived: false },
 		];
 
 		for (const input of valid) {
@@ -46,6 +49,9 @@ describe("thread schemas", () => {
 			{ action: "send", id: "thread_012345abcdef" },
 			{ action: "stop", prompt: "nope" },
 			{ action: "wait", id: "thread_012345abcdef", timeoutMs: -1 },
+			{ action: "resume", prompt: "nope" },
+			{ action: "fork", prompt: "nope" },
+			{ action: "archive", id: "thread_012345abcdef", force: true },
 			{ action: "start", prompt: "x", taskName: "Bad Name" },
 			{ action: "start", prompt: "x", context: { mode: "none" } },
 			{ action: "poll", id: "thread_012345abcdef", context: { mode: "none" } },

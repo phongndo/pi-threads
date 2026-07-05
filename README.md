@@ -40,14 +40,17 @@ Pi calls a single model-facing `thread` tool with an `action` field. The
 extension does not expose separate `thread_start`, `thread_poll`, or other split
 tools:
 
-| Action  | What it does                                                    |
-| ------- | --------------------------------------------------------------- |
-| `start` | Spawn a child Pi session with a prompt. Returns a thread id.    |
-| `poll`  | Check a thread's status, summarized output, and recent events.  |
-| `send`  | Send a follow-up message to a running thread.                   |
-| `wait`  | Wait until a child session is idle/closed or a timeout expires. |
-| `list`  | List all threads managed by this parent session.                |
-| `stop`  | Stop a thread gracefully (or forcefully).                       |
+| Action    | What it does                                                    |
+| --------- | --------------------------------------------------------------- |
+| `start`   | Spawn a child Pi session with a prompt. Returns a thread id.    |
+| `poll`    | Check a thread's status, summarized output, and recent events.  |
+| `send`    | Send a follow-up message to a running thread.                   |
+| `wait`    | Wait until a child session is idle/closed or a timeout expires. |
+| `list`    | List all threads managed by this parent session.                |
+| `stop`    | Stop a thread gracefully (or forcefully).                       |
+| `resume`  | Reopen a saved managed child session as a live thread.          |
+| `fork`    | Fork the parent/current child session into a managed thread.    |
+| `archive` | Hide completed/stale threads without deleting session history.  |
 
 Example tool calls:
 
@@ -94,6 +97,22 @@ Example tool calls:
 { "action": "list", "state": "live" }
 ```
 
+```json
+{ "action": "resume", "id": "/root/review_docs" }
+```
+
+```json
+{ "action": "fork", "id": "/root/review_docs", "entryId": "abc12345" }
+```
+
+```json
+{ "action": "archive", "id": "/root/review_docs" }
+```
+
+```json
+{ "action": "list", "visibility": "archived" }
+```
+
 Threads also get a stable canonical path like `/root/review_tests`. Omit
 `taskName` to generate a unique lower_snake_case path segment from `name` or the
 prompt, or pass `taskName` on `start` to choose the final path segment yourself.
@@ -136,28 +155,28 @@ children while preventing a tool call from loosening the parent's restrictions.
 
 ## Observability
 
-Use `/threads` in Pi's TUI to open an interactive thread browser for the current
-session. It defaults to all known threads so completed work remains visible.
-Use `/threads exit` as the explicit thread-session exit command; `/exit` remains
-the convenient shortcut that returns to the parent when a parent thread session
-is recorded.
+Use `/threads` in Pi's TUI to open an interactive observability browser for the
+current session. It loads all known threads, including archived entries, and
+defaults to active visibility.
 Other arguments show usage instead of silently falling back to the browser. The
-TUI opens with no arguments.
+TUI opens with no arguments and uses Pi's native editor-replacement surface, so
+the parent chat remains visible while browsing.
 
 The browser follows Pi's native tree-like UI style with state badges, friendly
-thread titles, search, and keyboard controls. Use `↑`/`↓` to navigate, type to
-search, `tab` to cycle filters (`all` → `live` → `closed`), `enter` to enter a
-closed/stopped thread's Pi session, `ctrl+p` to poll/refresh that row, `ctrl+r`
-to refresh the list, `ctrl+x` to stop it, and `esc` to clear search or close.
-The control legend is shown below the browser title.
+thread titles, search, status/visibility filters, and a selected-thread detail
+panel with result summary, session metadata, parent/child info, and recent event
+timeline. Use `↑`/`↓` to navigate, `←`/`→` to jump to visible parent/child
+threads, type to search, `tab` to cycle status filters, `ctrl+v` to cycle
+visibility (`active` → `archived` → `all`), `ctrl+p` to poll/refresh that row,
+`ctrl+r` to refresh the list, `ctrl+x` to stop it, and `esc` to clear search or
+close. The control legend is shown below the browser title.
 
-When you enter a closed/stopped thread from `/threads`, pi switches to that child
-session and records the parent session. Live threads must be stopped or closed
-before they can be opened. Use `/exit` from inside the child session to switch
-back to the parent. Outside a recorded thread session, `/exit` behaves like a
-normal Pi shutdown request; `/threads exit` is the thread-specific form and warns
-when no parent session is recorded. Entering is disabled when Pi was started with
-`--no-session`, because there is no saved parent session to return to.
+The browser intentionally does not expose start, resume, fork, archive, or send
+controls. Those remain agent/tool-level orchestration primitives. User-facing
+browser controls are limited to observing, navigating, polling/refreshing, and
+stopping live work for safety. It intentionally does not attach to or render
+child Pi sessions; use agent/tool actions such as `poll`, `wait`, and `list` for
+thread output, and keep orchestration in the parent chat.
 
 Friendly titles (generated session name, `name`, then `taskName` or short id)
 are for display in the TUI. Tool call headers and automation use stable
@@ -169,6 +188,15 @@ implicitly copy parent conversation context; include any context the child needs
 directly in the prompt. The extension does not provide context-transfer modes;
 context strategy belongs to the caller, prompt, skill, template, or another
 extension.
+
+Durability uses Pi-native session files and non-context custom session entries.
+When a parent session is saved, new children are started from an explicit child
+session file whose header records Pi's native `parentSession` metadata. `resume`
+reopens that saved session without sending a hidden prompt. `fork` uses Pi's
+session tree APIs and starts the forked session without an implicit kickoff
+message; send an explicit `send` action if the fork should continue with a new
+instruction. `archive` is only a pi-threads visibility state and never deletes
+the underlying Pi session file.
 
 ## Installation
 

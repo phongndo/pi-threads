@@ -4,7 +4,17 @@ import type { TLocalizedValidationError } from "typebox/error";
 import { Value } from "typebox/value";
 
 const Strict = { additionalProperties: false } as const;
-const ActionValues = ["start", "list", "poll", "send", "stop", "wait"] as const;
+const ActionValues = [
+	"start",
+	"list",
+	"poll",
+	"send",
+	"stop",
+	"wait",
+	"resume",
+	"fork",
+	"archive",
+] as const;
 
 export const ActionSchema = StringEnum(ActionValues, {
 	description: "Thread command to run.",
@@ -18,8 +28,17 @@ export const ListStateSchema = StringEnum(["all", "live", "closed"] as const, {
 	description: "Filter listed threads by runtime state.",
 });
 
+export const ListVisibilitySchema = StringEnum(["active", "archived", "all"] as const, {
+	description: "Filter listed threads by archive visibility. Defaults to active.",
+});
+
 export const DetailSchema = StringEnum(["summary", "tail", "full"] as const, {
 	description: "Output/detail level. Defaults to summary; full is explicit opt-in.",
+});
+
+export const ForkPositionSchema = StringEnum(["at", "before"] as const, {
+	description:
+		"For fork: fork at the selected entry, or before a selected user message. Defaults to at.",
 });
 
 const TargetDescription = "Thread id, canonical path (/root/task), or unambiguous task name.";
@@ -62,6 +81,7 @@ const ListFields = {
 		description: "List child Pi sessions.",
 	}),
 	state: Type.Optional(ListStateSchema),
+	visibility: Type.Optional(ListVisibilitySchema),
 } as const;
 
 export const ListCommandSchema = Type.Union(
@@ -139,6 +159,73 @@ export const WaitCommandSchema = Type.Object(
 	Strict,
 );
 
+export const ResumeCommandSchema = Type.Object(
+	{
+		action: Type.Literal("resume", {
+			description: "Reconnect a saved managed child Pi session as a live thread.",
+		}),
+		id: Type.String({ minLength: 1, description: TargetDescription }),
+	},
+	Strict,
+);
+
+export const ForkCommandSchema = Type.Object(
+	{
+		action: Type.Literal("fork", {
+			description:
+				"Fork the current Pi session or a managed child session into a new managed live thread.",
+		}),
+		id: Type.Optional(
+			Type.String({
+				minLength: 1,
+				description:
+					"Optional source managed thread id/path/task name. Omit to fork the current parent session.",
+			}),
+		),
+		entryId: Type.Optional(
+			Type.String({
+				minLength: 1,
+				description:
+					"Optional Pi session tree entry id to fork from. Omit to fork from the source session leaf.",
+			}),
+		),
+		position: Type.Optional(ForkPositionSchema),
+		name: Type.Optional(
+			Type.String({
+				minLength: 1,
+				description: "Display name for the forked child Pi session. Generated when omitted.",
+			}),
+		),
+		taskName: Type.Optional(
+			Type.String({
+				pattern: "^[a-z0-9][a-z0-9_]{0,63}$",
+				description:
+					"Stable lower_snake_case path segment for the forked managed thread. Generated when omitted.",
+			}),
+		),
+		args: Type.Optional(
+			Type.Array(Type.String(), {
+				description: "Extra Pi CLI args for the forked child. RPC mode and session are enforced.",
+			}),
+		),
+	},
+	Strict,
+);
+
+export const ArchiveCommandSchema = Type.Object(
+	{
+		action: Type.Literal("archive", {
+			description:
+				"Archive or unarchive a completed/stale managed thread without deleting history.",
+		}),
+		id: Type.String({ minLength: 1, description: TargetDescription }),
+		archived: Type.Optional(
+			Type.Boolean({ description: "Set false to unarchive. Defaults to true." }),
+		),
+	},
+	Strict,
+);
+
 export const StrictPiThreadParamsSchema = Type.Union(
 	[
 		StartCommandSchema,
@@ -147,9 +234,12 @@ export const StrictPiThreadParamsSchema = Type.Union(
 		SendCommandSchema,
 		StopCommandSchema,
 		WaitCommandSchema,
+		ResumeCommandSchema,
+		ForkCommandSchema,
+		ArchiveCommandSchema,
 	],
 	{
-		description: "Strict action union: start, list, poll, send, wait, stop.",
+		description: "Strict action union: start, list, poll, send, wait, stop, resume, fork, archive.",
 	},
 );
 
@@ -166,26 +256,26 @@ export const PiThreadParamsSchema = Type.Object(
 		name: Type.Optional(
 			Type.String({
 				minLength: 1,
-				description:
-					"For start: display name for the child session. Generated from prompt when omitted.",
+				description: "For start/fork: display name for the child session. Generated when omitted.",
 			}),
 		),
 		taskName: Type.Optional(
 			Type.String({
 				pattern: "^[a-z0-9][a-z0-9_]{0,63}$",
 				description:
-					"For start: stable lower_snake_case path segment. Generated from name or prompt when omitted.",
+					"For start/fork: stable lower_snake_case path segment. Generated when omitted.",
 			}),
 		),
 		args: Type.Optional(
 			Type.Array(Type.String(), {
-				description: "For start: extra Pi CLI args. RPC mode is enforced.",
+				description: "For start/fork: extra Pi CLI args. RPC mode and session are enforced.",
 			}),
 		),
 		cwd: Type.Optional(
 			Type.String({ minLength: 1, description: "For start: working directory for the child." }),
 		),
 		state: Type.Optional(ListStateSchema),
+		visibility: Type.Optional(ListVisibilitySchema),
 		parent: Type.Optional(
 			Type.String({
 				minLength: 1,
@@ -196,8 +286,18 @@ export const PiThreadParamsSchema = Type.Object(
 			Type.String({ minLength: 1, description: "For list: only descendants of this path/thread." }),
 		),
 		id: Type.Optional(
-			Type.String({ minLength: 1, description: `For poll/send/stop/wait: ${TargetDescription}` }),
+			Type.String({
+				minLength: 1,
+				description: `For poll/send/stop/wait/resume/archive; optional source for fork: ${TargetDescription}`,
+			}),
 		),
+		entryId: Type.Optional(
+			Type.String({
+				minLength: 1,
+				description: "For fork: optional Pi session tree entry id to fork from.",
+			}),
+		),
+		position: Type.Optional(ForkPositionSchema),
 		detail: Type.Optional(
 			StringEnum(["summary", "tail", "full"] as const, {
 				description: "For poll/wait: output detail level. Defaults to summary.",
@@ -210,6 +310,9 @@ export const PiThreadParamsSchema = Type.Object(
 		force: Type.Optional(
 			Type.Boolean({ description: "For stop: use SIGKILL instead of graceful stop." }),
 		),
+		archived: Type.Optional(
+			Type.Boolean({ description: "For archive: set false to unarchive. Defaults to true." }),
+		),
 		timeoutMs: Type.Optional(
 			Type.Integer({
 				minimum: 0,
@@ -221,12 +324,13 @@ export const PiThreadParamsSchema = Type.Object(
 	{
 		...Strict,
 		description:
-			"Manage child Pi sessions. Action-specific fields: start needs prompt; poll/send/stop/wait need id; poll/wait may use detail; send needs message; list may use state plus parent or ancestor, not both. Start prompts are sent verbatim without inherited parent conversation context.",
+			"Manage child Pi sessions. Action-specific fields: start needs prompt; poll/send/stop/wait/resume/archive need id; fork may use id and entryId; poll/wait may use detail; send needs message; list may use state/visibility plus parent or ancestor, not both. Start prompts are sent verbatim without inherited parent conversation context.",
 	},
 );
 
 export type SendMode = Static<typeof SendModeSchema>;
 export type ListState = Static<typeof ListStateSchema>;
+export type ListVisibility = Static<typeof ListVisibilitySchema>;
 export type ThreadDetail = Static<typeof DetailSchema>;
 export type StartCommand = Static<typeof StartCommandSchema>;
 export type ListCommand = Static<typeof ListCommandSchema>;
@@ -234,6 +338,9 @@ export type PollCommand = Static<typeof PollCommandSchema>;
 export type SendCommand = Static<typeof SendCommandSchema>;
 export type StopCommand = Static<typeof StopCommandSchema>;
 export type WaitCommand = Static<typeof WaitCommandSchema>;
+export type ResumeCommand = Static<typeof ResumeCommandSchema>;
+export type ForkCommand = Static<typeof ForkCommandSchema>;
+export type ArchiveCommand = Static<typeof ArchiveCommandSchema>;
 export type PiThreadParams = Static<typeof StrictPiThreadParamsSchema>;
 type Action = Static<typeof ActionSchema>;
 
@@ -244,6 +351,9 @@ const ActionExamples = {
 	send: `{ "action": "send", "id": "/root/inspect_tests", "message": "Continue", "mode": "follow_up" }`,
 	stop: `{ "action": "stop", "id": "/root/inspect_tests", "force": false }`,
 	wait: `{ "action": "wait", "id": "/root/inspect_tests", "timeoutMs": 30000 }`,
+	resume: `{ "action": "resume", "id": "/root/inspect_tests" }`,
+	fork: `{ "action": "fork", "id": "/root/inspect_tests", "entryId": "abc12345" }`,
+	archive: `{ "action": "archive", "id": "/root/inspect_tests" }`,
 } satisfies Record<Action, string>;
 
 const FieldRepairHints = {
@@ -257,6 +367,7 @@ const FieldRepairHints = {
 	},
 	list: {
 		state: `state must be one of "all", "live", or "closed"`,
+		visibility: `visibility must be one of "active", "archived", or "all"`,
 		parent: "parent must be a non-empty thread path/reference",
 		ancestor: "ancestor must be a non-empty thread path/reference",
 	},
@@ -277,6 +388,22 @@ const FieldRepairHints = {
 		id: "id must be a non-empty thread id, canonical path, or unambiguous task name",
 		detail: `detail must be one of "summary", "tail", or "full"`,
 		timeoutMs: "timeoutMs must be an integer from 0 to 600000 milliseconds",
+	},
+	resume: {
+		id: "id must be a non-empty managed thread id, canonical path, or unambiguous task name",
+	},
+	fork: {
+		id: "id must be a non-empty managed thread id/path/task name when provided",
+		entryId: "entryId must be a non-empty Pi session tree entry id when provided",
+		position: `position must be one of "at" or "before"`,
+		name: "name must be a non-empty string when provided",
+		taskName:
+			"taskName must be lower_snake_case: start with a lowercase letter or digit, then use lowercase letters, digits, or underscores (max 64 chars)",
+		args: `args must be an array of strings, e.g. "args": ["--model", "sonnet"]`,
+	},
+	archive: {
+		id: "id must be a non-empty thread id, canonical path, or unambiguous task name",
+		archived: "archived must be true or false when provided",
 	},
 } satisfies Record<Action, Record<string, string>>;
 
@@ -403,7 +530,7 @@ function allowedFieldsForAction(action: Action): ReadonlySet<string> {
 		case "start":
 			return new Set(["action", "prompt", "name", "taskName", "args", "cwd"]);
 		case "list":
-			return new Set(["action", "state", "parent", "ancestor"]);
+			return new Set(["action", "state", "visibility", "parent", "ancestor"]);
 		case "poll":
 			return new Set(["action", "id", "detail"]);
 		case "send":
@@ -412,6 +539,12 @@ function allowedFieldsForAction(action: Action): ReadonlySet<string> {
 			return new Set(["action", "id", "force"]);
 		case "wait":
 			return new Set(["action", "id", "detail", "timeoutMs"]);
+		case "resume":
+			return new Set(["action", "id"]);
+		case "fork":
+			return new Set(["action", "id", "entryId", "position", "name", "taskName", "args"]);
+		case "archive":
+			return new Set(["action", "id", "archived"]);
 	}
 }
 
@@ -421,10 +554,14 @@ function requiredFieldsForAction(action: Action): readonly string[] {
 			return ["prompt"];
 		case "send":
 			return ["id", "message"];
+		case "resume":
+		case "archive":
+			return ["id"];
 		case "poll":
 		case "stop":
 		case "wait":
 			return ["id"];
+		case "fork":
 		case "list":
 			return [];
 	}
@@ -444,5 +581,11 @@ function strictSchemaForAction(action: Action) {
 			return StopCommandSchema;
 		case "wait":
 			return WaitCommandSchema;
+		case "resume":
+			return ResumeCommandSchema;
+		case "fork":
+			return ForkCommandSchema;
+		case "archive":
+			return ArchiveCommandSchema;
 	}
 }

@@ -27,6 +27,7 @@ function thread(overrides: Partial<LiveThreadSnapshot> = {}): ThreadSnapshot {
 		parentPath: asThreadPath("/root"),
 		parentThreadId: null,
 		depth: 1,
+		archived: false,
 		cwd: "/tmp/project",
 		args: [],
 		createdAt: "2026-01-01T00:00:00.000Z",
@@ -52,6 +53,7 @@ function closedThread(overrides: Partial<ClosedThreadSnapshot> = {}): ThreadSnap
 		parentPath: asThreadPath("/root"),
 		parentThreadId: null,
 		depth: 1,
+		archived: false,
 		cwd: "/tmp/project",
 		args: [],
 		createdAt: "2026-01-01T00:00:00.000Z",
@@ -111,7 +113,7 @@ describe("/threads command", () => {
 		} as unknown as ExtensionCommandContext);
 
 		expect(list).not.toHaveBeenCalled();
-		expect(notify).toHaveBeenCalledWith("Usage: /threads [exit]", "error");
+		expect(notify).toHaveBeenCalledWith("Usage: /threads", "error");
 	});
 
 	it("rejects removed state filter arguments", async () => {
@@ -134,37 +136,13 @@ describe("/threads command", () => {
 		} as unknown as ExtensionCommandContext);
 
 		expect(list).not.toHaveBeenCalled();
-		expect(notify).toHaveBeenCalledWith("Usage: /threads [exit]", "error");
+		expect(notify).toHaveBeenCalledWith("Usage: /threads", "error");
 	});
 
-	it("routes /threads exit to the thread exit handler", async () => {
+	it("opens the TUI browser as a native editor replacement", async () => {
 		let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
 		const list = vi.fn(() => [thread()]);
-		const exit = vi.fn();
-		const pi = {
-			registerCommand: (name: string, options: Parameters<ExtensionAPI["registerCommand"]>[1]) => {
-				if (name === "threads") handler = options.handler;
-			},
-		} as unknown as ExtensionAPI;
-
-		registerThreadsCommand(pi, { list } as unknown as ThreadManager, { exit });
-		if (handler === undefined) throw new Error("/threads command was not registered");
-
-		const ctx = {
-			mode: "print",
-			hasUI: false,
-			ui: { notify: vi.fn() },
-		} as unknown as ExtensionCommandContext;
-		await handler("exit", ctx);
-
-		expect(exit).toHaveBeenCalledWith(ctx);
-		expect(list).not.toHaveBeenCalled();
-	});
-
-	it("warns instead of silently no-oping when /threads exit has no handler", async () => {
-		let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
-		const notify = vi.fn();
-		const list = vi.fn(() => [thread()]);
+		const custom = vi.fn().mockResolvedValue(null);
 		const pi = {
 			registerCommand: (name: string, options: Parameters<ExtensionAPI["registerCommand"]>[1]) => {
 				if (name === "threads") handler = options.handler;
@@ -174,14 +152,14 @@ describe("/threads command", () => {
 		registerThreadsCommand(pi, { list } as unknown as ThreadManager);
 		if (handler === undefined) throw new Error("/threads command was not registered");
 
-		await handler("exit", {
-			mode: "print",
-			hasUI: false,
-			ui: { notify },
+		await handler("", {
+			mode: "tui",
+			hasUI: true,
+			ui: { custom, notify: vi.fn() },
 		} as unknown as ExtensionCommandContext);
 
-		expect(notify).toHaveBeenCalledWith("Thread exit is unavailable in this context", "warning");
-		expect(list).not.toHaveBeenCalled();
+		expect(list).toHaveBeenCalledWith({ action: "list", state: "all", visibility: "all" });
+		expect(custom).toHaveBeenCalledWith(expect.any(Function));
 	});
 });
 
@@ -206,9 +184,10 @@ describe("ThreadsTreeComponent input", () => {
 		expect(stop).toHaveBeenCalledWith({ action: "stop", id: "/root/alpha", force: false });
 	});
 
-	it("does not stop or switch into a live thread when opening", async () => {
+	it("does not enter or switch sessions from the browser", () => {
 		const liveThread = thread({
 			phase: "busy",
+			lastPartialText: "Still working through the plan.",
 			session: {
 				kind: "known",
 				file: "/tmp/child.jsonl",
@@ -217,60 +196,38 @@ describe("ThreadsTreeComponent input", () => {
 				pendingMessageCount: null,
 			},
 		});
-		const poll = vi.fn().mockResolvedValue(liveThread);
+		const poll = vi.fn();
 		const stop = vi.fn();
 		const switchSession = vi.fn();
-		const notify = vi.fn();
 		const tree = component({ poll, stop }, [liveThread], {
-			ui: { notify },
 			switchSession,
 		} as unknown as ExtensionCommandContext);
 
 		tree.handleInput("\r");
-		await vi.waitFor(() => expect(poll).toHaveBeenCalledWith("/root/alpha"));
+		const rendered = tree.render(180).join("\n");
 
-		expect(stop).not.toHaveBeenCalled();
-		expect(switchSession).not.toHaveBeenCalled();
-		expect(notify).toHaveBeenCalledWith(expect.stringContaining("still live"), "warning");
-	});
-
-	it("does not enter a thread when the parent session is not saved", () => {
-		const stoppedThread = closedThread({
-			session: {
-				kind: "known",
-				file: "/tmp/child.jsonl",
-				id: "session-child",
-				name: null,
-				pendingMessageCount: null,
-			},
-		});
-		const poll = vi.fn().mockResolvedValue(stoppedThread);
-		const switchSession = vi.fn();
-		const notify = vi.fn();
-		const done = vi.fn();
-		const tree = component(
-			{ poll },
-			[stoppedThread],
-			{
-				ui: { notify },
-				sessionManager: { getSessionFile: () => undefined },
-				switchSession,
-			} as unknown as ExtensionCommandContext,
-			done,
-		);
-
-		tree.handleInput("\r");
-
+		expect(rendered).toContain("Pi Threads");
+		expect(rendered).toContain("Selected: alpha  /root/alpha");
+		expect(rendered).toContain("live/busy");
+		expect(rendered).toContain("Still working through the plan.");
+		expect(rendered).not.toContain("Attached read-only");
+		expect(rendered).not.toContain("READ ONLY");
 		expect(poll).not.toHaveBeenCalled();
-		expect(done).not.toHaveBeenCalled();
+		expect(stop).not.toHaveBeenCalled();
 		expect(switchSession).not.toHaveBeenCalled();
-		expect(notify).toHaveBeenCalledWith(
-			expect.stringContaining("no saved parent session"),
-			"warning",
-		);
 	});
 
-	it("opens a closed thread session without stopping it", async () => {
+	it("renders the browser at a natural panel height instead of padding to the viewport", () => {
+		const tree = component({}, [thread()]);
+		const lines = tree.render(100);
+
+		expect(lines.length).toBeLessThan(24);
+		expect(lines.every((line) => line.length <= 100)).toBe(true);
+		expect(lines.join("\n")).toContain("Pi Threads");
+		expect(lines.join("\n")).not.toContain("READ ONLY");
+	});
+
+	it("does not switch sessions for closed threads", () => {
 		const stoppedThread = closedThread({
 			session: {
 				kind: "known",
@@ -280,21 +237,18 @@ describe("ThreadsTreeComponent input", () => {
 				pendingMessageCount: null,
 			},
 		});
-		const poll = vi.fn().mockResolvedValue(stoppedThread);
-		const stop = vi.fn();
-		const switchSession = vi.fn().mockResolvedValue({ cancelled: false });
-		const tree = component({ poll, stop }, [stoppedThread], {
+		const switchSession = vi.fn();
+		const tree = component({}, [stoppedThread], {
 			switchSession,
 		} as unknown as ExtensionCommandContext);
 
 		tree.handleInput("\r");
-		await vi.waitFor(() => expect(switchSession).toHaveBeenCalled());
+		const rendered = tree.render(160).join("\n");
 
-		expect(stop).not.toHaveBeenCalled();
-		expect(switchSession).toHaveBeenCalledWith(
-			"/tmp/child.jsonl",
-			expect.objectContaining({ withSession: expect.any(Function) }),
-		);
+		expect(rendered).toContain("Selected: alpha  /root/alpha");
+		expect(rendered).toContain("closed/stopped");
+		expect(rendered).not.toContain("Attached read-only");
+		expect(switchSession).not.toHaveBeenCalled();
 	});
 
 	it("does not use a stale command context after the menu closes during stop", async () => {
@@ -345,5 +299,93 @@ describe("ThreadsTreeComponent input", () => {
 		await expect(stopPromise).resolves.toBeUndefined();
 		expect(done).toHaveBeenCalledWith(null);
 		expect(notify).not.toHaveBeenCalled();
+	});
+
+	it("hides archived threads by default and toggles archived visibility with ctrl+v", () => {
+		const active = thread();
+		const archived = closedThread({
+			id: asThreadId("thread_111111111111"),
+			name: "beta",
+			taskName: "beta",
+			path: asThreadPath("/root/beta"),
+			archived: true,
+		});
+		const tree = component({}, [active, archived]);
+
+		expect(tree.render(160).join("\n")).toContain("/root/alpha");
+		expect(tree.render(160).join("\n")).not.toContain("/root/beta");
+
+		tree.handleInput("\x16");
+		expect(tree.render(160).join("\n")).not.toContain("/root/alpha");
+		expect(tree.render(160).join("\n")).toContain("/root/beta");
+		expect(tree.render(160).join("\n")).toContain("[archived]");
+
+		tree.handleInput("\x16");
+		expect(tree.render(160).join("\n")).toContain("/root/alpha");
+		expect(tree.render(160).join("\n")).toContain("/root/beta");
+	});
+
+	it("shows stale state, summaries, and event timeline for the selected thread", () => {
+		const staleThread = closedThread({
+			exit: { kind: "stale", message: "restored" },
+			lastAssistantText: "Finished reviewing the docs.",
+			session: {
+				kind: "known",
+				file: "/tmp/child.jsonl",
+				id: "session-child",
+				name: null,
+				pendingMessageCount: null,
+			},
+			recentEvents: [
+				{
+					seq: 1,
+					at: "2026-01-01T00:00:00.000Z",
+					type: "assistant_message",
+					text: "Finished reviewing the docs.",
+				},
+			],
+		});
+		const tree = component({}, [staleThread]);
+		const rendered = tree.render(180).join("\n");
+
+		expect(rendered).toContain("stale");
+		expect(rendered).toContain("State: closed/stale");
+		expect(rendered).toContain("Saved session: yes");
+		expect(rendered).toContain("Result: Finished reviewing the docs.");
+		expect(rendered).toContain("Timeline:");
+		expect(rendered).toContain("assistant: Finished reviewing the docs.");
+	});
+
+	it("does not expose resume, fork, or archive keyboard controls", () => {
+		const resume = vi.fn();
+		const fork = vi.fn();
+		const archive = vi.fn();
+		const tree = component({ resume, fork, archive } as Partial<ThreadManager>, [closedThread()]);
+
+		tree.handleInput("\x15");
+		tree.handleInput("\x06");
+		tree.handleInput("\x01");
+
+		expect(resume).not.toHaveBeenCalled();
+		expect(fork).not.toHaveBeenCalled();
+		expect(archive).not.toHaveBeenCalled();
+	});
+
+	it("navigates between visible parent and child threads with arrow keys", () => {
+		const parent = thread();
+		const child = thread({
+			id: asThreadId("thread_111111111111"),
+			name: "beta",
+			taskName: "beta",
+			path: asThreadPath("/root/alpha/beta"),
+			parentPath: asThreadPath("/root/alpha"),
+		});
+		const tree = component({}, [parent, child]);
+
+		expect(tree.render(180).join("\n")).toContain("Selected: alpha  /root/alpha");
+		tree.handleInput("\x1b[C");
+		expect(tree.render(180).join("\n")).toContain("Selected: beta  /root/alpha/beta");
+		tree.handleInput("\x1b[D");
+		expect(tree.render(180).join("\n")).toContain("Selected: alpha  /root/alpha");
 	});
 });

@@ -23,6 +23,7 @@ export type ThreadSession =
 export type ThreadExit =
 	| { readonly kind: "exited"; readonly code: number | null; readonly signal: string | null }
 	| { readonly kind: "stopped"; readonly code: number | null; readonly signal: string | null }
+	| { readonly kind: "stale"; readonly message: string }
 	| { readonly kind: "failed"; readonly message: string };
 
 export type ThreadEvent =
@@ -31,6 +32,26 @@ export type ThreadEvent =
 			readonly at: string;
 			readonly type: "thread_started";
 			readonly pid: number;
+	  }
+	| {
+			readonly seq: number;
+			readonly at: string;
+			readonly type: "thread_resumed";
+			readonly pid: number;
+	  }
+	| {
+			readonly seq: number;
+			readonly at: string;
+			readonly type: "thread_forked";
+			readonly pid: number;
+			readonly sourceSessionFile: string;
+			readonly sourceEntryId: string | null;
+	  }
+	| {
+			readonly seq: number;
+			readonly at: string;
+			readonly type: "thread_archived";
+			readonly archived: boolean;
 	  }
 	| { readonly seq: number; readonly at: string; readonly type: "thread_stopping" }
 	| { readonly seq: number; readonly at: string; readonly type: "turn_started" }
@@ -84,6 +105,7 @@ export type LiveThreadSnapshot = {
 	readonly parentPath: ThreadPath;
 	readonly parentThreadId: ThreadId | null;
 	readonly depth: number;
+	readonly archived: boolean;
 	readonly cwd: string;
 	readonly args: readonly string[];
 	readonly createdAt: string;
@@ -106,6 +128,7 @@ export type ClosedThreadSnapshot = {
 	readonly parentPath: ThreadPath;
 	readonly parentThreadId: ThreadId | null;
 	readonly depth: number;
+	readonly archived: boolean;
 	readonly cwd: string;
 	readonly args: readonly string[];
 	readonly createdAt: string;
@@ -121,7 +144,7 @@ export type ThreadSnapshot = LiveThreadSnapshot | ClosedThreadSnapshot;
 
 export type ThreadRuntimeStatus = "live" | "closed";
 
-export type ThreadRuntimePhase = ThreadPhase | "failed";
+export type ThreadRuntimePhase = ThreadPhase | "failed" | "stale";
 
 export type ThreadDetail = "summary" | "tail" | "full";
 
@@ -148,6 +171,9 @@ export type ThreadRuntimeSnapshot = {
 	readonly parentPath: ThreadPath;
 	readonly parentThreadId: ThreadId | null;
 	readonly depth: number;
+	readonly archived: boolean;
+	readonly resumable: boolean;
+	readonly stale: boolean;
 	readonly cwd: string;
 	readonly args: readonly string[];
 	readonly createdAt: string;
@@ -220,7 +246,13 @@ export function isThreadRunning(thread: ThreadSnapshot): boolean {
 }
 
 export function nextSuggestedThreadActions(thread: ThreadSnapshot): readonly string[] {
-	if (thread.state === "closed") return ["list"];
+	if (thread.archived)
+		return thread.state === "closed" ? ["unarchive", "list"] : ["unarchive", "poll"];
+	if (thread.state === "closed") {
+		return thread.session.kind === "known"
+			? ["resume", "fork", "archive", "list"]
+			: ["archive", "list"];
+	}
 	if (thread.phase === "idle") return ["send prompt", "poll", "stop"];
 	if (thread.phase === "stopping") return ["poll", "wait"];
 	return ["wait", "poll", "send follow_up", "stop"];
@@ -250,6 +282,9 @@ export function toThreadRuntimeSnapshot(
 		parentPath: thread.parentPath,
 		parentThreadId: thread.parentThreadId,
 		depth: thread.depth,
+		archived: thread.archived === true,
+		resumable: thread.state === "closed" && thread.session.kind === "known",
+		stale: thread.state === "closed" && thread.exit.kind === "stale",
 		cwd: thread.cwd,
 		args: [...thread.args],
 		createdAt: thread.createdAt,
@@ -291,7 +326,8 @@ export function toThreadRuntimeSnapshot(
 
 	return {
 		...common,
-		phase: isThreadExitFailed(thread.exit) ? "failed" : "idle",
+		phase:
+			thread.exit.kind === "stale" ? "stale" : isThreadExitFailed(thread.exit) ? "failed" : "idle",
 		exit: thread.exit,
 	};
 }

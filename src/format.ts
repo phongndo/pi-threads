@@ -12,6 +12,9 @@ import {
 	type ThreadSnapshot,
 } from "./domain.ts";
 import type {
+	ArchiveOutcome,
+	ForkOutcome,
+	ResumeOutcome,
 	SendOutcome,
 	StartOutcome,
 	StopOutcome,
@@ -33,12 +36,44 @@ export function formatStart(outcome: StartOutcome): string {
 	return lines.join("\n");
 }
 
+export function formatResume(outcome: ResumeOutcome): string {
+	const title = formatThreadTitle(outcome.thread);
+	return [
+		`${outcome.alreadyLive ? "Thread already live" : "Resumed Pi thread"} "${title}".`,
+		`Path: ${outcome.thread.path}`,
+		`ID: ${outcome.thread.id}`,
+		`Status: ${formatStatus(outcome.thread)}`,
+		formatNextLine(outcome.thread),
+	].join("\n");
+}
+
+export function formatFork(outcome: ForkOutcome): string {
+	return [
+		`Forked Pi thread "${formatThreadTitle(outcome.thread)}".`,
+		`Path: ${outcome.thread.path}`,
+		`ID: ${outcome.thread.id}`,
+		`Source session: ${outcome.sourceSessionFile}`,
+		`Source entry: ${outcome.sourceEntryId ?? "leaf/root"}`,
+		`Status: ${formatStatus(outcome.thread)}`,
+		formatNextLine(outcome.thread),
+	].join("\n");
+}
+
+export function formatArchive(outcome: ArchiveOutcome): string {
+	return [
+		`${outcome.archived ? "Archived" : "Unarchived"} "${formatThreadTitle(outcome.thread)}".`,
+		`Path: ${outcome.thread.path}`,
+		`Status: ${formatStatus(outcome.thread)}`,
+		formatNextLine(outcome.thread),
+	].join("\n");
+}
+
 export function formatList(threads: readonly ThreadSnapshot[]): string {
 	if (threads.length === 0) return "No Pi threads are managed by this parent session.";
 	return threads
 		.map(
 			(thread) =>
-				`${formatThreadTitle(thread)} ${thread.path} - ${formatStatus(thread)} [id: ${thread.id}]`,
+				`${formatThreadTitle(thread)} ${thread.path} - ${formatStatus(thread)}${thread.archived ? " archived" : ""} [id: ${thread.id}]`,
 		)
 		.join("\n");
 }
@@ -172,6 +207,7 @@ export function nextThreadActions(thread: ThreadSnapshot): readonly string[] {
 
 function formatStatus(thread: ThreadSnapshot): string {
 	if (thread.state === "closed") {
+		if (thread.exit.kind === "stale") return "closed/stale";
 		if (isThreadExitFailed(thread.exit)) return "closed/failed";
 		return `closed/${thread.exit.kind}`;
 	}
@@ -184,6 +220,12 @@ export function formatThreadEvent(event: ThreadEvent): string {
 	switch (event.type) {
 		case "thread_started":
 			return `${prefix} thread started pid=${event.pid}`;
+		case "thread_resumed":
+			return `${prefix} thread resumed pid=${event.pid}`;
+		case "thread_forked":
+			return `${prefix} thread forked pid=${event.pid} source=${event.sourceSessionFile}${event.sourceEntryId === null ? "" : ` entry=${event.sourceEntryId}`}`;
+		case "thread_archived":
+			return `${prefix} thread ${event.archived ? "archived" : "unarchived"}`;
 		case "thread_stopping":
 			return `${prefix} thread stopping`;
 		case "turn_started":
@@ -209,6 +251,8 @@ function formatExit(exit: ThreadExit): string {
 	switch (exit.kind) {
 		case "failed":
 			return `failed (${exit.message})`;
+		case "stale":
+			return `stale (${exit.message})`;
 		case "exited":
 		case "stopped": {
 			const details = [
@@ -223,7 +267,6 @@ function formatExit(exit: ThreadExit): string {
 }
 
 function formatNextLine(thread: ThreadSnapshot): string {
-	if (thread.state === "closed") return "Next: review output or list threads";
 	return `Next: ${formatActionList(nextThreadActions(thread))}`;
 }
 
@@ -303,9 +346,11 @@ export function formatThreadStateBadge(
 export function formatThreadSummary(thread: ThreadSnapshot, maxLen?: number): string {
 	const statePart =
 		thread.state === "closed"
-			? isThreadExitFailed(thread.exit)
-				? "closed/failed"
-				: `closed/${thread.exit.kind}`
+			? thread.exit.kind === "stale"
+				? "closed/stale"
+				: isThreadExitFailed(thread.exit)
+					? "closed/failed"
+					: `closed/${thread.exit.kind}`
 			: `live/${thread.phase}`;
 	const pidPart = thread.state === "live" ? ` pid=${thread.pid}` : "";
 

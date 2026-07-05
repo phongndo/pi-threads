@@ -3,9 +3,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { PassThrough } from "node:stream";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { asThreadId, asThreadPath } from "../src/domain.ts";
+import { asThreadId, asThreadPath, type ThreadSnapshot } from "../src/domain.ts";
 
 const { spawnMock } = vi.hoisted(() => ({
 	spawnMock: vi.fn(),
@@ -16,7 +16,8 @@ vi.mock("node:child_process", async () => {
 	return { ...actual, spawn: spawnMock };
 });
 
-const { ThreadManager, shouldApproveChildCwd } = await import("../src/thread-manager.ts");
+const { PI_THREAD_REGISTRY_ENTRY_TYPE, ThreadManager, shouldApproveChildCwd } =
+	await import("../src/thread-manager.ts");
 
 class FakeChildProcess extends EventEmitter {
 	readonly pid = 12_345;
@@ -96,6 +97,27 @@ function mockResponsiveChild(sessionId: string): FakeChildProcess {
 		if (request["type"] === "prompt") respond(child, request);
 	});
 	return child;
+}
+
+function registryEntry(snapshot: ThreadSnapshot, scope?: { readonly sessionId: string }): unknown {
+	return {
+		type: "custom",
+		customType: PI_THREAD_REGISTRY_ENTRY_TYPE,
+		data: {
+			version: 1,
+			kind: "thread_snapshot",
+			snapshot,
+			...(scope === undefined ? {} : { scope }),
+		},
+	};
+}
+
+function writeSessionHeader(file: string, id = "session-test", cwd = process.cwd()): void {
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.writeFileSync(
+		file,
+		`${JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-01-01T00:00:00.000Z", cwd })}\n`,
+	);
 }
 
 describe("ThreadManager session metadata", () => {
@@ -271,6 +293,626 @@ describe("ThreadManager session metadata", () => {
 			name: "Quick child",
 			pendingMessageCount: 0,
 		});
+	});
+
+	it("persists managed thread snapshots and hydrates live snapshots as stale", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+		const snapshots: ThreadSnapshot[] = [];
+		manager.setPersistence({ appendSnapshot: (snapshot) => snapshots.push(snapshot) });
+		mockResponsiveChild("session-alpha");
+
+		const outcome = await manager.start(
+			{ action: "start", prompt: "work", taskName: "alpha" },
+			context(),
+		);
+		const latest = snapshots.at(-1);
+		if (latest === undefined) throw new Error("expected a persisted snapshot");
+
+		const restoredManager = new ThreadManager(managerEnvironment());
+		restoredManager.hydrateFromSession({
+			sessionManager: { getBranch: () => [registryEntry(latest)] },
+		} as unknown as ExtensionContext);
+
+		const restored = restoredManager.list({ action: "list", visibility: "all" })[0];
+		expect(restored).toEqual(
+			expect.objectContaining({
+				state: "closed",
+				id: outcome.thread.id,
+				path: "/root/alpha",
+				exit: expect.objectContaining({ kind: "stale" }),
+			}),
+		);
+	});
+
+	it("persists live result and poll refresh updates to the registry", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+		const snapshots: ThreadSnapshot[] = [];
+		manager.setPersistence({ appendSnapshot: (snapshot) => snapshots.push(snapshot) });
+		const child = mockResponsiveChild("session-alpha");
+
+		await manager.start({ action: "start", prompt: "work", taskName: "alpha" }, context());
+		snapshots.length = 0;
+
+		emitRpcEvent(child, {
+			type: "message_end",
+			message: { role: "assistant", content: [{ type: "text", text: "Done" }] },
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		const resultSnapshot = snapshots.at(-1);
+		if (resultSnapshot === undefined) throw new Error("expected a live result snapshot");
+		expect(resultSnapshot).toEqual(
+			expect.objectContaining({ state: "live", lastAssistantText: "Done" }),
+		);
+		expect(resultSnapshot.recentEvents).toContainEqual(
+			expect.objectContaining({ type: "assistant_message", text: "Done" }),
+		);
+
+		emitRpcEvent(child, { type: "agent_start" });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		snapshots.length = 0;
+
+		await manager.poll("alpha");
+
+		const refreshSnapshot = snapshots.at(-1);
+		if (refreshSnapshot === undefined) throw new Error("expected a poll refresh snapshot");
+		expect(refreshSnapshot).toEqual(expect.objectContaining({ state: "live", phase: "idle" }));
+		expect(refreshSnapshot.recentEvents.map((event) => event.type)).toContain("turn_completed");
+	});
+
+	it("keeps background persistence bound to the thread owner's session after switches", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-owner-session-"));
+		try {
+			const rootSessionFile = path.join(root, "root.jsonl");
+			const manager = new ThreadManager(managerEnvironment());
+			const writes: Array<{
+				readonly path: string;
+				readonly scope: unknown;
+				readonly target: unknown;
+			}> = [];
+			manager.setPersistence({
+				appendSnapshot: (snapshot, scope, target) => {
+					writes.push({ path: snapshot.path, scope, target });
+				},
+			});
+			manager.hydrateFromSession({
+				sessionManager: {
+					getBranch: () => [],
+					getSessionId: () => "session-root",
+					getSessionFile: () => rootSessionFile,
+					getSessionDir: () => root,
+				},
+			} as unknown as ExtensionContext);
+
+			mockResponsiveChild("session-alpha");
+			const alpha = await manager.start(
+				{ action: "start", prompt: "alpha", taskName: "alpha" },
+				context(),
+			);
+			const betaChild = mockResponsiveChild("session-beta");
+			await manager.start({ action: "start", prompt: "beta", taskName: "beta" }, context());
+			writes.length = 0;
+
+			manager.hydrateFromSession({
+				sessionManager: {
+					getBranch: () => [],
+					getSessionId: () => "session-alpha",
+					getSessionFile: () => "/tmp/session-alpha.jsonl",
+					getSessionDir: () => root,
+				},
+			} as unknown as ExtensionContext);
+			manager.rebindScope({
+				currentPath: alpha.thread.path,
+				depth: alpha.thread.depth,
+				selfThreadId: alpha.thread.id,
+			});
+
+			emitRpcEvent(betaChild, { type: "agent_start" });
+			await new Promise<void>((resolve) => setImmediate(resolve));
+
+			expect(writes.at(-1)).toEqual({
+				path: "/root/beta",
+				scope: { sessionId: "session-root" },
+				target: expect.objectContaining({
+					sessionId: "session-root",
+					sessionFile: rootSessionFile,
+					isCurrentSession: false,
+				}),
+			});
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not re-create already hydrated stale snapshots", () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(new Date("2026-01-01T00:00:01.000Z"));
+			const liveSnapshot: ThreadSnapshot = {
+				state: "live",
+				id: asThreadId("thread_abcdef012345"),
+				name: "alpha",
+				taskName: "alpha",
+				path: asThreadPath("/root/alpha"),
+				parentPath: asThreadPath("/root"),
+				parentThreadId: null,
+				depth: 1,
+				archived: false,
+				cwd: process.cwd(),
+				args: [],
+				createdAt: "2026-01-01T00:00:00.000Z",
+				lastEventAt: "2026-01-01T00:00:00.000Z",
+				pid: 12_345,
+				phase: "idle",
+				session: { kind: "unknown" },
+				lastAssistantText: null,
+				lastPartialText: null,
+				recentEvents: [
+					{
+						seq: 0,
+						at: "2026-01-01T00:00:00.000Z",
+						type: "thread_started",
+						pid: 12_345,
+					},
+				],
+				stderrTail: "",
+			};
+			const sessionManager = { getBranch: () => [registryEntry(liveSnapshot)] };
+			const manager = new ThreadManager(managerEnvironment());
+
+			manager.hydrateFromSession({ sessionManager } as unknown as ExtensionContext);
+			const first = manager.list({ action: "list", visibility: "all" })[0];
+			expect(first).toBeDefined();
+			if (first === undefined) return;
+			expect(first).toEqual(
+				expect.objectContaining({
+					state: "closed",
+					lastEventAt: liveSnapshot.lastEventAt,
+					exit: expect.objectContaining({ kind: "stale" }),
+				}),
+			);
+			expect(first.recentEvents.at(-1)).toEqual(
+				expect.objectContaining({
+					seq: 1,
+					at: liveSnapshot.lastEventAt,
+					type: "thread_closed",
+					exit: expect.objectContaining({ kind: "stale" }),
+				}),
+			);
+
+			const onChange = vi.fn();
+			manager.onChange(onChange);
+			vi.setSystemTime(new Date("2026-01-01T00:00:02.000Z"));
+
+			manager.hydrateFromSession({ sessionManager } as unknown as ExtensionContext);
+
+			expect(manager.list({ action: "list", visibility: "all" })[0]).toEqual(first);
+			expect(onChange).not.toHaveBeenCalled();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not hydrate registry snapshots copied from fork source sessions", () => {
+		const snapshot: ThreadSnapshot = {
+			state: "closed",
+			id: asThreadId("thread_012345abcdef"),
+			name: "alpha",
+			taskName: "alpha",
+			path: asThreadPath("/root/alpha"),
+			parentPath: asThreadPath("/root"),
+			parentThreadId: null,
+			depth: 1,
+			archived: false,
+			cwd: process.cwd(),
+			args: [],
+			createdAt: "2026-01-01T00:00:00.000Z",
+			lastEventAt: "2026-01-01T00:00:00.000Z",
+			exit: { kind: "exited", code: 0, signal: null },
+			session: { kind: "unknown" },
+			lastAssistantText: null,
+			recentEvents: [],
+			stderrTail: "",
+		};
+		const manager = new ThreadManager(managerEnvironment());
+
+		manager.hydrateFromSession({
+			sessionManager: {
+				getBranch: () => [registryEntry(snapshot, { sessionId: "session-source" })],
+				getHeader: () => ({ type: "session", parentSession: "/tmp/source.jsonl" }),
+				getSessionId: () => "session-fork",
+			},
+		} as unknown as ExtensionContext);
+
+		expect(manager.list({ action: "list", visibility: "all" })).toEqual([]);
+	});
+
+	it("ignores legacy root registries copied into forked sessions", () => {
+		const snapshot: ThreadSnapshot = {
+			state: "closed",
+			id: asThreadId("thread_012345abcdef"),
+			name: "alpha",
+			taskName: "alpha",
+			path: asThreadPath("/root/alpha"),
+			parentPath: asThreadPath("/root"),
+			parentThreadId: null,
+			depth: 1,
+			archived: false,
+			cwd: process.cwd(),
+			args: [],
+			createdAt: "2026-01-01T00:00:00.000Z",
+			lastEventAt: "2026-01-01T00:00:00.000Z",
+			exit: { kind: "exited", code: 0, signal: null },
+			session: { kind: "unknown" },
+			lastAssistantText: null,
+			recentEvents: [],
+			stderrTail: "",
+		};
+		const manager = new ThreadManager(managerEnvironment());
+
+		manager.hydrateFromSession({
+			sessionManager: {
+				getBranch: () => [registryEntry(snapshot)],
+				getHeader: () => ({ type: "session", parentSession: "/tmp/source.jsonl" }),
+				getSessionId: () => "session-fork",
+			},
+		} as unknown as ExtensionContext);
+
+		expect(manager.list({ action: "list", visibility: "all" })).toEqual([]);
+	});
+
+	it("pre-creates child Pi sessions with native parentSession metadata", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-parent-session-"));
+		try {
+			const parentSessionFile = path.join(root, "parent.jsonl");
+			const sessionDir = path.join(root, "sessions");
+			writeSessionHeader(parentSessionFile, "session-parent", root);
+			const child = new FakeChildProcess();
+			let childSessionFile: string | undefined;
+			spawnMock.mockReturnValueOnce(child);
+			attachRpc(child, (request) => {
+				if (request["type"] === "get_state") {
+					const args = spawnMock.mock.calls[0]?.[1] as readonly string[];
+					childSessionFile = args[args.indexOf("--session") + 1];
+					respond(child, request, {
+						sessionFile: childSessionFile,
+						sessionId: "session-child",
+						pendingMessageCount: 0,
+						isStreaming: false,
+					});
+					return;
+				}
+				if (request["type"] === "prompt") respond(child, request);
+			});
+
+			await new ThreadManager(managerEnvironment()).start(
+				{ action: "start", prompt: "work", taskName: "child" },
+				{
+					...context({ cwd: root }),
+					sessionManager: {
+						getBranch: () => [],
+						getSessionFile: () => parentSessionFile,
+						getSessionDir: () => sessionDir,
+					},
+				} as unknown as ExtensionContext,
+			);
+
+			expect(childSessionFile).toBeDefined();
+			const header = JSON.parse(fs.readFileSync(childSessionFile!, "utf8").split("\n")[0]!);
+			expect(header).toEqual(
+				expect.objectContaining({
+					type: "session",
+					cwd: root,
+					parentSession: parentSessionFile,
+				}),
+			);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("materializes an unflushed current Pi session before forking it", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-current-fork-"));
+		try {
+			const sessionDir = path.join(root, "sessions");
+			const sessionManager = SessionManager.create(root, sessionDir);
+			const sourceSessionFile = sessionManager.getSessionFile();
+			if (sourceSessionFile === undefined) throw new Error("expected a planned session file");
+			sessionManager.appendMessage({
+				role: "user",
+				content: "fork this first turn",
+				timestamp: Date.now(),
+			});
+			expect(fs.existsSync(sourceSessionFile)).toBe(false);
+
+			const child = new FakeChildProcess();
+			let childSessionFile: string | undefined;
+			spawnMock.mockReturnValueOnce(child);
+			attachRpc(child, (request) => {
+				if (request["type"] === "get_state") {
+					const args = spawnMock.mock.calls[0]?.[1] as readonly string[];
+					childSessionFile = args[args.indexOf("--session") + 1];
+					respond(child, request, {
+						sessionFile: childSessionFile,
+						sessionId: "session-fork",
+						pendingMessageCount: 0,
+						isStreaming: false,
+					});
+				}
+			});
+
+			const outcome = await new ThreadManager(managerEnvironment()).fork(
+				{ action: "fork", taskName: "first_turn" },
+				{
+					...context({ cwd: root }),
+					sessionManager,
+				} as unknown as ExtensionContext,
+			);
+
+			expect(outcome.sourceSessionFile).toBe(sourceSessionFile);
+			expect(fs.existsSync(sourceSessionFile)).toBe(true);
+			expect(childSessionFile).toBeDefined();
+			expect(fs.existsSync(childSessionFile!)).toBe(true);
+			const assistantMessage = {
+				role: "assistant",
+				content: [],
+				api: "test",
+				provider: "test",
+				model: "test",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: Date.now(),
+			} as Parameters<typeof sessionManager.appendMessage>[0];
+			expect(() => sessionManager.appendMessage(assistantMessage)).not.toThrow();
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("validates fork inputs before materializing fork session files", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-invalid-fork-"));
+		try {
+			const sessionDir = path.join(root, "sessions");
+			const sessionManager = SessionManager.create(root, sessionDir);
+			const sourceSessionFile = sessionManager.getSessionFile();
+			if (sourceSessionFile === undefined) throw new Error("expected a planned session file");
+			sessionManager.appendMessage({
+				role: "user",
+				content: "fork source",
+				timestamp: Date.now(),
+			});
+
+			const existing: ThreadSnapshot = {
+				state: "closed",
+				id: asThreadId("thread_012345abcdef"),
+				name: "dupe",
+				taskName: "dupe",
+				path: asThreadPath("/root/dupe"),
+				parentPath: asThreadPath("/root"),
+				parentThreadId: null,
+				depth: 1,
+				archived: false,
+				cwd: root,
+				args: [],
+				createdAt: "2026-01-01T00:00:00.000Z",
+				lastEventAt: "2026-01-01T00:00:00.000Z",
+				exit: { kind: "stale", message: "restored" },
+				session: { kind: "unknown" },
+				lastAssistantText: null,
+				recentEvents: [],
+				stderrTail: "",
+			};
+			const manager = new ThreadManager(managerEnvironment());
+			manager.hydrateFromSession({
+				sessionManager: { getBranch: () => [registryEntry(existing)] },
+			} as unknown as ExtensionContext);
+			const forkContext = {
+				...context({ cwd: root }),
+				sessionManager,
+			} as unknown as ExtensionContext;
+
+			await expect(manager.fork({ action: "fork", taskName: "dupe" }, forkContext)).rejects.toThrow(
+				/Thread path already exists/u,
+			);
+			await expect(
+				manager.fork(
+					{ action: "fork", taskName: "fresh", args: ["--session", "/tmp/nope.jsonl"] },
+					forkContext,
+				),
+			).rejects.toThrow(/Unsupported child Pi arg/u);
+
+			expect(spawnMock).not.toHaveBeenCalled();
+			expect(fs.existsSync(sourceSessionFile)).toBe(false);
+			expect(fs.readdirSync(sessionDir)).toEqual([]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("resumes saved sessions without sending an implicit prompt", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-resume-"));
+		try {
+			const sessionFile = path.join(root, "child.jsonl");
+			writeSessionHeader(sessionFile, "session-child", root);
+			const snapshot: ThreadSnapshot = {
+				state: "closed",
+				id: asThreadId("thread_012345abcdef"),
+				name: "alpha",
+				taskName: "alpha",
+				path: asThreadPath("/root/alpha"),
+				parentPath: asThreadPath("/root"),
+				parentThreadId: null,
+				depth: 1,
+				archived: false,
+				cwd: root,
+				args: [],
+				createdAt: "2026-01-01T00:00:00.000Z",
+				lastEventAt: "2026-01-01T00:00:00.000Z",
+				exit: { kind: "stale", message: "restored" },
+				session: {
+					kind: "known",
+					file: sessionFile,
+					id: "session-child",
+					name: null,
+					pendingMessageCount: null,
+				},
+				lastAssistantText: null,
+				recentEvents: [],
+				stderrTail: "",
+			};
+			const manager = new ThreadManager(managerEnvironment());
+			manager.hydrateFromSession({
+				sessionManager: { getBranch: () => [registryEntry(snapshot)] },
+			} as unknown as ExtensionContext);
+
+			const child = new FakeChildProcess();
+			const requests: string[] = [];
+			spawnMock.mockReturnValueOnce(child);
+			attachRpc(child, (request) => {
+				requests.push(String(request["type"]));
+				if (request["type"] === "get_state") {
+					respond(child, request, {
+						sessionFile,
+						sessionId: "session-child",
+						pendingMessageCount: 0,
+						isStreaming: false,
+					});
+				}
+			});
+
+			const outcome = await manager.resume(
+				{ action: "resume", id: "/root/alpha" },
+				context({ cwd: root }),
+			);
+
+			const args = spawnMock.mock.calls[0]?.[1] as readonly string[];
+			expect(args.slice(args.indexOf("--session"), args.indexOf("--session") + 2)).toEqual([
+				"--session",
+				sessionFile,
+			]);
+			expect(requests).toEqual(["get_state"]);
+			expect(outcome.alreadyLive).toBe(false);
+			expect(outcome.thread.state).toBe("live");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("unarchives resumed sessions so live work remains visible", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-resume-archive-"));
+		try {
+			const sessionFile = path.join(root, "child.jsonl");
+			writeSessionHeader(sessionFile, "session-child", root);
+			const snapshot: ThreadSnapshot = {
+				state: "closed",
+				id: asThreadId("thread_012345abcdef"),
+				name: "alpha",
+				taskName: "alpha",
+				path: asThreadPath("/root/alpha"),
+				parentPath: asThreadPath("/root"),
+				parentThreadId: null,
+				depth: 1,
+				archived: true,
+				cwd: root,
+				args: [],
+				createdAt: "2026-01-01T00:00:00.000Z",
+				lastEventAt: "2026-01-01T00:00:00.000Z",
+				exit: { kind: "stale", message: "restored" },
+				session: {
+					kind: "known",
+					file: sessionFile,
+					id: "session-child",
+					name: null,
+					pendingMessageCount: null,
+				},
+				lastAssistantText: null,
+				recentEvents: [],
+				stderrTail: "",
+			};
+			const manager = new ThreadManager(managerEnvironment());
+			manager.hydrateFromSession({
+				sessionManager: { getBranch: () => [registryEntry(snapshot)] },
+			} as unknown as ExtensionContext);
+			expect(manager.list({ action: "list" })).toEqual([]);
+
+			const child = new FakeChildProcess();
+			spawnMock.mockReturnValueOnce(child);
+			attachRpc(child, (request) => {
+				if (request["type"] === "get_state") {
+					respond(child, request, {
+						sessionFile,
+						sessionId: "session-child",
+						pendingMessageCount: 0,
+						isStreaming: false,
+					});
+				}
+			});
+
+			const outcome = await manager.resume(
+				{ action: "resume", id: "/root/alpha" },
+				context({ cwd: root }),
+			);
+
+			expect(outcome.thread.archived).toBe(false);
+			expect(manager.list({ action: "list" })).toHaveLength(1);
+			expect(manager.list({ action: "list", visibility: "archived" })).toEqual([]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("archives completed threads as visibility state without deleting session files", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-archive-"));
+		try {
+			const sessionFile = path.join(root, "child.jsonl");
+			writeSessionHeader(sessionFile, "session-child", root);
+			const snapshot: ThreadSnapshot = {
+				state: "closed",
+				id: asThreadId("thread_012345abcdef"),
+				name: "alpha",
+				taskName: "alpha",
+				path: asThreadPath("/root/alpha"),
+				parentPath: asThreadPath("/root"),
+				parentThreadId: null,
+				depth: 1,
+				archived: false,
+				cwd: root,
+				args: [],
+				createdAt: "2026-01-01T00:00:00.000Z",
+				lastEventAt: "2026-01-01T00:00:00.000Z",
+				exit: { kind: "exited", code: 0, signal: null },
+				session: {
+					kind: "known",
+					file: sessionFile,
+					id: "session-child",
+					name: null,
+					pendingMessageCount: null,
+				},
+				lastAssistantText: null,
+				recentEvents: [],
+				stderrTail: "",
+			};
+			const manager = new ThreadManager(managerEnvironment());
+			manager.hydrateFromSession({
+				sessionManager: { getBranch: () => [registryEntry(snapshot)] },
+			} as unknown as ExtensionContext);
+
+			const outcome = manager.archive({ action: "archive", id: "/root/alpha" });
+
+			expect(outcome.archived).toBe(true);
+			expect(manager.list({ action: "list" })).toEqual([]);
+			expect(manager.list({ action: "list", visibility: "archived" })).toHaveLength(1);
+			expect(fs.existsSync(sessionFile)).toBe(true);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("uses the rebound thread scope when starting nested work after a session switch", async () => {
@@ -539,6 +1181,67 @@ describe("ThreadManager session metadata", () => {
 		await manager.poll("/root/alpha");
 
 		expect(onChange).toHaveBeenCalledTimes(1);
+	});
+
+	it("throttles change notifications for streaming assistant updates", async () => {
+		const child = new FakeChildProcess();
+		spawnMock.mockReturnValue(child);
+		attachRpc(child, (request) => {
+			if (request["type"] === "get_state") {
+				respond(child, request, {
+					sessionFile: "/tmp/stream.jsonl",
+					sessionId: "session-stream",
+					pendingMessageCount: 0,
+					isStreaming: false,
+				});
+				return;
+			}
+
+			if (request["type"] === "prompt") respond(child, request);
+		});
+
+		const manager = new ThreadManager(managerEnvironment());
+		await manager.start({ action: "start", prompt: "stream", taskName: "stream" }, context());
+
+		const onChange = vi.fn();
+		manager.onChange(onChange);
+		vi.useFakeTimers();
+		try {
+			emitRpcEvent(child, {
+				type: "message_update",
+				message: { role: "assistant", content: [{ type: "text", text: "hel" }] },
+			});
+			emitRpcEvent(child, {
+				type: "message_update",
+				message: { role: "assistant", content: [{ type: "text", text: "hello" }] },
+			});
+
+			expect(onChange).not.toHaveBeenCalled();
+
+			await vi.advanceTimersByTimeAsync(249);
+			expect(onChange).not.toHaveBeenCalled();
+
+			await vi.advanceTimersByTimeAsync(1);
+			expect(onChange).toHaveBeenCalledTimes(1);
+			expect(onChange.mock.calls[0]?.[0][0]).toMatchObject({
+				state: "live",
+				lastPartialText: "hello",
+			});
+
+			emitRpcEvent(child, {
+				type: "message_update",
+				message: { role: "assistant", content: [{ type: "text", text: "hello!" }] },
+			});
+			await vi.advanceTimersByTimeAsync(250);
+
+			expect(onChange).toHaveBeenCalledTimes(2);
+			expect(onChange.mock.calls[1]?.[0][0]).toMatchObject({
+				state: "live",
+				lastPartialText: "hello!",
+			});
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("forces no-approve for a child cwd outside the trusted parent cwd", async () => {

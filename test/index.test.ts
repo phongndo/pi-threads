@@ -1,3 +1,6 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -12,7 +15,6 @@ import {
 	toThreadRuntimeSnapshot,
 	type ThreadSnapshot,
 } from "../src/domain.ts";
-import { PI_THREAD_ENTRY_MESSAGE_TYPE } from "../src/threads-command.ts";
 import extension from "../src/index.ts";
 import { PiThreadParamsSchema } from "../src/schema.ts";
 import {
@@ -21,7 +23,7 @@ import {
 	shouldShutdownThreadsOnSessionShutdown,
 	syncThreadManagerScope,
 } from "../src/index.ts";
-import type { ThreadManager } from "../src/thread-manager.ts";
+import { PI_THREAD_REGISTRY_ENTRY_TYPE, type ThreadManager } from "../src/thread-manager.ts";
 
 const theme = {
 	fg: (_color: string, text: string) => text,
@@ -95,6 +97,14 @@ function managerWithThread(thread: ThreadSnapshot | null): ThreadManager {
 	} as unknown as ThreadManager;
 }
 
+function writeSessionHeader(file: string, id = "session-root", cwd = process.cwd()): void {
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.writeFileSync(
+		file,
+		`${JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-01-01T00:00:00.000Z", cwd })}\n`,
+	);
+}
+
 type CommandHandler = (args: string, ctx: ExtensionCommandContext) => Promise<void>;
 type RegisteredTool = Parameters<ExtensionAPI["registerTool"]>[0];
 
@@ -133,27 +143,6 @@ function registeredCommandHandlers(): Map<string, CommandHandler> {
 
 	extension(pi);
 	return handlers;
-}
-
-function commandCtx(branch: readonly unknown[] = []): ExtensionCommandContext & {
-	readonly notify: ReturnType<typeof vi.fn>;
-	readonly shutdown: ReturnType<typeof vi.fn>;
-	readonly switchSession: ReturnType<typeof vi.fn>;
-} {
-	const notify = vi.fn();
-	const shutdown = vi.fn();
-	const switchSession = vi.fn();
-	return {
-		notify,
-		shutdown,
-		switchSession,
-		ui: { notify },
-		sessionManager: { getBranch: () => branch, getSessionFile: () => "/tmp/current.jsonl" },
-	} as unknown as ExtensionCommandContext & {
-		readonly notify: ReturnType<typeof vi.fn>;
-		readonly shutdown: ReturnType<typeof vi.fn>;
-		readonly switchSession: ReturnType<typeof vi.fn>;
-	};
 }
 
 describe("thread prompt metadata", () => {
@@ -229,6 +218,25 @@ describe("thread tool structured details", () => {
 				thread: closedThread,
 				snapshot: closedSnapshot,
 			}),
+			resume: async () => ({
+				kind: "resumed" as const,
+				alreadyLive: false,
+				thread: liveThread,
+				snapshot: liveSnapshot,
+			}),
+			fork: async () => ({
+				kind: "forked" as const,
+				sourceSessionFile: "/tmp/current.jsonl",
+				sourceEntryId: null,
+				thread: liveThread,
+				snapshot: liveSnapshot,
+			}),
+			archive: () => ({
+				kind: "archived" as const,
+				archived: true,
+				thread: closedThread,
+				snapshot: closedSnapshot,
+			}),
 		} as unknown as ThreadManager;
 		const restoreManager = useProcessManager(manager);
 
@@ -293,6 +301,27 @@ describe("thread tool structured details", () => {
 				undefined,
 				context,
 			);
+			const resume = await tool.execute(
+				"call-resume",
+				{ action: "resume", id: "alpha" },
+				undefined,
+				undefined,
+				context,
+			);
+			const fork = await tool.execute(
+				"call-fork",
+				{ action: "fork" },
+				undefined,
+				undefined,
+				context,
+			);
+			const archive = await tool.execute(
+				"call-archive",
+				{ action: "archive", id: "alpha" },
+				undefined,
+				undefined,
+				context,
+			);
 
 			expect(start.details).toEqual(
 				expect.objectContaining({
@@ -328,7 +357,7 @@ describe("thread tool structured details", () => {
 					],
 				}),
 			);
-			for (const result of [poll, send, wait, stop]) {
+			for (const result of [poll, send, wait, stop, resume, fork, archive]) {
 				expect(result.details).toEqual(
 					expect.objectContaining({
 						snapshot: expect.objectContaining({
@@ -391,6 +420,78 @@ describe("thread tool structured details", () => {
 	});
 });
 
+describe("thread registry persistence", () => {
+	it("writes non-current snapshots to their owning session file", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-index-registry-"));
+		try {
+			const ownerSessionFile = path.join(root, "owner.jsonl");
+			writeSessionHeader(ownerSessionFile, "session-root", root);
+			let appendSnapshot:
+				| ((
+						snapshot: ThreadSnapshot,
+						scope: { readonly sessionId: string } | null,
+						target: {
+							readonly sessionId: string | null;
+							readonly sessionFile: string | null;
+							readonly sessionDir: string | null;
+							readonly isCurrentSession: boolean;
+						} | null,
+				  ) => void)
+				| undefined;
+			const restoreManager = useProcessManager({
+				setPersistence: (persistence: { readonly appendSnapshot?: typeof appendSnapshot }) => {
+					appendSnapshot = persistence.appendSnapshot;
+				},
+			} as unknown as ThreadManager);
+			const appendEntry = vi.fn();
+			const pi = {
+				appendEntry,
+				registerCommand: () => undefined,
+				registerMessageRenderer: () => undefined,
+				on: () => undefined,
+				registerTool: () => undefined,
+			} as unknown as ExtensionAPI;
+
+			try {
+				extension(pi);
+				if (appendSnapshot === undefined) throw new Error("registry persistence was not set");
+
+				appendSnapshot(
+					threadSnapshot(),
+					{ sessionId: "session-root" },
+					{
+						sessionId: "session-root",
+						sessionFile: ownerSessionFile,
+						sessionDir: root,
+						isCurrentSession: false,
+					},
+				);
+			} finally {
+				restoreManager();
+			}
+
+			expect(appendEntry).not.toHaveBeenCalled();
+			const entries = fs
+				.readFileSync(ownerSessionFile, "utf8")
+				.trimEnd()
+				.split("\n")
+				.map((line) => JSON.parse(line) as Record<string, unknown>);
+			expect(entries.at(-1)).toMatchObject({
+				type: "custom",
+				customType: PI_THREAD_REGISTRY_ENTRY_TYPE,
+				data: {
+					version: 1,
+					kind: "thread_snapshot",
+					scope: { sessionId: "session-root" },
+					snapshot: { id: "thread_012345abcdef", path: "/root/alpha" },
+				},
+			});
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("session shutdown thread lifecycle", () => {
 	it("preserves thread management when switching into a closed managed child session", () => {
 		expect(
@@ -448,25 +549,7 @@ describe("session shutdown thread lifecycle", () => {
 		expect(calls).toEqual([{ action: "stop", id: "/root/alpha", force: false }]);
 	});
 
-	it("preserves live thread management when returning from a thread session", () => {
-		const branch = [
-			{
-				type: "custom_message",
-				customType: PI_THREAD_ENTRY_MESSAGE_TYPE,
-				details: { parentSessionFile: "/tmp/parent.jsonl" },
-			},
-		];
-
-		expect(
-			shouldShutdownThreadsOnSessionShutdown(
-				event({ targetSessionFile: "/tmp/parent.jsonl" }),
-				ctx(branch),
-				managerWithThread(null),
-			),
-		).toBe(false);
-	});
-
-	it("rebinds the process manager to the entered thread scope", () => {
+	it("rebinds the process manager for a managed child session", () => {
 		const manager = {
 			findBySessionFile: () => threadSnapshot(),
 			rebindScope: () => undefined,
@@ -507,76 +590,11 @@ describe("session shutdown thread lifecycle", () => {
 	});
 });
 
-describe("thread exit commands", () => {
-	it("/exit outside a thread requests normal shutdown", async () => {
-		const handlers = registeredCommandHandlers();
-		const exit = handlers.get("exit");
-		if (exit === undefined) throw new Error("/exit command was not registered");
-		const commandContext = commandCtx();
-
-		await exit("", commandContext);
-
-		expect(commandContext.shutdown).toHaveBeenCalledTimes(1);
-		expect(commandContext.switchSession).not.toHaveBeenCalled();
-		expect(commandContext.notify).not.toHaveBeenCalled();
-	});
-
-	it("/exit inside an entered thread switches back to the recorded parent session", async () => {
-		const handlers = registeredCommandHandlers();
-		const exit = handlers.get("exit");
-		if (exit === undefined) throw new Error("/exit command was not registered");
-		const commandContext = commandCtx([
-			{
-				type: "custom_message",
-				customType: PI_THREAD_ENTRY_MESSAGE_TYPE,
-				details: { parentSessionFile: "/tmp/parent.jsonl" },
-			},
-		]);
-
-		await exit("", commandContext);
-
-		expect(commandContext.switchSession).toHaveBeenCalledWith("/tmp/parent.jsonl");
-		expect(commandContext.shutdown).not.toHaveBeenCalled();
-	});
-
-	it("/threads exit warns when no parent session is recorded", async () => {
-		const handlers = registeredCommandHandlers();
-		const threads = handlers.get("threads");
-		if (threads === undefined) throw new Error("/threads command was not registered");
-		const commandContext = commandCtx();
-
-		await threads("exit", commandContext);
-
-		expect(commandContext.notify).toHaveBeenCalledWith(
-			expect.stringContaining("No parent"),
-			"warning",
-		);
-		expect(commandContext.shutdown).not.toHaveBeenCalled();
-		expect(commandContext.switchSession).not.toHaveBeenCalled();
-	});
-
-	it("/threads exit inside an entered thread switches back to the recorded parent session", async () => {
-		const handlers = registeredCommandHandlers();
-		const threads = handlers.get("threads");
-		if (threads === undefined) throw new Error("/threads command was not registered");
-		const commandContext = commandCtx([
-			{
-				type: "custom_message",
-				customType: PI_THREAD_ENTRY_MESSAGE_TYPE,
-				details: { parentSessionFile: "/tmp/parent.jsonl" },
-			},
-		]);
-
-		await threads("exit", commandContext);
-
-		expect(commandContext.switchSession).toHaveBeenCalledWith("/tmp/parent.jsonl");
-		expect(commandContext.shutdown).not.toHaveBeenCalled();
-		expect(commandContext.notify).not.toHaveBeenCalled();
-	});
-
-	it("does not register the deprecated singular /thread command", () => {
+describe("thread commands", () => {
+	it("does not register user-facing thread exit commands", () => {
 		const handlers = registeredCommandHandlers();
 
+		expect(handlers.has("exit")).toBe(false);
 		expect(handlers.has("thread")).toBe(false);
 	});
 });

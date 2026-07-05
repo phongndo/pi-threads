@@ -110,13 +110,13 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
 
 ## 9. Durability and navigation
 
-- [ ] Improve resume semantics so managed thread ids/paths survive parent reloads
+- [x] Improve resume semantics so managed thread ids/paths survive parent reloads
       where possible.
-- [ ] Lean on Pi's native session model instead of inventing a parallel one:
+- [x] Lean on Pi's native session model instead of inventing a parallel one:
       session files, session ids, parent-session headers, tree entries, labels,
       branch summaries, and session names should remain the source of truth where
       possible.
-- [ ] Add first-class `resume` support inside the same `thread` tool.
+- [x] Add first-class `resume` support inside the same `thread` tool.
   - Resume/reconnect a managed child from its saved Pi session file.
   - Allow closed/stopped children to be reopened as managed live threads when
     safe.
@@ -124,7 +124,7 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
     managed child.
   - Do not expose raw `--session` through `start.args`; implement resume as a
     validated thread action.
-- [ ] Add first-class `fork` support inside the same `thread` tool.
+- [x] Add first-class `fork` support inside the same `thread` tool.
   - Fork from a parent session, a child session, or a selected entry id where Pi
     supports it.
   - Prefer Pi's native fork/clone/session APIs over custom transcript copying.
@@ -132,32 +132,22 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
     possible.
   - Do not expose raw `--fork` through `start.args`; implement fork as a
     validated thread action.
-- [ ] Add archive/cleanup behavior for completed or stale threads without
+- [x] Add archive/cleanup behavior for completed or stale threads without
       deleting history by default.
   - Treat archive as a visibility/lifecycle state for managed threads.
   - Keep the underlying Pi session file unless the user explicitly asks for
     deletion.
   - If deletion is added later, prefer Pi's existing session deletion/trash
     behavior when available.
-- [ ] Improve `/threads` browser with:
+- [x] Improve `/threads` browser with:
   - better filters,
   - event timeline,
   - summaries,
   - clearer live/closed/stale states,
   - archived-thread visibility toggles,
-  - resume/fork/archive actions,
+  - clear resumable/forkable/archived state without exposing orchestration
+    controls,
   - easier parent/child navigation.
-
-## 10. User-facing invocation
-
-- [ ] Add a manual shorthand command, e.g.
-      `/thread start Find the auth refresh code`.
-- [ ] Consider optional mention-style invocation, e.g.
-      `@thread Find the auth refresh code`.
-- [ ] Ensure users can directly spawn/manage threads without depending on
-      autonomous model behavior.
-- [ ] Keep manual invocation thin; it should map to the same underlying `thread`
-      primitive.
 
 ## 11. Safety and resource controls
 

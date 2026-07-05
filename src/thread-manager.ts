@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	ROOT_THREAD_PATH,
 	asThreadPath,
@@ -20,16 +20,19 @@ import {
 	type ThreadExit,
 	type ThreadId,
 	type ThreadPath,
+	type ThreadSnapshot,
 	type ThreadRuntimeSnapshot,
 	type ThreadPhase,
 	type ThreadSession,
-	type ThreadSnapshot,
 	toThreadRuntimeSnapshot,
 } from "./domain.ts";
 import { isRecord, numberField, stringField } from "./json.ts";
 import { RpcClient, type RpcClientEvent, type RpcResponse } from "./rpc.ts";
 import type {
 	ListCommand,
+	ArchiveCommand,
+	ForkCommand,
+	ResumeCommand,
 	SendCommand,
 	SendMode,
 	StartCommand,
@@ -50,8 +53,10 @@ const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
 const MAX_WAIT_TIMEOUT_MS = 600_000;
 const WAIT_POLL_INTERVAL_MS = 250;
 const BUSY_SEND_IDLE_SETTLE_REFRESHES = 2;
+const MESSAGE_UPDATE_EMIT_THROTTLE_MS = 250;
 const TASK_NAME_MAX_LENGTH = 64;
 const DISPLAY_NAME_MAX_LENGTH = 80;
+export const PI_THREAD_REGISTRY_ENTRY_TYPE = "pi-threads-registry";
 // Pi resolves CLI resource flags from the process startup cwd, while ctx.cwd can
 // later point at a resumed or switched session in another project.
 const PROCESS_START_CWD = process.cwd();
@@ -64,6 +69,9 @@ type ThreadBase = {
 	readonly parentPath: ThreadPath;
 	readonly parentThreadId: ThreadId | null;
 	readonly depth: number;
+	readonly registrySession: ThreadRegistrySession | null;
+	readonly registryGeneration: number;
+	archived: boolean;
 	readonly cwd: string;
 	readonly args: readonly string[];
 	readonly createdAt: string;
@@ -152,6 +160,28 @@ export type StopOutcome = {
 	readonly snapshot: ThreadRuntimeSnapshot;
 };
 
+export type ResumeOutcome = {
+	readonly kind: "resumed";
+	readonly alreadyLive: boolean;
+	readonly thread: ThreadSnapshot;
+	readonly snapshot: ThreadRuntimeSnapshot;
+};
+
+export type ForkOutcome = {
+	readonly kind: "forked";
+	readonly sourceSessionFile: string;
+	readonly sourceEntryId: string | null;
+	readonly thread: ThreadSnapshot;
+	readonly snapshot: ThreadRuntimeSnapshot;
+};
+
+export type ArchiveOutcome = {
+	readonly kind: "archived";
+	readonly archived: boolean;
+	readonly thread: ThreadSnapshot;
+	readonly snapshot: ThreadRuntimeSnapshot;
+};
+
 export type WaitOutcome = {
 	readonly kind: "waited";
 	readonly timedOut: boolean;
@@ -171,9 +201,85 @@ type WaitOptions = {
 	readonly onProgress?: (progress: WaitProgress) => void;
 };
 
+type ThreadRegistryPersistence = {
+	readonly appendSnapshot?: (
+		snapshot: ThreadSnapshot,
+		scope: ThreadRegistryEntryScope | null,
+		target: ThreadRegistryPersistenceTarget | null,
+	) => void;
+};
+
+type ThreadRegistryEntryScope = {
+	readonly sessionId: string;
+};
+
+type ThreadRegistrySession = {
+	readonly sessionId: string | null;
+	readonly sessionFile: string | null;
+	readonly sessionDir: string | null;
+};
+
+export type ThreadRegistryPersistenceTarget = ThreadRegistrySession & {
+	readonly isCurrentSession: boolean;
+};
+
+type ThreadRegistryRestoreScope = {
+	readonly sessionId: string | null;
+	readonly sessionStartedAt: string | null;
+	readonly currentPath: ThreadPath;
+	readonly isRootSessionFork: boolean;
+	readonly registrySession: ThreadRegistrySession | null;
+	readonly registryGeneration: number;
+};
+
+type LaunchThreadInput = {
+	readonly id: ThreadId;
+	readonly name: string;
+	readonly taskName: string;
+	readonly path: ThreadPath;
+	readonly parentPath: ThreadPath;
+	readonly parentThreadId: ThreadId | null;
+	readonly depth: number;
+	readonly cwd: string;
+	readonly args: readonly string[];
+	readonly createdAt?: string;
+	readonly archived?: boolean;
+	readonly session?: ThreadSession | undefined;
+	readonly sessionFile?: string | undefined;
+	readonly lastAssistantText?: string | null | undefined;
+	readonly recentEvents?: readonly ThreadEvent[] | undefined;
+	readonly stderrTail?: string | undefined;
+	readonly startEvent: "thread_started" | "thread_resumed" | "thread_forked";
+	readonly sourceSessionFile?: string | undefined;
+	readonly sourceEntryId?: string | null;
+	readonly prompt?: string;
+};
+
+type DurableThreadData = {
+	readonly version: 1;
+	readonly kind: "thread_snapshot";
+	readonly snapshot: ThreadSnapshot;
+	readonly entryTimestamp: string | null;
+	readonly scope?: ThreadRegistryEntryScope;
+};
+
+type ForkSource = {
+	readonly sessionFile: string;
+	readonly sessionDir: string | undefined;
+	readonly cwd: string;
+	readonly displayName: string;
+};
+
+type ForkedManagedSession = {
+	readonly cwd: string;
+	readonly session: Extract<ThreadSession, { readonly kind: "known" }>;
+	readonly sourceEntryId: string | null;
+};
+
 export class ThreadManager {
 	readonly #threads = new Map<ThreadId, ManagedThread>();
 	readonly #listeners = new Set<ThreadChangeListener>();
+	#messageUpdateChangeTimer: ReturnType<typeof setTimeout> | null = null;
 	readonly #baseScope: ThreadManagerScope;
 	#depth: number;
 	readonly #maxDepth: number;
@@ -181,6 +287,9 @@ export class ThreadManager {
 	#selfThreadId: ThreadId | null;
 	#currentPath: ThreadPath;
 	readonly #rootSessionId: string;
+	#registrySession: ThreadRegistrySession | null = null;
+	#registryGeneration = 0;
+	#persistence: ThreadRegistryPersistence = {};
 
 	constructor(environment: NodeJS.ProcessEnv = process.env) {
 		const baseDepth = readInteger(environment["PI_THREADS_DEPTH"], 0);
@@ -197,6 +306,44 @@ export class ThreadManager {
 		this.#selfThreadId = baseSelfThreadId;
 		this.#currentPath = baseCurrentPath;
 		this.#rootSessionId = environment["PI_THREADS_ROOT_SESSION_ID"] ?? `root_${process.pid}`;
+	}
+
+	setPersistence(persistence: ThreadRegistryPersistence): void {
+		this.#persistence = persistence;
+	}
+
+	#setRegistrySession(session: ThreadRegistrySession | null): void {
+		if (!threadRegistrySessionsMatch(this.#registrySession, session)) this.#registryGeneration++;
+		this.#registrySession = session;
+	}
+
+	hydrateFromSession(ctx: Pick<ExtensionContext, "sessionManager">): void {
+		this.#setRegistrySession(threadRegistrySessionFromContext(ctx));
+		const restoreScope: ThreadRegistryRestoreScope = {
+			sessionId: this.#registrySession?.sessionId ?? null,
+			sessionStartedAt: safeSessionTimestamp(ctx),
+			currentPath: this.#currentPath,
+			isRootSessionFork: sessionHasParentSession(ctx) && this.#currentPath === ROOT_THREAD_PATH,
+			registrySession: this.#registrySession,
+			registryGeneration: this.#registryGeneration,
+		};
+		const entries = safeSessionBranch(ctx);
+		if (entries.length === 0) return;
+
+		let changed = false;
+		for (const restored of restoreDurableThreads(entries, restoreScope)) {
+			const existing = this.#threads.get(restored.id);
+			if (existing?.state === "live") continue;
+			if (existing !== undefined && threadSnapshotsMatch(existing, restored)) {
+				if (!threadRegistryMetadataMatches(existing, restored))
+					this.#threads.set(restored.id, restored);
+				continue;
+			}
+			this.#threads.set(restored.id, restored);
+			changed = true;
+		}
+
+		if (changed) this.#emitChange();
 	}
 
 	onChange(listener: ThreadChangeListener): () => void {
@@ -238,6 +385,11 @@ export class ThreadManager {
 		const state = command?.state ?? "all";
 		if (state !== "all") threads = threads.filter((thread) => thread.state === state);
 
+		const visibility = command?.visibility ?? "active";
+		if (visibility !== "all") {
+			threads = threads.filter((thread) => thread.archived === (visibility === "archived"));
+		}
+
 		const parent = command && "parent" in command ? command.parent : undefined;
 		if (parent !== undefined) {
 			const parentPath = this.#resolveListPathReference(parent);
@@ -269,160 +421,32 @@ export class ThreadManager {
 		const cwd = resolveCwd(ctx.cwd, command.cwd);
 		const extraArgs = command.args ?? [];
 		assertAllowedExtraArgs(extraArgs);
-		const inheritedArgs = collectInheritedPiArgs(process.argv, PROCESS_START_CWD);
-		const argv = buildPiArgs({
-			name,
-			extraArgs,
-			inheritedArgs,
-			projectTrusted: shouldApproveChildCwd(ctx.isProjectTrusted(), ctx.cwd, cwd),
-		});
-		const invocation = getPiInvocation(argv);
-		const childEnvironment = {
-			...process.env,
-			PI_THREADS_DEPTH: String(this.#depth + 1),
-			PI_THREADS_MAX_DEPTH: String(this.#maxDepth),
-			PI_THREADS_MAX_THREADS: String(this.#maxThreads),
-			PI_THREADS_SELF_ID: id,
-			PI_THREADS_PARENT_ID: this.#selfThreadId ?? "",
-			PI_THREADS_PARENT_THREAD_ID: this.#selfThreadId ?? "",
-			PI_THREADS_PARENT_PATH: this.#currentPath,
-			PI_THREADS_PATH: threadPath,
-			PI_THREADS_ROOT_SESSION_ID: this.#rootSessionId,
-		};
-
-		let child: ChildProcessWithoutNullStreams;
-		try {
-			child = spawn(invocation.command, invocation.args, {
-				cwd,
-				env: childEnvironment,
-				shell: false,
-				stdio: ["pipe", "pipe", "pipe"],
-			});
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			throw new Error(`Unable to start child Pi process: ${message}`, { cause: error });
-		}
-
-		const pendingStart: {
-			spawnError: Error | null;
-			close: { readonly code: number | null; readonly signal: string | null } | null;
-		} = { spawnError: null, close: null };
-		child.once("error", (error) => {
-			if (!this.#threads.has(id)) {
-				pendingStart.spawnError = error;
-				return;
-			}
-			this.#closeThread(id, { kind: "failed", message: error.message });
-		});
-
-		child.once("close", (code, signal) => {
-			const current = this.#threads.get(id);
-			if (current === undefined) {
-				pendingStart.close = { code, signal };
-				return;
-			}
-			const stopped = current.state === "live" && current.stopRequested;
-			this.#closeThread(id, classifyProcessExit({ code, signal, stopped }));
-		});
-
-		if (child.pid === undefined) {
-			child.kill("SIGKILL");
-			const reason =
-				pendingStart.spawnError === null ? "missing pid" : pendingStart.spawnError.message;
-			throw new Error(`Unable to start child Pi process: ${reason}`);
-		}
-
-		const closedDeferred = createDeferred<void>();
-
-		const thread: LiveThread = {
-			state: "live",
-			id,
-			name,
-			taskName,
-			path: threadPath,
-			parentPath: this.#currentPath,
-			parentThreadId: this.#selfThreadId,
-			depth: this.#depth + 1,
-			cwd,
-			args: [...extraArgs],
-			createdAt: nowIso(),
-			lastEventAt: nowIso(),
-			session: { kind: "unknown" },
-			lastAssistantText: null,
-			lastPartialText: null,
-			recentEvents: [],
-			nextEventSeq: 1,
-			stderrTail: "",
-			phase: "starting",
-			pid: child.pid,
-			child,
-			rpc: new RpcClient(child, (event) => this.#handleRpcEvent(id, event)),
-			stopRequested: false,
-			hasRun: false,
-			activityGeneration: 0,
-			userMessageStartGeneration: 0,
-			awaitingSend: null,
-			pendingInitialPrompt: null,
-			turnOpen: false,
-			closed: closedDeferred.promise,
-			resolveClosed: closedDeferred.resolve,
-		};
-
-		this.#threads.set(id, thread);
-		appendThreadEvent(thread, { type: "thread_started", pid: child.pid });
-		this.#emitChange();
-
-		child.stderr.on("data", (chunk: Buffer | string) => {
-			const current = this.#threads.get(id);
-			if (!current) return;
-			current.stderrTail = tail(`${current.stderrTail}${String(chunk)}`, STDERR_TAIL_LIMIT);
-			current.lastEventAt = nowIso();
-		});
-
-		if (pendingStart.spawnError !== null) {
-			this.#closeThread(id, { kind: "failed", message: pendingStart.spawnError.message });
-		} else if (pendingStart.close !== null) {
-			this.#closeThread(
+		const preparedSession = prepareManagedChildSession(ctx, cwd);
+		const launch = await this.#launchThread(
+			{
 				id,
-				classifyProcessExit({
-					code: pendingStart.close.code,
-					signal: pendingStart.close.signal,
-					stopped: thread.stopRequested,
-				}),
-			);
-		}
-
-		await this.#refreshSession(thread);
-
-		let note: string | null = null;
-		let promptAccepted = false;
-		try {
-			const request = thread.rpc.requestWithHandle(
-				{ type: "prompt", message: command.prompt },
-				PROMPT_ACCEPT_TIMEOUT_MS,
-			);
-			thread.pendingInitialPrompt = { requestId: request.id };
-
-			const response = await request.response;
-			promptAccepted = response.success;
-			this.#recordInitialPromptResponse(id, response);
-			if (!response.success) {
-				note = response.error ?? "Prompt was rejected by child Pi.";
-			}
-		} catch (error) {
-			note = error instanceof Error ? error.message : String(error);
-		}
-		const current = this.#threads.get(id);
-		if (current?.state === "live" && current.session.kind !== "known") {
-			await this.#refreshSession(current);
-		}
-		this.#emitChange();
+				name,
+				taskName,
+				path: threadPath,
+				parentPath: this.#currentPath,
+				parentThreadId: this.#selfThreadId,
+				depth: this.#depth + 1,
+				cwd,
+				args: extraArgs,
+				session: preparedSession?.session,
+				sessionFile:
+					preparedSession?.session.kind === "known" ? preparedSession.session.file : undefined,
+				startEvent: "thread_started",
+				prompt: command.prompt,
+			},
+			ctx,
+		);
 
 		const resultThread = snapshotPair(this.#required(id));
 		return {
 			kind: "started",
-			promptAccepted,
-			note,
+			promptAccepted: launch.promptAccepted,
+			note: launch.note,
 			...resultThread,
 		};
 	}
@@ -451,6 +475,7 @@ export class ThreadManager {
 			const current = this.#threads.get(thread.id);
 			if (current?.state === "live") {
 				recordAcceptedSend(current, sendAcceptanceBaseline);
+				this.#persistThreadSnapshot(current);
 			}
 		}
 		this.#emitChange();
@@ -477,6 +502,7 @@ export class ThreadManager {
 		thread.stopRequested = true;
 		thread.phase = "stopping";
 		appendThreadEvent(thread, { type: "thread_stopping" });
+		this.#persistThreadSnapshot(thread);
 		this.#emitChange();
 
 		if (command.force === true) {
@@ -491,6 +517,115 @@ export class ThreadManager {
 		await Promise.race([thread.closed, delay(STOP_GRACE_MS)]);
 		this.#emitChange();
 		return { kind: "stopped", ...snapshotPair(this.#required(id)) };
+	}
+
+	async resume(command: ResumeCommand, ctx: ExtensionContext): Promise<ResumeOutcome> {
+		const thread = this.#requiredByTarget(command.id);
+		if (thread.state === "live") {
+			return { kind: "resumed", alreadyLive: true, ...snapshotPair(thread) };
+		}
+		this.#assertStartAllowed();
+		if (thread.session.kind !== "known") {
+			throw new Error(
+				`Cannot resume ${thread.path}: no saved Pi session file is known. Repair: resume only managed threads with a known session file, or start a new thread.`,
+			);
+		}
+		assertSessionFileExists(thread.session.file, "resume");
+
+		await this.#launchThread(
+			{
+				id: thread.id,
+				name: thread.name,
+				taskName: thread.taskName,
+				path: thread.path,
+				parentPath: thread.parentPath,
+				parentThreadId: thread.parentThreadId,
+				depth: thread.depth,
+				cwd: thread.cwd,
+				args: thread.args,
+				createdAt: thread.createdAt,
+				archived: false,
+				session: thread.session,
+				sessionFile: thread.session.file,
+				lastAssistantText: thread.lastAssistantText,
+				recentEvents: thread.recentEvents,
+				stderrTail: thread.stderrTail,
+				startEvent: "thread_resumed",
+			},
+			ctx,
+		);
+
+		return { kind: "resumed", alreadyLive: false, ...snapshotPair(this.#required(thread.id)) };
+	}
+
+	async fork(command: ForkCommand, ctx: ExtensionContext): Promise<ForkOutcome> {
+		this.#assertStartAllowed();
+
+		const id = newThreadId();
+		const extraArgs = command.args ?? [];
+		assertAllowedExtraArgs(extraArgs);
+		let taskName: string | null = null;
+		let threadPath: ThreadPath | null = null;
+		if (command.taskName !== undefined) {
+			taskName = assertTaskName(command.taskName);
+			threadPath = joinThreadPath(this.#currentPath, taskName);
+			this.#assertPathAvailable(threadPath);
+		} else if (command.name !== undefined) {
+			taskName = this.#uniqueTaskName(taskNameFromText(command.name) ?? shortTaskName(id), id);
+			threadPath = joinThreadPath(this.#currentPath, taskName);
+			this.#assertPathAvailable(threadPath);
+		}
+
+		const source = this.#resolveForkSource(command, ctx);
+		const baseName = command.name ?? `Fork of ${source.displayName}`;
+		if (taskName === null || threadPath === null) {
+			taskName = this.#uniqueTaskName(taskNameFromText(baseName) ?? shortTaskName(id), id);
+			threadPath = joinThreadPath(this.#currentPath, taskName);
+			this.#assertPathAvailable(threadPath);
+		}
+		const forked = createForkedManagedSession(source, command);
+
+		await this.#launchThread(
+			{
+				id,
+				name: baseName,
+				taskName,
+				path: threadPath,
+				parentPath: this.#currentPath,
+				parentThreadId: this.#selfThreadId,
+				depth: this.#depth + 1,
+				cwd: forked.cwd,
+				args: extraArgs,
+				session: forked.session,
+				sessionFile: forked.session.file,
+				startEvent: "thread_forked",
+				sourceSessionFile: source.sessionFile,
+				sourceEntryId: forked.sourceEntryId,
+			},
+			ctx,
+		);
+
+		return {
+			kind: "forked",
+			sourceSessionFile: source.sessionFile,
+			sourceEntryId: forked.sourceEntryId,
+			...snapshotPair(this.#required(id)),
+		};
+	}
+
+	archive(command: ArchiveCommand): ArchiveOutcome {
+		const thread = this.#requiredByTarget(command.id);
+		if (thread.state === "live") {
+			throw new Error(
+				`Cannot archive live thread ${thread.path}. Repair: stop or wait for the thread to close before archiving, or omit archive for live work.`,
+			);
+		}
+
+		thread.archived = command.archived ?? true;
+		appendThreadEvent(thread, { type: "thread_archived", archived: thread.archived });
+		this.#persistThreadSnapshot(thread);
+		this.#emitChange();
+		return { kind: "archived", archived: thread.archived, ...snapshotPair(thread) };
 	}
 
 	async wait(command: WaitCommand, options: WaitOptions = {}): Promise<WaitOutcome> {
@@ -586,6 +721,208 @@ export class ThreadManager {
 		this.#emitChange();
 	}
 
+	async #launchThread(
+		input: LaunchThreadInput,
+		ctx: ExtensionContext,
+	): Promise<{ readonly promptAccepted: boolean; readonly note: string | null }> {
+		const inheritedArgs = collectInheritedPiArgs(process.argv, PROCESS_START_CWD);
+		const argv = buildPiArgs({
+			name: input.name,
+			extraArgs: input.args,
+			inheritedArgs,
+			projectTrusted: shouldApproveChildCwd(ctx.isProjectTrusted(), ctx.cwd, input.cwd),
+			sessionFile: input.sessionFile,
+		});
+		const invocation = getPiInvocation(argv);
+		const childEnvironment = {
+			...process.env,
+			PI_THREADS_DEPTH: String(input.depth),
+			PI_THREADS_MAX_DEPTH: String(this.#maxDepth),
+			PI_THREADS_MAX_THREADS: String(this.#maxThreads),
+			PI_THREADS_SELF_ID: input.id,
+			PI_THREADS_PARENT_ID: input.parentThreadId ?? "",
+			PI_THREADS_PARENT_THREAD_ID: input.parentThreadId ?? "",
+			PI_THREADS_PARENT_PATH: input.parentPath,
+			PI_THREADS_PATH: input.path,
+			PI_THREADS_ROOT_SESSION_ID: this.#rootSessionId,
+		};
+
+		let child: ChildProcessWithoutNullStreams;
+		try {
+			child = spawn(invocation.command, invocation.args, {
+				cwd: input.cwd,
+				env: childEnvironment,
+				shell: false,
+				stdio: ["pipe", "pipe", "pipe"],
+			});
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new Error(`Unable to start child Pi process: ${message}`, { cause: error });
+		}
+
+		const pendingStart: {
+			spawnError: Error | null;
+			close: { readonly code: number | null; readonly signal: string | null } | null;
+		} = { spawnError: null, close: null };
+		child.once("error", (error) => {
+			if (!this.#threads.has(input.id)) {
+				pendingStart.spawnError = error;
+				return;
+			}
+			this.#closeThread(input.id, { kind: "failed", message: error.message });
+		});
+
+		child.once("close", (code, signal) => {
+			const current = this.#threads.get(input.id);
+			if (current === undefined) {
+				pendingStart.close = { code, signal };
+				return;
+			}
+			const stopped = current.state === "live" && current.stopRequested;
+			this.#closeThread(input.id, classifyProcessExit({ code, signal, stopped }));
+		});
+
+		if (child.pid === undefined) {
+			child.kill("SIGKILL");
+			const reason =
+				pendingStart.spawnError === null ? "missing pid" : pendingStart.spawnError.message;
+			throw new Error(`Unable to start child Pi process: ${reason}`);
+		}
+
+		const previousThread = this.#threads.get(input.id);
+		const registrySession = previousThread?.registrySession ?? this.#registrySession;
+		const registryGeneration = previousThread?.registryGeneration ?? this.#registryGeneration;
+		const closedDeferred = createDeferred<void>();
+		const recentEvents = [...(input.recentEvents ?? [])];
+		const thread: LiveThread = {
+			state: "live",
+			id: input.id,
+			name: input.name,
+			taskName: input.taskName,
+			path: input.path,
+			parentPath: input.parentPath,
+			parentThreadId: input.parentThreadId,
+			depth: input.depth,
+			registrySession,
+			registryGeneration,
+			archived: input.archived ?? false,
+			cwd: input.cwd,
+			args: [...input.args],
+			createdAt: input.createdAt ?? nowIso(),
+			lastEventAt: nowIso(),
+			session: input.session ?? { kind: "unknown" },
+			lastAssistantText: input.lastAssistantText ?? null,
+			lastPartialText: null,
+			recentEvents,
+			nextEventSeq: Math.max(0, ...recentEvents.map((event) => event.seq)) + 1,
+			stderrTail: input.stderrTail ?? "",
+			phase: "starting",
+			pid: child.pid,
+			child,
+			rpc: new RpcClient(child, (event) => this.#handleRpcEvent(input.id, event)),
+			stopRequested: false,
+			hasRun: false,
+			activityGeneration: 0,
+			userMessageStartGeneration: 0,
+			awaitingSend: null,
+			pendingInitialPrompt: null,
+			turnOpen: false,
+			closed: closedDeferred.promise,
+			resolveClosed: closedDeferred.resolve,
+		};
+
+		this.#threads.set(input.id, thread);
+		appendLaunchThreadEvent(thread, input, child.pid);
+		this.#persistThreadSnapshot(thread);
+		this.#emitChange();
+
+		child.stderr.on("data", (chunk: Buffer | string) => {
+			const current = this.#threads.get(input.id);
+			if (!current) return;
+			current.stderrTail = tail(`${current.stderrTail}${String(chunk)}`, STDERR_TAIL_LIMIT);
+			current.lastEventAt = nowIso();
+		});
+
+		if (pendingStart.spawnError !== null) {
+			this.#closeThread(input.id, { kind: "failed", message: pendingStart.spawnError.message });
+		} else if (pendingStart.close !== null) {
+			this.#closeThread(
+				input.id,
+				classifyProcessExit({
+					code: pendingStart.close.code,
+					signal: pendingStart.close.signal,
+					stopped: thread.stopRequested,
+				}),
+			);
+		}
+
+		await this.#refreshSession(thread);
+
+		let note: string | null = null;
+		let promptAccepted = false;
+		if (input.prompt !== undefined) {
+			try {
+				const request = thread.rpc.requestWithHandle(
+					{ type: "prompt", message: input.prompt },
+					PROMPT_ACCEPT_TIMEOUT_MS,
+				);
+				thread.pendingInitialPrompt = { requestId: request.id };
+
+				const response = await request.response;
+				promptAccepted = response.success;
+				this.#recordInitialPromptResponse(input.id, response);
+				if (!response.success) {
+					note = response.error ?? "Prompt was rejected by child Pi.";
+				}
+			} catch (error) {
+				note = error instanceof Error ? error.message : String(error);
+			}
+		} else if (this.#threads.get(input.id)?.state === "live") {
+			const current = this.#threads.get(input.id);
+			if (current?.state === "live" && current.phase === "starting") current.phase = "idle";
+		}
+
+		const current = this.#threads.get(input.id);
+		if (current?.state === "live" && current.session.kind !== "known") {
+			await this.#refreshSession(current);
+		}
+		this.#persistThreadSnapshot(this.#required(input.id));
+		this.#emitChange();
+
+		return { promptAccepted, note };
+	}
+
+	#persistThreadSnapshot(thread: ManagedThread): void {
+		try {
+			const target = this.#registryTarget(thread);
+			if (target === null) return;
+			this.#persistence.appendSnapshot?.(snapshot(thread), registryScope(target), target);
+		} catch {
+			// Persistence should never affect process lifecycle management.
+		}
+	}
+
+	#persistThreadSnapshotAndEmitChange(thread: ManagedThread): void {
+		this.#persistThreadSnapshot(thread);
+		this.#emitChange();
+	}
+
+	#registryTarget(thread: ManagedThread): ThreadRegistryPersistenceTarget | null {
+		if (thread.registrySession !== null) {
+			return {
+				...thread.registrySession,
+				isCurrentSession: threadRegistrySessionsMatch(
+					thread.registrySession,
+					this.#registrySession,
+				),
+			};
+		}
+
+		if (thread.registryGeneration !== this.#registryGeneration) return null;
+		if (this.#registrySession !== null) return { ...this.#registrySession, isCurrentSession: true };
+		return { sessionId: null, sessionFile: null, sessionDir: null, isCurrentSession: true };
+	}
+
 	#assertStartAllowed(): void {
 		if (this.#depth >= this.#maxDepth) {
 			throw new Error(
@@ -615,6 +952,39 @@ export class ThreadManager {
 		const thread = this.#requiredByTarget(target);
 		if (thread.state === "closed") throw new Error(`Thread is closed: ${target}`);
 		return thread;
+	}
+
+	#resolveForkSource(command: ForkCommand, ctx: ExtensionContext): ForkSource {
+		if (command.id !== undefined) {
+			const sourceThread = this.#requiredByTarget(command.id);
+			if (sourceThread.session.kind !== "known") {
+				throw new Error(
+					`Cannot fork ${sourceThread.path}: no saved Pi session file is known. Repair: fork only managed threads with known session files, or omit fork.id to fork the current parent session.`,
+				);
+			}
+			assertSessionFileExists(sourceThread.session.file, "fork");
+			return {
+				sessionFile: sourceThread.session.file,
+				sessionDir: undefined,
+				cwd: sourceThread.cwd,
+				displayName: sourceThread.name,
+			};
+		}
+
+		const sessionFile = safeGetSessionFile(ctx);
+		if (sessionFile === undefined) {
+			throw new Error(
+				"Cannot fork the current parent session because it has no saved Pi session file. Repair: start Pi with sessions enabled, fork a managed child by id, or start a new thread instead.",
+			);
+		}
+		materializeSessionManagerFile(ctx.sessionManager);
+		assertSessionFileExists(sessionFile, "fork");
+		return {
+			sessionFile,
+			sessionDir: safeGetSessionDir(ctx),
+			cwd: ctx.cwd,
+			displayName: "current session",
+		};
 	}
 
 	#resolveTarget(targetText: string): ThreadId {
@@ -747,6 +1117,9 @@ export class ThreadManager {
 			parentPath: thread.parentPath,
 			parentThreadId: thread.parentThreadId,
 			depth: thread.depth,
+			registrySession: thread.registrySession,
+			registryGeneration: thread.registryGeneration,
+			archived: thread.archived,
 			cwd: thread.cwd,
 			args: thread.args,
 			createdAt: thread.createdAt,
@@ -761,6 +1134,7 @@ export class ThreadManager {
 
 		appendThreadEvent(closed, { type: "thread_closed", exit });
 		this.#threads.set(id, closed);
+		this.#persistThreadSnapshot(closed);
 		thread.resolveClosed();
 		this.#emitChange();
 	}
@@ -789,12 +1163,14 @@ export class ThreadManager {
 
 		if (clientEvent.kind === "parse_error") {
 			appendThreadEvent(thread, { type: "thread_error", message: clientEvent.message });
-			this.#emitChange();
+			this.#persistThreadSnapshotAndEmitChange(thread);
 			return;
 		}
 
 		if (clientEvent.kind === "response") {
-			if (this.#recordInitialPromptResponse(id, clientEvent.response)) this.#emitChange();
+			if (this.#recordInitialPromptResponse(id, clientEvent.response)) {
+				this.#persistThreadSnapshotAndEmitChange(thread);
+			}
 			return;
 		}
 
@@ -806,7 +1182,7 @@ export class ThreadManager {
 				thread.phase = "busy";
 				thread.hasRun = true;
 				recordThreadTurnStarted(thread);
-				this.#emitChange();
+				this.#persistThreadSnapshotAndEmitChange(thread);
 				return;
 			}
 			case "agent_end": {
@@ -816,7 +1192,7 @@ export class ThreadManager {
 				allowAwaitingSendRunActivity(thread);
 				clearObservedSendIfIdle(thread);
 				recordThreadTurnCompleted(thread);
-				this.#emitChange();
+				this.#persistThreadSnapshotAndEmitChange(thread);
 				return;
 			}
 			case "turn_start": {
@@ -824,7 +1200,7 @@ export class ThreadManager {
 				thread.phase = "busy";
 				thread.hasRun = true;
 				recordThreadTurnStarted(thread);
-				this.#emitChange();
+				this.#persistThreadSnapshotAndEmitChange(thread);
 				return;
 			}
 			case "message_start": {
@@ -833,20 +1209,23 @@ export class ThreadManager {
 				thread.phase = "busy";
 				thread.hasRun = true;
 				recordThreadTurnStarted(thread);
-				this.#emitChange();
+				this.#persistThreadSnapshotAndEmitChange(thread);
 				return;
 			}
 			case "turn_end": {
 				recordPromptRunActivity(thread);
 				allowAwaitingSendRunActivity(thread);
 				recordThreadTurnCompleted(thread);
-				this.#emitChange();
+				this.#persistThreadSnapshotAndEmitChange(thread);
 				return;
 			}
 			case "message_update": {
 				recordPromptRunActivity(thread);
 				const text = extractAssistantText(event["message"]);
-				if (text !== null) thread.lastPartialText = text;
+				if (text !== null && text !== thread.lastPartialText) {
+					thread.lastPartialText = text;
+					this.#scheduleMessageUpdateChange();
+				}
 				return;
 			}
 			case "message_end": {
@@ -857,7 +1236,7 @@ export class ThreadManager {
 					thread.lastPartialText = null;
 					clearObservedSendIfIdle(thread);
 					appendThreadEvent(thread, { type: "assistant_message", text: tail(text, 2_000) });
-					this.#emitChange();
+					this.#persistThreadSnapshotAndEmitChange(thread);
 				}
 				return;
 			}
@@ -869,7 +1248,7 @@ export class ThreadManager {
 					type: "tool_started",
 					toolName: stringField(event, "toolName") ?? "unknown",
 				});
-				this.#emitChange();
+				this.#persistThreadSnapshotAndEmitChange(thread);
 				return;
 			}
 			case "tool_execution_update": {
@@ -883,7 +1262,7 @@ export class ThreadManager {
 					toolName: stringField(event, "toolName") ?? "unknown",
 					error: event["isError"] === true,
 				});
-				this.#emitChange();
+				this.#persistThreadSnapshotAndEmitChange(thread);
 				return;
 			}
 			case "extension_ui_request": {
@@ -898,7 +1277,7 @@ export class ThreadManager {
 					autoCancelled: shouldAutoCancel,
 				});
 				if (shouldAutoCancel) thread.rpc.respondToUiRequest(requestId);
-				this.#emitChange();
+				this.#persistThreadSnapshotAndEmitChange(thread);
 				return;
 			}
 			default:
@@ -929,7 +1308,11 @@ export class ThreadManager {
 	async #refreshSession(thread: LiveThread): Promise<void> {
 		const data = await this.#requestState(thread, { recordErrors: false });
 		if (data === null) return;
-		if (captureSession(thread, data)) this.#emitChange();
+		if (this.#threads.get(thread.id) !== thread) return;
+		if (captureSession(thread, data)) {
+			this.#persistThreadSnapshot(thread);
+			this.#emitChange();
+		}
 	}
 
 	async #refreshState(
@@ -940,8 +1323,13 @@ export class ThreadManager {
 			options.timeoutMs === undefined
 				? { recordErrors: true }
 				: { recordErrors: true, timeoutMs: options.timeoutMs };
+		const before = liveThreadDurabilitySignature(thread);
 		const data = await this.#requestState(thread, requestOptions);
-		if (data === null) return false;
+		if (this.#threads.get(thread.id) !== thread) return false;
+		if (data === null) {
+			if (liveThreadDurabilitySignature(thread) !== before) this.#persistThreadSnapshot(thread);
+			return false;
+		}
 
 		captureSession(thread, data);
 
@@ -996,11 +1384,28 @@ export class ThreadManager {
 			}
 		}
 		if (childAppearsIdle && thread.phase !== "stopping") recordThreadTurnCompleted(thread);
+		if (liveThreadDurabilitySignature(thread) !== before) this.#persistThreadSnapshot(thread);
 		if (options.emitChange ?? true) this.#emitChange();
 		return true;
 	}
 
+	#scheduleMessageUpdateChange(): void {
+		if (this.#listeners.size === 0 || this.#messageUpdateChangeTimer !== null) return;
+		this.#messageUpdateChangeTimer = setTimeout(() => {
+			this.#messageUpdateChangeTimer = null;
+			this.#emitChange();
+		}, MESSAGE_UPDATE_EMIT_THROTTLE_MS);
+		this.#messageUpdateChangeTimer.unref();
+	}
+
+	#clearScheduledMessageUpdateChange(): void {
+		if (this.#messageUpdateChangeTimer === null) return;
+		clearTimeout(this.#messageUpdateChangeTimer);
+		this.#messageUpdateChangeTimer = null;
+	}
+
 	#emitChange(): void {
+		this.#clearScheduledMessageUpdateChange();
 		if (this.#listeners.size === 0) return;
 		const threads = Array.from(this.#threads.values())
 			.toSorted((left, right) => left.path.localeCompare(right.path))
@@ -1040,15 +1445,408 @@ function captureSession(thread: LiveThread, data: Record<string, unknown>): bool
 	return false;
 }
 
+function registryScope(target: ThreadRegistryPersistenceTarget): ThreadRegistryEntryScope | null {
+	return target.sessionId === null ? null : { sessionId: target.sessionId };
+}
+
+function threadRegistrySessionFromContext(
+	ctx: Pick<ExtensionContext, "sessionManager">,
+): ThreadRegistrySession | null {
+	const sessionId = safeGetSessionId(ctx);
+	const sessionFile = safeGetSessionFile(ctx) ?? null;
+	const sessionDir = safeGetSessionDir(ctx) ?? null;
+	if (sessionId === null && sessionFile === null && sessionDir === null) return null;
+	return { sessionId, sessionFile, sessionDir };
+}
+
+function threadRegistrySessionsMatch(
+	left: ThreadRegistrySession | null,
+	right: ThreadRegistrySession | null,
+): boolean {
+	if (left === null || right === null) return left === right;
+	if (left.sessionId !== null && right.sessionId !== null)
+		return left.sessionId === right.sessionId;
+	if (left.sessionFile !== null && right.sessionFile !== null) {
+		return sameSessionFile(left.sessionFile, right.sessionFile);
+	}
+	return (
+		left.sessionId === right.sessionId &&
+		left.sessionFile === right.sessionFile &&
+		left.sessionDir === right.sessionDir
+	);
+}
+
+function liveThreadDurabilitySignature(thread: LiveThread): string {
+	return JSON.stringify({
+		archived: thread.archived,
+		lastAssistantText: thread.lastAssistantText,
+		lastPartialText: thread.lastPartialText,
+		phase: thread.phase,
+		recentEvents: thread.recentEvents,
+		session: thread.session,
+		stderrTail: thread.stderrTail,
+	});
+}
+
+function prepareManagedChildSession(
+	ctx: ExtensionContext,
+	cwd: string,
+): { readonly session: Extract<ThreadSession, { readonly kind: "known" }> } | null {
+	const parentSessionFile = safeGetSessionFile(ctx);
+	if (parentSessionFile === undefined) return null;
+
+	const sessionManager = SessionManager.create(cwd, safeGetSessionDir(ctx), {
+		parentSession: parentSessionFile,
+	});
+	materializeSessionManagerFile(sessionManager);
+	const sessionFile = sessionManager.getSessionFile();
+	if (sessionFile === undefined) return null;
+
+	return {
+		session: {
+			kind: "known",
+			file: sessionFile,
+			id: sessionManager.getSessionId(),
+			name: sessionManager.getSessionName() ?? null,
+			pendingMessageCount: null,
+		},
+	};
+}
+
+function createForkedManagedSession(
+	source: ForkSource,
+	command: ForkCommand,
+): ForkedManagedSession {
+	const sourceManager = SessionManager.open(source.sessionFile, source.sessionDir);
+	const position = command.position ?? "at";
+	const requestedEntryId = command.entryId ?? sourceManager.getLeafId();
+	let sourceEntryId: string | null = requestedEntryId ?? null;
+
+	let forkManager: SessionManager;
+	if (requestedEntryId === null) {
+		forkManager = SessionManager.create(sourceManager.getCwd(), sourceManager.getSessionDir(), {
+			parentSession: source.sessionFile,
+		});
+	} else {
+		let targetLeafId: string | null = requestedEntryId;
+		if (position === "before") {
+			const selectedEntry = sourceManager.getEntry(requestedEntryId);
+			if (selectedEntry === undefined)
+				throw new Error(`Cannot fork: entry not found: ${requestedEntryId}`);
+			if (selectedEntry.type !== "message" || selectedEntry.message.role !== "user") {
+				throw new Error(
+					`Cannot fork before entry ${requestedEntryId}: the selected entry is not a user message. Repair: use position "at" or choose a user message entry id.`,
+				);
+			}
+			targetLeafId = selectedEntry.parentId;
+		}
+
+		if (targetLeafId === null) {
+			forkManager = SessionManager.create(sourceManager.getCwd(), sourceManager.getSessionDir(), {
+				parentSession: source.sessionFile,
+			});
+		} else {
+			const forkedPath = sourceManager.createBranchedSession(targetLeafId);
+			if (forkedPath === undefined)
+				throw new Error("Cannot fork: source session is not persisted.");
+			forkManager = sourceManager;
+		}
+	}
+
+	materializeSessionManagerFile(forkManager);
+	const file = forkManager.getSessionFile();
+	if (file === undefined) throw new Error("Cannot fork: forked session has no session file.");
+
+	return {
+		cwd: forkManager.getCwd(),
+		session: {
+			kind: "known",
+			file,
+			id: forkManager.getSessionId(),
+			name: forkManager.getSessionName() ?? null,
+			pendingMessageCount: null,
+		},
+		sourceEntryId,
+	};
+}
+
+type MaterializableSessionManager = {
+	readonly getSessionFile: () => string | undefined;
+	readonly getHeader: () => unknown;
+	readonly getEntries: () => readonly unknown[];
+};
+
+function materializeSessionManagerFile(sessionManager: MaterializableSessionManager): void {
+	const sessionFile = sessionManager.getSessionFile();
+	if (sessionFile === undefined || fs.existsSync(sessionFile)) return;
+	if (rewriteSessionManagerFile(sessionManager, sessionFile)) return;
+
+	const header = sessionManager.getHeader();
+	if (header === null) throw new Error("Cannot materialize Pi session: missing session header.");
+	fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+	const lines = [header, ...sessionManager.getEntries()].map((entry) => JSON.stringify(entry));
+	fs.writeFileSync(sessionFile, `${lines.join("\n")}\n`, { flag: "wx" });
+	markSessionManagerFileFlushed(sessionManager);
+}
+
+function rewriteSessionManagerFile(
+	sessionManager: MaterializableSessionManager,
+	sessionFile: string,
+): boolean {
+	const internals = sessionManager as MaterializableSessionManager & {
+		readonly isPersisted?: () => boolean;
+		flushed?: boolean;
+	} & Record<string, unknown>;
+	if (typeof internals.isPersisted === "function" && !internals.isPersisted.call(sessionManager)) {
+		return false;
+	}
+	const rewriteFile = internals["_rewriteFile"];
+	if (typeof rewriteFile !== "function") return false;
+
+	try {
+		rewriteFile.call(sessionManager);
+	} catch {
+		return false;
+	}
+
+	if (!fs.existsSync(sessionFile)) return false;
+	markSessionManagerFileFlushed(sessionManager);
+	return true;
+}
+
+function markSessionManagerFileFlushed(sessionManager: MaterializableSessionManager): void {
+	(sessionManager as { flushed?: boolean }).flushed = true;
+}
+
+function safeGetSessionFile(ctx: Pick<ExtensionContext, "sessionManager">): string | undefined {
+	try {
+		return ctx.sessionManager.getSessionFile?.();
+	} catch {
+		return undefined;
+	}
+}
+
+function safeGetSessionId(ctx: Pick<ExtensionContext, "sessionManager">): string | null {
+	try {
+		return ctx.sessionManager.getSessionId?.() ?? null;
+	} catch {
+		return null;
+	}
+}
+
+function sessionHasParentSession(ctx: Pick<ExtensionContext, "sessionManager">): boolean {
+	try {
+		const header = ctx.sessionManager.getHeader?.();
+		return (
+			isRecord(header) &&
+			typeof header["parentSession"] === "string" &&
+			header["parentSession"].length > 0
+		);
+	} catch {
+		return false;
+	}
+}
+
+function safeSessionTimestamp(ctx: Pick<ExtensionContext, "sessionManager">): string | null {
+	try {
+		const header = ctx.sessionManager.getHeader?.();
+		return isRecord(header) ? stringField(header, "timestamp") : null;
+	} catch {
+		return null;
+	}
+}
+
+function safeGetSessionDir(ctx: Pick<ExtensionContext, "sessionManager">): string | undefined {
+	try {
+		return ctx.sessionManager.getSessionDir?.();
+	} catch {
+		return undefined;
+	}
+}
+
+function assertSessionFileExists(sessionFile: string, action: "resume" | "fork"): void {
+	if (fs.existsSync(sessionFile)) return;
+	throw new Error(
+		`Cannot ${action} managed thread: saved Pi session file does not exist: ${sessionFile}. Repair: choose a thread with an existing session file, or start/fork a new thread.`,
+	);
+}
+
+function safeSessionBranch(ctx: Pick<ExtensionContext, "sessionManager">): readonly unknown[] {
+	try {
+		return ctx.sessionManager.getBranch?.() ?? [];
+	} catch {
+		return [];
+	}
+}
+
+function restoreDurableThreads(
+	entries: readonly unknown[],
+	scope: ThreadRegistryRestoreScope,
+): readonly ClosedThread[] {
+	const latest = new Map<ThreadId, DurableThreadData>();
+	for (const entry of entries) {
+		const data = durableThreadDataFromEntry(entry);
+		if (data === null) continue;
+		if (!shouldRestoreDurableThread(data, scope)) continue;
+		latest.set(data.snapshot.id, data);
+	}
+
+	return Array.from(latest.values()).map((data) => snapshotToRestoredThread(data, scope));
+}
+
+function threadSnapshotsMatch(left: ManagedThread, right: ManagedThread): boolean {
+	return JSON.stringify(snapshot(left)) === JSON.stringify(snapshot(right));
+}
+
+function threadRegistryMetadataMatches(left: ManagedThread, right: ManagedThread): boolean {
+	return (
+		left.registryGeneration === right.registryGeneration &&
+		threadRegistrySessionsMatch(left.registrySession, right.registrySession)
+	);
+}
+
+function shouldRestoreDurableThread(
+	data: DurableThreadData,
+	scope: ThreadRegistryRestoreScope,
+): boolean {
+	if (!threadSnapshotIsInCurrentScope(data.snapshot, scope.currentPath)) return false;
+	if (data.scope !== undefined) {
+		return scope.sessionId !== null && data.scope.sessionId === scope.sessionId;
+	}
+
+	if (!scope.isRootSessionFork) return true;
+
+	// Legacy registry entries predate per-session ownership metadata. A root-level
+	// fork has the same /root path, so keep only legacy entries appended after the
+	// fork session header and drop copied source-session registry entries.
+	return (
+		data.entryTimestamp !== null &&
+		scope.sessionStartedAt !== null &&
+		data.entryTimestamp >= scope.sessionStartedAt
+	);
+}
+
+function threadSnapshotIsInCurrentScope(
+	threadSnapshot: ThreadSnapshot,
+	currentPath: ThreadPath,
+): boolean {
+	return threadSnapshot.path.startsWith(`${currentPath}/`);
+}
+
+function durableThreadDataFromEntry(entry: unknown): DurableThreadData | null {
+	if (!isRecord(entry) || entry["type"] !== "custom") return null;
+	if (entry["customType"] !== PI_THREAD_REGISTRY_ENTRY_TYPE) return null;
+	const data = entry["data"];
+	if (!isRecord(data) || data["version"] !== 1 || data["kind"] !== "thread_snapshot") return null;
+	const rawSnapshot = data["snapshot"];
+	if (!isThreadSnapshotLike(rawSnapshot)) return null;
+	const scope = threadRegistryEntryScopeFromValue(data["scope"]);
+	const entryTimestamp = stringField(entry, "timestamp");
+	return {
+		version: 1,
+		kind: "thread_snapshot",
+		snapshot: rawSnapshot,
+		entryTimestamp,
+		...(scope === undefined ? {} : { scope }),
+	};
+}
+
+function threadRegistryEntryScopeFromValue(value: unknown): ThreadRegistryEntryScope | undefined {
+	if (!isRecord(value)) return undefined;
+	const sessionId = stringField(value, "sessionId");
+	if (sessionId === null || sessionId.length === 0) return undefined;
+	return { sessionId };
+}
+
+function restoredThreadRegistrySession(
+	data: DurableThreadData,
+	scope: ThreadRegistryRestoreScope,
+): ThreadRegistrySession | null {
+	if (scope.registrySession !== null) return scope.registrySession;
+	if (data.scope === undefined) return null;
+	return { sessionId: data.scope.sessionId, sessionFile: null, sessionDir: null };
+}
+
+function isThreadSnapshotLike(value: unknown): value is ThreadSnapshot {
+	if (!isRecord(value)) return false;
+	try {
+		asThreadId(stringField(value, "id") ?? "");
+		asThreadPath(stringField(value, "path") ?? "");
+		asThreadPath(stringField(value, "parentPath") ?? "");
+		assertTaskName(stringField(value, "taskName") ?? "");
+		return (
+			(value["state"] === "live" || value["state"] === "closed") &&
+			typeof value["name"] === "string" &&
+			typeof value["cwd"] === "string" &&
+			Array.isArray(value["args"]) &&
+			Array.isArray(value["recentEvents"])
+		);
+	} catch {
+		return false;
+	}
+}
+
+function snapshotToRestoredThread(
+	data: DurableThreadData,
+	scope: ThreadRegistryRestoreScope,
+): ClosedThread {
+	const restored = data.snapshot;
+	const recentEvents = [...restored.recentEvents];
+	const nextEventSeq = Math.max(0, ...recentEvents.map((event) => event.seq)) + 1;
+	const exit =
+		restored.state === "closed"
+			? restored.exit
+			: {
+					kind: "stale" as const,
+					message:
+						"Thread was restored from the parent Pi session registry without a live process connection.",
+				};
+
+	const thread: ClosedThread = {
+		state: "closed",
+		id: restored.id,
+		name: restored.name,
+		taskName: restored.taskName,
+		path: restored.path,
+		parentPath: restored.parentPath,
+		parentThreadId: restored.parentThreadId,
+		depth: restored.depth,
+		registrySession: restoredThreadRegistrySession(data, scope),
+		registryGeneration: scope.registryGeneration,
+		archived: restored.archived === true,
+		cwd: restored.cwd,
+		args: [...restored.args],
+		createdAt: restored.createdAt,
+		lastEventAt: restored.lastEventAt,
+		session: restored.session,
+		lastAssistantText: restored.lastAssistantText,
+		recentEvents,
+		nextEventSeq,
+		stderrTail: restored.stderrTail,
+		exit,
+	};
+
+	if (restored.state === "live") {
+		appendThreadEventAt(
+			thread,
+			{ type: "thread_closed", exit },
+			data.entryTimestamp ?? restored.lastEventAt,
+		);
+	}
+	return thread;
+}
+
 export function buildPiArgs(input: {
 	readonly name: string;
 	readonly extraArgs: readonly string[];
 	readonly inheritedArgs?: readonly string[];
 	readonly projectTrusted: boolean;
+	readonly sessionFile?: string | undefined;
 }): readonly string[] {
 	const childArgs = mergeChildArgs(input.inheritedArgs ?? [], input.extraArgs);
 	return [
 		...childArgs,
+		...(input.sessionFile === undefined ? [] : ["--session", input.sessionFile]),
 		"--mode",
 		"rpc",
 		"--name",
@@ -1644,6 +2442,7 @@ function snapshot(thread: ManagedThread): ThreadSnapshot {
 			parentPath: thread.parentPath,
 			parentThreadId: thread.parentThreadId,
 			depth: thread.depth,
+			archived: thread.archived,
 			cwd: thread.cwd,
 			args: [...thread.args],
 			createdAt: thread.createdAt,
@@ -1665,6 +2464,7 @@ function snapshot(thread: ManagedThread): ThreadSnapshot {
 		parentPath: thread.parentPath,
 		parentThreadId: thread.parentThreadId,
 		depth: thread.depth,
+		archived: thread.archived,
 		cwd: thread.cwd,
 		args: [...thread.args],
 		createdAt: thread.createdAt,
@@ -1686,13 +2486,35 @@ type ThreadEventInput = ThreadEvent extends infer Event
 	: never;
 
 function appendThreadEvent(thread: ThreadBase, event: ThreadEventInput): void {
-	const at = nowIso();
+	appendThreadEventAt(thread, event, nowIso());
+}
+
+function appendThreadEventAt(thread: ThreadBase, event: ThreadEventInput, at: string): void {
 	const nextEvent = { ...event, seq: thread.nextEventSeq, at } as ThreadEvent;
 	thread.nextEventSeq++;
 	thread.lastEventAt = at;
 	thread.recentEvents.push(nextEvent);
 	if (thread.recentEvents.length > RECENT_EVENT_LIMIT)
 		thread.recentEvents.splice(0, thread.recentEvents.length - RECENT_EVENT_LIMIT);
+}
+
+function appendLaunchThreadEvent(thread: LiveThread, input: LaunchThreadInput, pid: number): void {
+	switch (input.startEvent) {
+		case "thread_started":
+			appendThreadEvent(thread, { type: "thread_started", pid });
+			return;
+		case "thread_resumed":
+			appendThreadEvent(thread, { type: "thread_resumed", pid });
+			return;
+		case "thread_forked":
+			appendThreadEvent(thread, {
+				type: "thread_forked",
+				pid,
+				sourceSessionFile: input.sourceSessionFile ?? "unknown",
+				sourceEntryId: input.sourceEntryId ?? null,
+			});
+			return;
+	}
 }
 
 function recordThreadTurnStarted(thread: LiveThread): void {

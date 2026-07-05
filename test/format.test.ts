@@ -27,6 +27,7 @@ function liveThread(overrides: Partial<LiveThreadSnapshot> = {}): ThreadSnapshot
 		parentPath: asThreadPath("/root"),
 		parentThreadId: null,
 		depth: 1,
+		archived: false,
 		cwd: "/tmp/project",
 		args: [],
 		createdAt: "2026-01-01T00:00:00.000Z",
@@ -52,6 +53,7 @@ function closedThread(overrides: Partial<ClosedThreadSnapshot> = {}): ThreadSnap
 		parentPath: asThreadPath("/root"),
 		parentThreadId: null,
 		depth: 1,
+		archived: false,
 		cwd: "/tmp/project",
 		args: [],
 		createdAt: "2026-01-01T00:00:00.000Z",
@@ -179,7 +181,7 @@ describe("thread display formatting", () => {
 		expect(idleOutput).toContain("Running: yes");
 		expect(idleOutput).toContain("Next: send prompt, poll, or stop");
 		expect(closedOutput).toContain("Running: no");
-		expect(closedOutput).toContain("Next: review output or list threads");
+		expect(closedOutput).toContain("Next: archive, or list");
 	});
 });
 

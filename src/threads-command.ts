@@ -8,82 +8,89 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import type { ThreadSnapshot } from "./domain.ts";
+import {
+	isThreadExitFailed,
+	toThreadRuntimeSnapshot,
+	type ThreadPath,
+	type ThreadSnapshot,
+} from "./domain.ts";
 import {
 	formatPoll,
 	formatThreadEvent,
 	formatThreadStateBadge,
 	formatThreadSummary,
 	formatThreadTitle,
-	formatThreadUserStatus,
 } from "./format.ts";
 import type { ThreadManager } from "./thread-manager.ts";
 
-type StateFilter = "all" | "live" | "closed";
-const FILTER_CYCLE: readonly StateFilter[] = ["all", "live", "closed"];
+type StatusFilter = "all" | "live" | "working" | "idle" | "closed" | "stale" | "failed";
+type VisibilityFilter = "active" | "archived" | "all";
+type BrowserStatus = "working" | "idle" | "done" | "stale" | "failed";
+const STATUS_FILTER_CYCLE: readonly StatusFilter[] = [
+	"all",
+	"live",
+	"working",
+	"idle",
+	"closed",
+	"stale",
+	"failed",
+];
+const VISIBILITY_FILTER_CYCLE: readonly VisibilityFilter[] = ["active", "archived", "all"];
 const THREAD_HELP_ITEMS = [
 	"↑/↓ move",
-	"tab filter",
-	"enter open closed",
+	"←/→ parent/child",
+	"tab status",
+	"ctrl+v visibility",
 	"ctrl+p poll",
 	"ctrl+r refresh",
 	"ctrl+x stop",
 	"type search",
 	"esc close",
 ];
-export const PI_THREAD_ENTRY_MESSAGE_TYPE = "pi-threads-entry";
 
 export function registerThreadsCommand(
 	pi: ExtensionAPI,
 	manager: ThreadManager,
 	options: {
 		readonly beforeUse?: (ctx: ExtensionCommandContext) => void;
-		readonly exit?: (ctx: ExtensionCommandContext) => Promise<void>;
 	} = {},
 ): void {
 	pi.registerCommand("threads", {
-		description: "List and manage Pi threads interactively",
-		getArgumentCompletions: (_prefix: string) => [
-			{ value: "exit", label: "exit", description: "Return to the parent thread session" },
-		],
+		description: "Browse Pi threads interactively",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			options.beforeUse?.(ctx);
 			const trimmed = args?.trim().toLowerCase() || "";
 			const command = parseThreadsCommand(trimmed);
 			if (command === null) {
-				ctx.ui.notify("Usage: /threads [exit]", "error");
-				return;
-			}
-			if (command.kind === "exit") {
-				if (options.exit === undefined) {
-					ctx.ui.notify("Thread exit is unavailable in this context", "warning");
-					return;
-				}
-				await options.exit(ctx);
+				ctx.ui.notify("Usage: /threads", "error");
 				return;
 			}
 
 			if (ctx.mode === "tui") {
-				await showThreadsTui(ctx, manager, manager.list({ action: "list", state: "all" }), "all");
+				await showThreadsTui(
+					ctx,
+					manager,
+					manager.list({ action: "list", state: "all", visibility: "all" }),
+					"all",
+				);
 			} else if (ctx.hasUI) {
-				const threads = manager.list({ action: "list", state: "all" });
+				const threads = manager.list({ action: "list", state: "all", visibility: "active" });
 				if (threads.length === 0) {
 					ctx.ui.notify("No threads found", "info");
 					return;
 				}
 				await showThreadsRpc(ctx, manager, threads);
 			} else {
-				const threads = manager.list({ action: "list", state: "all" });
+				const threads = manager.list({ action: "list", state: "all", visibility: "active" });
 				ctx.ui.notify(`Found ${threads.length} thread(s)`, "info");
 			}
 		},
 	});
 }
 
-type ThreadsCommand = { readonly kind: "browse" } | { readonly kind: "exit" };
+type ThreadsCommand = { readonly kind: "browse" };
 
 function parseThreadsCommand(value: string): ThreadsCommand | null {
-	if (value === "exit") return { kind: "exit" };
 	if (value === "") return { kind: "browse" };
 	return null;
 }
@@ -92,7 +99,7 @@ async function showThreadsTui(
 	ctx: ExtensionCommandContext,
 	manager: ThreadManager,
 	initialThreads: readonly ThreadSnapshot[],
-	filter: StateFilter,
+	filter: StatusFilter,
 ): Promise<void> {
 	await ctx.ui.custom<null>((tui, theme, _kb, done) => {
 		let unsubscribe: (() => void) | null = null;
@@ -115,6 +122,10 @@ async function showThreadsTui(
 	});
 }
 
+type ThreadsTui = {
+	requestRender: () => void;
+};
+
 export class ThreadsTreeComponent implements Component {
 	private threads: ThreadSnapshot[];
 	private selectedIndex = 0;
@@ -124,16 +135,18 @@ export class ThreadsTreeComponent implements Component {
 	private cachedLines: string[] | undefined;
 
 	constructor(
-		private readonly tui: { requestRender: () => void },
+		private readonly tui: ThreadsTui,
 		private readonly theme: Theme,
 		private readonly manager: ThreadManager,
 		private readonly ctx: ExtensionCommandContext,
 		initialThreads: readonly ThreadSnapshot[],
-		private filter: StateFilter,
+		private statusFilter: StatusFilter,
 		private readonly done: (result: null) => void,
 	) {
 		this.threads = [...initialThreads];
 	}
+
+	private visibilityFilter: VisibilityFilter = "active";
 
 	invalidate(): void {
 		this.cachedWidth = undefined;
@@ -160,13 +173,11 @@ export class ThreadsTreeComponent implements Component {
 
 		const t = this.theme;
 		const filtered = this.filteredThreads();
-		const liveCount = this.threads.filter((thread) => thread.state === "live").length;
-		const closedCount = this.threads.length - liveCount;
+		const counts = browserCounts(this.threads);
 		const lines: string[] = [];
-
 		lines.push("");
 		lines.push(...this.renderBorder(width));
-		lines.push(this.renderTitleLine(width, liveCount, closedCount));
+		lines.push(this.renderTitleLine(width, counts));
 		lines.push(...this.renderHelpLines(width));
 		lines.push(truncateToWidth(this.renderSearchLine(), width));
 		lines.push(...this.renderBorder(width));
@@ -196,24 +207,22 @@ export class ThreadsTreeComponent implements Component {
 				truncateToWidth(t.fg("muted", `  (${this.selectedIndex + 1}/${filtered.length})`), width),
 			);
 
-			const lastEvent = this.selectedThread()?.recentEvents.at(-1);
-			if (lastEvent !== undefined) {
-				lines.push(
-					truncateToWidth(t.fg("muted", `  Last event: ${formatThreadEvent(lastEvent)}`), width),
-				);
-			}
+			lines.push("");
+			lines.push(...this.renderSelectedDetails(width));
 		}
 
 		lines.push("");
 		lines.push(...this.renderBorder(width));
 
+		const screenLines = this.fitToWidth(lines, width);
 		this.cachedWidth = width;
-		this.cachedLines = lines;
-		return lines;
+		this.cachedLines = screenLines;
+		return screenLines;
 	}
 
 	handleInput(data: string): void {
 		if (this.closed) return;
+
 		const filtered = this.filteredThreads();
 
 		if (matchesKey(data, Key.up)) {
@@ -230,13 +239,23 @@ export class ThreadsTreeComponent implements Component {
 			return;
 		}
 
-		if (matchesKey(data, Key.enter)) {
-			void this.handleEnterThread();
+		if (matchesKey(data, Key.left)) {
+			this.selectParentThread();
+			return;
+		}
+
+		if (matchesKey(data, Key.right)) {
+			this.selectFirstChildThread();
 			return;
 		}
 
 		if (matchesKey(data, Key.tab)) {
-			this.cycleFilter();
+			this.cycleStatusFilter();
+			return;
+		}
+
+		if (matchesKey(data, Key.ctrl("v"))) {
+			this.cycleVisibilityFilter();
 			return;
 		}
 
@@ -289,34 +308,34 @@ export class ThreadsTreeComponent implements Component {
 		return `${this.theme.fg("muted", "  Type to search:")} ${this.theme.fg("accent", this.searchQuery)}`;
 	}
 
-	private renderTitleLine(width: number, liveCount: number, closedCount: number): string {
-		const leftText = this.theme.bold(`  Pi Threads (${liveCount} live, ${closedCount} closed)`);
-		const rightText = truncateToWidth(this.renderFilterControls(), width, "");
+	private renderTitleLine(width: number, counts: BrowserCounts): string {
+		const leftText = this.theme.bold(
+			`  Pi Threads (${counts.live} live, ${counts.closed} closed, ${counts.stale} stale, ${counts.archived} archived)`,
+		);
+		const rightText = truncateToWidth(this.renderCompactFilterControls(), width, "");
 		const availableLeft = Math.max(0, width - visibleWidth(rightText) - 1);
 		const left = truncateToWidth(leftText, availableLeft, "");
 		const spacing = Math.max(0, width - visibleWidth(left) - visibleWidth(rightText));
 		return `${left}${" ".repeat(spacing)}${rightText}`;
 	}
 
-	private renderFilterControls(): string {
+	private renderCompactFilterControls(): string {
 		const t = this.theme;
-		const option = (filter: StateFilter, label: string): string => {
-			const marker = this.filter === filter ? "◉" : "○";
-			const text = `${marker} ${label}`;
-			return this.filter === filter ? t.fg("accent", text) : t.fg("muted", text);
-		};
-
-		return `${t.fg("muted", "State: ")}${option("all", "All")}${t.fg("muted", " | ")}${option("live", "Live")}${t.fg("muted", " | ")}${option("closed", "Closed")}`;
+		return `${t.fg("muted", "Status: ")}${t.fg("accent", formatFilterValue(this.statusFilter))}${t.fg("muted", " · Visibility: ")}${t.fg("accent", formatFilterValue(this.visibilityFilter))}`;
 	}
 
 	private renderHelpLines(width: number): string[] {
+		return this.renderHelpItems(THREAD_HELP_ITEMS, width);
+	}
+
+	private renderHelpItems(items: readonly string[], width: number): string[] {
 		const availableWidth = Math.max(1, width);
 		const indent = "  ";
 		const separator = " · ";
 		const lines: string[] = [];
 		let currentLine = "";
 
-		for (const item of THREAD_HELP_ITEMS) {
+		for (const item of items) {
 			const candidate = currentLine
 				? `${currentLine}${separator}${item}`
 				: visibleWidth(`${indent}${item}`) <= availableWidth
@@ -335,6 +354,10 @@ export class ThreadsTreeComponent implements Component {
 		if (currentLine) lines.push(...wrapTextWithAnsi(currentLine.trimEnd(), availableWidth));
 
 		return lines.map((line) => this.theme.fg("muted", line));
+	}
+
+	private fitToWidth(lines: readonly string[], width: number): string[] {
+		return lines.map((line) => truncateToWidth(line, width, ""));
 	}
 
 	private renderBorder(width: number): string[] {
@@ -356,22 +379,32 @@ export class ThreadsTreeComponent implements Component {
 		const title = isSelected
 			? t.bold(t.fg("accent", formatThreadTitle(thread)))
 			: t.fg("accent", formatThreadTitle(thread));
-		const userStatus = formatThreadUserStatus(thread);
+		const userStatus = browserStatus(thread);
 		const statusColor =
-			userStatus === "working" ? "accent" : userStatus === "failed" ? "error" : "success";
+			userStatus === "working"
+				? "accent"
+				: userStatus === "failed"
+					? "error"
+					: userStatus === "stale"
+						? "warning"
+						: "success";
 		const status = t.fg(statusColor, userStatus);
+		const archived = thread.archived ? ` ${t.fg("muted", "[archived]")}` : "";
 		const summary = t.fg("muted", formatThreadSummary(thread, 90));
 		const path = t.fg("dim", thread.path);
-		const line = `${cursor}${prefix}${badge} ${title}  ${status}  ${path} ${summary}`;
+		const line = `${cursor}${prefix}${badge} ${title}  ${status}${archived}  ${path} ${summary}`;
 		const themed = isSelected ? t.bg("selectedBg", line) : line;
 		return truncateToWidth(themed, width, "");
 	}
 
 	private filteredThreads(): readonly ThreadSnapshot[] {
-		const stateFiltered =
-			this.filter === "all"
-				? this.threads
-				: this.threads.filter((thread) => thread.state === this.filter);
+		const visibleThreads = this.threads.filter((thread) => {
+			if (this.visibilityFilter === "all") return true;
+			return thread.archived === (this.visibilityFilter === "archived");
+		});
+		const stateFiltered = visibleThreads.filter((thread) =>
+			matchesStatusFilter(thread, this.statusFilter),
+		);
 		const query = this.searchQuery.trim().toLowerCase();
 		if (query === "") return stateFiltered;
 		const tokens = query.split(/\s+/u).filter(Boolean);
@@ -381,6 +414,9 @@ export class ThreadsTreeComponent implements Component {
 				thread.name,
 				thread.taskName,
 				thread.path,
+				browserStatus(thread),
+				thread.archived ? "archived" : "active",
+				thread.session.kind === "known" ? thread.session.file : "",
 				formatThreadSummary(thread, 160),
 			]
 				.join(" ")
@@ -391,13 +427,81 @@ export class ThreadsTreeComponent implements Component {
 
 	private emptyMessage(): string {
 		if (this.threads.length === 0) return "  No threads";
-		const filterCount = this.threads.filter((thread) => thread.state === this.filter).length;
-		if (this.filter !== "all" && filterCount === 0) return `  No ${this.filter} threads`;
+		const visibleCount = this.threads.filter((thread) => {
+			if (this.visibilityFilter === "all") return true;
+			return thread.archived === (this.visibilityFilter === "archived");
+		}).length;
+		if (visibleCount === 0) return `  No ${this.visibilityFilter} threads`;
+		const filterCount = this.threads.filter((thread) =>
+			matchesStatusFilter(thread, this.statusFilter),
+		).length;
+		if (this.statusFilter !== "all" && filterCount === 0)
+			return `  No ${this.statusFilter} threads`;
 		return "  No matching threads";
 	}
 
 	private selectedThread(): ThreadSnapshot | undefined {
 		return this.filteredThreads()[this.selectedIndex];
+	}
+
+	private renderSelectedDetails(width: number): string[] {
+		const thread = this.selectedThread();
+		if (thread === undefined) return [];
+
+		const t = this.theme;
+		const runtime = toThreadRuntimeSnapshot(thread, { detail: "summary" });
+		const children = this.threads.filter(
+			(candidate) => candidate.parentPath === thread.path,
+		).length;
+		const parentManaged = this.threads.some((candidate) => candidate.path === thread.parentPath);
+		const lines = [
+			`Selected: ${formatThreadTitle(thread)}  ${thread.path}`,
+			`State: ${browserStateText(thread)}  Archived: ${thread.archived ? "yes" : "no"}  Saved session: ${thread.session.kind === "known" ? "yes" : "no"}  Resumable: ${thread.state === "closed" && thread.session.kind === "known" ? "yes" : "no"}  Children: ${children}`,
+			`Parent: ${thread.parentPath}${parentManaged ? " (managed)" : ""}`,
+			`Cwd: ${thread.cwd}`,
+		];
+		if (thread.session.kind === "known") lines.push(`Session: ${thread.session.file}`);
+		if (runtime.result.text !== null) lines.push(`Result: ${runtime.result.text}`);
+
+		const rendered = lines.map((line) => truncateToWidth(t.fg("muted", `  ${line}`), width));
+		const recentEvents = thread.recentEvents.slice(-5);
+		if (recentEvents.length === 0)
+			return [...rendered, truncateToWidth(t.fg("muted", "  Timeline: none"), width)];
+
+		rendered.push(truncateToWidth(t.fg("muted", "  Timeline:"), width));
+		for (const event of recentEvents) {
+			rendered.push(truncateToWidth(t.fg("muted", `  - ${formatThreadEvent(event)}`), width));
+		}
+		return rendered;
+	}
+
+	private selectParentThread(): void {
+		const thread = this.selectedThread();
+		if (thread === undefined || thread.parentPath === "/root") return;
+		if (!this.selectVisiblePath(thread.parentPath)) {
+			this.notify("Parent thread is hidden by the current filters or search.", "info");
+		}
+	}
+
+	private selectFirstChildThread(): void {
+		const thread = this.selectedThread();
+		if (thread === undefined) return;
+		const child = this.filteredThreads()
+			.filter((candidate) => candidate.parentPath === thread.path)
+			.toSorted((left, right) => left.path.localeCompare(right.path))[0];
+		if (child === undefined) {
+			this.notify("No visible child thread for the selected row.", "info");
+			return;
+		}
+		this.selectVisiblePath(child.path);
+	}
+
+	private selectVisiblePath(threadPath: ThreadPath): boolean {
+		const index = this.filteredThreads().findIndex((thread) => thread.path === threadPath);
+		if (index < 0) return false;
+		this.selectedIndex = index;
+		this.rerender();
+		return true;
 	}
 
 	private async handlePoll(): Promise<void> {
@@ -407,71 +511,12 @@ export class ThreadsTreeComponent implements Component {
 		try {
 			const updated = await this.manager.poll(thread.path);
 			if (this.closed) return;
-			this.notify(
-				`Polled ${formatThreadTitle(updated)} — ${formatThreadUserStatus(updated)}`,
-				"info",
-			);
+			this.notify(`Polled ${formatThreadTitle(updated)} — ${browserStatus(updated)}`, "info");
 			this.replaceThread(updated);
 			this.rerender();
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
 			this.notify(`Poll failed: ${message}`, "error");
-		}
-	}
-
-	private async handleEnterThread(): Promise<void> {
-		const thread = this.selectedThread();
-		if (!thread) return;
-		const parentSessionFile = this.ctx.sessionManager.getSessionFile();
-		if (parentSessionFile === undefined) {
-			this.notify(
-				"Cannot enter a thread from a --no-session Pi session because there is no saved parent session to return to.",
-				"warning",
-			);
-			this.rerender();
-			return;
-		}
-
-		try {
-			const updated = await this.manager.poll(thread.path);
-			if (this.closed) return;
-			this.replaceThread(updated);
-			if (updated.session.kind !== "known") {
-				this.notify(`Thread session is not ready yet: ${formatThreadTitle(updated)}`, "warning");
-				this.rerender();
-				return;
-			}
-
-			const sessionFile = updated.session.file;
-			const threadTitle = formatThreadTitle(updated);
-			if (updated.state === "live") {
-				this.notify(
-					`Thread ${threadTitle} is still live. Stop it with Ctrl+X or wait for it to close before opening its session.`,
-					"warning",
-				);
-				this.rerender();
-				return;
-			}
-
-			this.close(null);
-			await this.ctx.switchSession(sessionFile, {
-				withSession: async (nextCtx) => {
-					await nextCtx.sendMessage({
-						customType: PI_THREAD_ENTRY_MESSAGE_TYPE,
-						content: `Entered Pi thread "${threadTitle}". Use /exit to return to the parent session.`,
-						display: true,
-						details: {
-							parentSessionFile,
-							threadId: updated.id,
-							threadPath: updated.path,
-							threadTitle,
-						},
-					});
-				},
-			});
-		} catch (err: unknown) {
-			const message = err instanceof Error ? err.message : String(err);
-			this.notify(`Enter failed: ${message}`, "error", { allowClosed: true });
 		}
 	}
 
@@ -493,11 +538,12 @@ export class ThreadsTreeComponent implements Component {
 	private replaceThread(thread: ThreadSnapshot): void {
 		const index = this.threads.findIndex((candidate) => candidate.id === thread.id);
 		if (index >= 0) this.threads[index] = thread;
+		else this.threads.push(thread);
 	}
 
 	private refreshList(): void {
 		if (this.closed) return;
-		this.threads = [...this.manager.list({ action: "list", state: "all" })];
+		this.threads = [...this.manager.list({ action: "list", state: "all", visibility: "all" })];
 		this.selectedIndex = Math.min(
 			this.selectedIndex,
 			Math.max(0, this.filteredThreads().length - 1),
@@ -505,10 +551,25 @@ export class ThreadsTreeComponent implements Component {
 		this.rerender();
 	}
 
-	private cycleFilter(): void {
-		const currentIndex = FILTER_CYCLE.indexOf(this.filter);
-		this.filter = FILTER_CYCLE[(currentIndex + 1) % FILTER_CYCLE.length]!;
-		this.refreshList();
+	private cycleStatusFilter(): void {
+		const currentIndex = STATUS_FILTER_CYCLE.indexOf(this.statusFilter);
+		this.statusFilter = STATUS_FILTER_CYCLE[(currentIndex + 1) % STATUS_FILTER_CYCLE.length]!;
+		this.selectedIndex = Math.min(
+			this.selectedIndex,
+			Math.max(0, this.filteredThreads().length - 1),
+		);
+		this.rerender();
+	}
+
+	private cycleVisibilityFilter(): void {
+		const currentIndex = VISIBILITY_FILTER_CYCLE.indexOf(this.visibilityFilter);
+		this.visibilityFilter =
+			VISIBILITY_FILTER_CYCLE[(currentIndex + 1) % VISIBILITY_FILTER_CYCLE.length]!;
+		this.selectedIndex = Math.min(
+			this.selectedIndex,
+			Math.max(0, this.filteredThreads().length - 1),
+		);
+		this.rerender();
 	}
 
 	private rerender(): void {
@@ -551,7 +612,7 @@ async function showThreadsRpc(
 		const badge = formatThreadStateBadge(thread, {
 			fg: (color: string, text: string) => theme.fg(color as never, text),
 		});
-		return `${badge} ${formatThreadTitle(thread)} — ${thread.path}`;
+		return `${badge} ${formatThreadTitle(thread)} — ${browserStatus(thread)}${thread.archived ? " archived" : ""} — ${thread.path}`;
 	});
 
 	const choice = await ctx.ui.select("Select a thread to inspect:", options);
@@ -568,6 +629,49 @@ async function showThreadsRpc(
 		const message = err instanceof Error ? err.message : String(err);
 		ctx.ui.notify(`Poll failed: ${message}`, "error");
 	}
+}
+
+type BrowserCounts = {
+	readonly live: number;
+	readonly closed: number;
+	readonly stale: number;
+	readonly failed: number;
+	readonly archived: number;
+};
+
+function browserCounts(threads: readonly ThreadSnapshot[]): BrowserCounts {
+	return {
+		live: threads.filter((thread) => thread.state === "live").length,
+		closed: threads.filter((thread) => thread.state === "closed").length,
+		stale: threads.filter((thread) => browserStatus(thread) === "stale").length,
+		failed: threads.filter((thread) => browserStatus(thread) === "failed").length,
+		archived: threads.filter((thread) => thread.archived).length,
+	};
+}
+
+function browserStatus(thread: ThreadSnapshot): BrowserStatus {
+	if (thread.state === "live") return thread.phase === "idle" ? "idle" : "working";
+	if (thread.exit.kind === "stale") return "stale";
+	if (isThreadExitFailed(thread.exit)) return "failed";
+	return "done";
+}
+
+function browserStateText(thread: ThreadSnapshot): string {
+	if (thread.state === "live") return `live/${thread.phase}`;
+	if (thread.exit.kind === "stale") return "closed/stale";
+	if (isThreadExitFailed(thread.exit)) return "closed/failed";
+	return `closed/${thread.exit.kind}`;
+}
+
+function matchesStatusFilter(thread: ThreadSnapshot, filter: StatusFilter): boolean {
+	if (filter === "all") return true;
+	if (filter === "live") return thread.state === "live";
+	if (filter === "closed") return thread.state === "closed";
+	return browserStatus(thread) === filter;
+}
+
+function formatFilterValue(value: StatusFilter | VisibilityFilter): string {
+	return value.slice(0, 1).toUpperCase() + value.slice(1);
 }
 
 function treePrefix(thread: ThreadSnapshot, visibleThreads: readonly ThreadSnapshot[]): string {

@@ -1,27 +1,25 @@
-import * as path from "node:path";
-import type {
-	ExtensionAPI,
-	ExtensionCommandContext,
-	ExtensionContext,
-	SessionShutdownEvent,
+import * as fs from "node:fs";
+import {
+	SessionManager,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type SessionShutdownEvent,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import {
 	DEFAULT_THREAD_DETAIL,
 	assertNever,
-	asThreadId,
-	asThreadPath,
-	isThreadIdText,
 	toThreadRuntimeSnapshot,
 	type ThreadDetail,
-	type ThreadId,
-	type ThreadPath,
 	type ThreadRuntimeSnapshot,
 	type ThreadSnapshot,
 } from "./domain.ts";
 import {
 	formatList,
 	formatPoll,
+	formatArchive,
+	formatFork,
+	formatResume,
 	formatSend,
 	formatStart,
 	formatStop,
@@ -29,10 +27,15 @@ import {
 	formatWaitProgress,
 	formatWait,
 } from "./format.ts";
-import { isRecord, stringField } from "./json.ts";
 import { assertPiThreadParams, PiThreadParamsSchema } from "./schema.ts";
-import { PI_THREAD_ENTRY_MESSAGE_TYPE, registerThreadsCommand } from "./threads-command.ts";
-import { ThreadManager, type ThreadManagerScope, type WaitProgress } from "./thread-manager.ts";
+import { registerThreadsCommand } from "./threads-command.ts";
+import {
+	PI_THREAD_REGISTRY_ENTRY_TYPE,
+	ThreadManager,
+	type ThreadRegistryPersistenceTarget,
+	type ThreadManagerScope,
+	type WaitProgress,
+} from "./thread-manager.ts";
 import { PI_THREAD_DESCRIPTION } from "./prompt.ts";
 
 const PROCESS_MANAGER_KEY = "__piThreadsProcessManager";
@@ -67,16 +70,14 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 
 // ---- Extension entrypoint ----
 
-type ThreadEntryDetails = {
-	readonly parentSessionFile: string | null;
-	readonly threadPath: ThreadPath | null;
-	readonly threadId: ThreadId | null;
-};
-
 type ThreadsSessionShutdownAction =
 	| { readonly kind: "shutdown" }
 	| { readonly kind: "preserve" }
 	| { readonly kind: "stop_target"; readonly thread: ThreadSnapshot };
+
+type ThreadRegistryEntryScope = {
+	readonly sessionId: string;
+};
 
 type SingleThreadResultDetails = {
 	readonly kind: string;
@@ -127,50 +128,6 @@ function listResultDetails(
 	};
 }
 
-function findThreadEntryDetails(ctx: ExtensionContext): ThreadEntryDetails | null {
-	const branch = ctx.sessionManager.getBranch();
-	for (let index = branch.length - 1; index >= 0; index -= 1) {
-		const entry = branch[index];
-		if (!isRecord(entry) || entry["type"] !== "custom_message") continue;
-		if (entry["customType"] !== PI_THREAD_ENTRY_MESSAGE_TYPE) continue;
-		const details = entry["details"];
-		if (!isRecord(details)) continue;
-		const parentSessionFile = stringField(details, "parentSessionFile");
-		const threadPathText = stringField(details, "threadPath");
-		const threadIdText = stringField(details, "threadId");
-		return {
-			parentSessionFile,
-			threadPath: threadPathText === null ? null : parseThreadPath(threadPathText),
-			threadId: threadIdText === null ? null : parseThreadId(threadIdText),
-		};
-	}
-	return null;
-}
-
-function findThreadParentSession(ctx: ExtensionContext): string | null {
-	return findThreadEntryDetails(ctx)?.parentSessionFile ?? null;
-}
-
-function sameSessionFile(left: string, right: string): boolean {
-	return path.resolve(left) === path.resolve(right);
-}
-
-function threadDepth(threadPath: ThreadPath): number {
-	return Math.max(0, threadPath.split("/").filter(Boolean).length - 1);
-}
-
-function parseThreadPath(value: string): ThreadPath | null {
-	try {
-		return asThreadPath(value);
-	} catch {
-		return null;
-	}
-}
-
-function parseThreadId(value: string): ThreadId | null {
-	return isThreadIdText(value) ? asThreadId(value) : null;
-}
-
 function scopeForThread(thread: ThreadSnapshot): ThreadManagerScope {
 	return {
 		currentPath: thread.path,
@@ -180,6 +137,7 @@ function scopeForThread(thread: ThreadSnapshot): ThreadManagerScope {
 }
 
 export function syncThreadManagerScope(ctx: ExtensionContext, manager: ThreadManager): void {
+	if (typeof manager.hydrateFromSession === "function") manager.hydrateFromSession(ctx);
 	const sessionFile = ctx.sessionManager.getSessionFile();
 	if (sessionFile !== undefined) {
 		const managedThread = manager.findBySessionFile(sessionFile);
@@ -187,16 +145,6 @@ export function syncThreadManagerScope(ctx: ExtensionContext, manager: ThreadMan
 			manager.rebindScope(scopeForThread(managedThread));
 			return;
 		}
-	}
-
-	const entryDetails = findThreadEntryDetails(ctx);
-	if (entryDetails !== null && entryDetails.threadPath !== null) {
-		manager.rebindScope({
-			currentPath: entryDetails.threadPath,
-			depth: threadDepth(entryDetails.threadPath),
-			selfThreadId: entryDetails.threadId,
-		});
-		return;
 	}
 
 	manager.resetScope();
@@ -216,11 +164,6 @@ export function getThreadsSessionShutdownAction(
 		return targetThread.state === "live"
 			? { kind: "stop_target", thread: targetThread }
 			: { kind: "preserve" };
-	}
-
-	const parentSessionFile = findThreadParentSession(ctx);
-	if (parentSessionFile !== null && sameSessionFile(parentSessionFile, targetSessionFile)) {
-		return { kind: "preserve" };
 	}
 
 	return { kind: "shutdown" };
@@ -265,44 +208,47 @@ export async function prepareThreadsForSessionShutdown(
 	}
 }
 
-type MissingParentExitBehavior = "shutdown" | "warn";
+function appendThreadRegistrySnapshot(
+	pi: ExtensionAPI,
+	snapshot: ThreadSnapshot,
+	scope: ThreadRegistryEntryScope | null,
+	target: ThreadRegistryPersistenceTarget | null,
+): void {
+	const data = {
+		version: 1,
+		kind: "thread_snapshot",
+		snapshot,
+		...(scope === null ? {} : { scope }),
+	};
 
-async function exitThreadSession(
-	ctx: ExtensionCommandContext,
-	missingParentBehavior: MissingParentExitBehavior,
-): Promise<void> {
-	const parentSessionFile = findThreadParentSession(ctx);
-	if (parentSessionFile === null) {
-		if (missingParentBehavior === "shutdown") {
-			ctx.shutdown();
-			return;
-		}
-		ctx.ui.notify("No parent Pi thread session is recorded. Use /quit to quit Pi.", "warning");
+	if (target === null || target.isCurrentSession) {
+		if (typeof pi.appendEntry !== "function") return;
+		pi.appendEntry(PI_THREAD_REGISTRY_ENTRY_TYPE, data);
 		return;
 	}
-	await ctx.switchSession(parentSessionFile);
+
+	if (target.sessionFile === null || !fs.existsSync(target.sessionFile)) return;
+	SessionManager.open(target.sessionFile, target.sessionDir ?? undefined).appendCustomEntry(
+		PI_THREAD_REGISTRY_ENTRY_TYPE,
+		data,
+	);
 }
 
 export default function (pi: ExtensionAPI) {
 	const manager = getProcessManager();
+	if (typeof manager.setPersistence === "function") {
+		manager.setPersistence({
+			appendSnapshot: (snapshot, scope, target) =>
+				appendThreadRegistrySnapshot(pi, snapshot, scope, target),
+		});
+	}
 
 	registerThreadsCommand(pi, manager, {
 		beforeUse: (ctx) => syncThreadManagerScope(ctx, manager),
-		exit: (ctx) => exitThreadSession(ctx, "warn"),
 	});
 
 	pi.on("session_start", (_event, ctx) => {
 		syncThreadManagerScope(ctx, manager);
-	});
-
-	pi.registerMessageRenderer(PI_THREAD_ENTRY_MESSAGE_TYPE, (message, _options, theme) => {
-		const text = typeof message.content === "string" ? message.content : "Entered Pi thread.";
-		return new Text(theme.fg("muted", text), 1, 0);
-	});
-
-	pi.registerCommand("exit", {
-		description: "Exit a Pi thread, or quit Pi when no parent thread session is recorded",
-		handler: async (_args, ctx) => exitThreadSession(ctx, "shutdown"),
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {
@@ -360,6 +306,27 @@ export default function (pi: ExtensionAPI) {
 						details: withThreadResultDetails(outcome),
 					};
 				}
+				case "resume": {
+					const outcome = await manager.resume(params, ctx);
+					return {
+						content: [{ type: "text", text: formatResume(outcome) }],
+						details: withThreadResultDetails(outcome),
+					};
+				}
+				case "fork": {
+					const outcome = await manager.fork(params, ctx);
+					return {
+						content: [{ type: "text", text: formatFork(outcome) }],
+						details: withThreadResultDetails(outcome),
+					};
+				}
+				case "archive": {
+					const outcome = manager.archive(params);
+					return {
+						content: [{ type: "text", text: formatArchive(outcome) }],
+						details: withThreadResultDetails(outcome),
+					};
+				}
 				case "wait": {
 					const detail = params.detail ?? DEFAULT_THREAD_DETAIL;
 					const waitOptions = {
@@ -398,7 +365,19 @@ export default function (pi: ExtensionAPI) {
 					if (taskName) text += " " + theme.fg("muted", `[${taskName}]`);
 					break;
 				}
+				case "fork": {
+					const id = typeof args["id"] === "string" ? args["id"] : "";
+					const entryId = typeof args["entryId"] === "string" ? args["entryId"] : "";
+					const taskName =
+						"taskName" in args && typeof args["taskName"] === "string" ? args["taskName"] : "";
+					if (id) text += " " + theme.fg("accent", id);
+					if (entryId) text += " " + theme.fg("muted", `entry:${entryId}`);
+					if (taskName) text += " " + theme.fg("muted", `[${taskName}]`);
+					break;
+				}
 				case "poll":
+				case "resume":
+				case "archive":
 				case "stop": {
 					const id = typeof args["id"] === "string" ? args["id"] : "";
 					if (id) text += " " + theme.fg("accent", id);
