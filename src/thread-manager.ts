@@ -15,6 +15,7 @@ import {
 	nowIso,
 	threadPathBasename,
 	type ClosedThreadSnapshot,
+	type KnownThreadSession,
 	type LiveThreadSnapshot,
 	type ThreadEvent,
 	type ThreadExit,
@@ -137,57 +138,41 @@ export type ThreadManagerScope = {
 	readonly selfThreadId: ThreadId | null;
 };
 
-export type StartOutcome = {
-	readonly kind: "started";
-	readonly promptAccepted: boolean;
-	readonly note: string | null;
+type ThreadOutcomeBase<K extends string> = {
+	readonly kind: K;
 	readonly thread: ThreadSnapshot;
 	readonly snapshot: ThreadRuntimeSnapshot;
 };
 
-export type SendOutcome = {
-	readonly kind: "sent";
+export type StartOutcome = ThreadOutcomeBase<"started"> & {
+	readonly promptAccepted: boolean;
+	readonly note: string | null;
+};
+
+export type SendOutcome = ThreadOutcomeBase<"sent"> & {
 	readonly mode: SendMode;
 	readonly accepted: boolean;
 	readonly error: string | null;
-	readonly thread: ThreadSnapshot;
-	readonly snapshot: ThreadRuntimeSnapshot;
 };
 
-export type StopOutcome = {
-	readonly kind: "stopped";
-	readonly thread: ThreadSnapshot;
-	readonly snapshot: ThreadRuntimeSnapshot;
-};
+export type StopOutcome = ThreadOutcomeBase<"stopped">;
 
-export type ResumeOutcome = {
-	readonly kind: "resumed";
+export type ResumeOutcome = ThreadOutcomeBase<"resumed"> & {
 	readonly alreadyLive: boolean;
-	readonly thread: ThreadSnapshot;
-	readonly snapshot: ThreadRuntimeSnapshot;
 };
 
-export type ForkOutcome = {
-	readonly kind: "forked";
+export type ForkOutcome = ThreadOutcomeBase<"forked"> & {
 	readonly sourceSessionFile: string;
 	readonly sourceEntryId: string | null;
-	readonly thread: ThreadSnapshot;
-	readonly snapshot: ThreadRuntimeSnapshot;
 };
 
-export type ArchiveOutcome = {
-	readonly kind: "archived";
+export type ArchiveOutcome = ThreadOutcomeBase<"archived"> & {
 	readonly archived: boolean;
-	readonly thread: ThreadSnapshot;
-	readonly snapshot: ThreadRuntimeSnapshot;
 };
 
-export type WaitOutcome = {
-	readonly kind: "waited";
+export type WaitOutcome = ThreadOutcomeBase<"waited"> & {
 	readonly timedOut: boolean;
 	readonly waitedMs: number;
-	readonly thread: ThreadSnapshot;
-	readonly snapshot: ThreadRuntimeSnapshot;
 };
 
 export type WaitProgress = {
@@ -272,7 +257,7 @@ type ForkSource = {
 
 type ForkedManagedSession = {
 	readonly cwd: string;
-	readonly session: Extract<ThreadSession, { readonly kind: "known" }>;
+	readonly session: KnownThreadSession;
 	readonly sourceEntryId: string | null;
 };
 
@@ -1491,7 +1476,7 @@ function liveThreadDurabilitySignature(thread: LiveThread): string {
 function prepareManagedChildSession(
 	ctx: ExtensionContext,
 	cwd: string,
-): { readonly session: Extract<ThreadSession, { readonly kind: "known" }> } | null {
+): { readonly session: KnownThreadSession } | null {
 	const parentSessionFile = safeGetSessionFile(ctx);
 	if (parentSessionFile === undefined) return null;
 

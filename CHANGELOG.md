@@ -19,3 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   test.
 - Package peer dependency ranges now document the tested Pi and TypeBox
   compatibility window.
+- `/threads` usage/docs now clarify that the command is observability-first, not
+  a manual thread lifecycle control surface.
+- Public thread snapshot typings now use shared base interfaces to reduce
+  duplicated domain shape definitions.

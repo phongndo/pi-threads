@@ -54,6 +54,9 @@ tools:
 
 Example tool calls:
 
+These examples show the structured `thread` tool calls Pi can make. They are not
+manual `/threads ...` slash-command syntax.
+
 ```json
 {
   "action": "start",
@@ -159,6 +162,9 @@ Use `/threads` in Pi's TUI to open an interactive observability browser for the
 current session. It loads all known threads, including archived entries, and
 defaults to active visibility.
 Other arguments show usage instead of silently falling back to the browser. The
+command intentionally does not provide `/threads start`, `/threads send`, or
+other manual lifecycle subcommands; describe the work you want in natural
+language and let Pi manage thread orchestration through the `thread` tool. The
 TUI opens with no arguments and uses Pi's native editor-replacement surface, so
 the parent chat remains visible while browsing.
 

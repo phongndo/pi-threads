@@ -113,7 +113,10 @@ describe("/threads command", () => {
 		} as unknown as ExtensionCommandContext);
 
 		expect(list).not.toHaveBeenCalled();
-		expect(notify).toHaveBeenCalledWith("Usage: /threads", "error");
+		expect(notify).toHaveBeenCalledWith(
+			expect.stringContaining("Use /threads to observe managed Pi threads."),
+			"error",
+		);
 	});
 
 	it("rejects removed state filter arguments", async () => {
@@ -136,7 +139,51 @@ describe("/threads command", () => {
 		} as unknown as ExtensionCommandContext);
 
 		expect(list).not.toHaveBeenCalled();
-		expect(notify).toHaveBeenCalledWith("Usage: /threads", "error");
+		expect(notify).toHaveBeenCalledWith(
+			expect.stringContaining("Thread lifecycle is managed by Pi through the thread tool."),
+			"error",
+		);
+	});
+
+	it("rejects lifecycle-looking shorthand arguments to keep /threads observability-only", async () => {
+		let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
+		const list = vi.fn(() => [thread()]);
+		const notify = vi.fn();
+		const pi = {
+			registerCommand: (name: string, options: Parameters<ExtensionAPI["registerCommand"]>[1]) => {
+				if (name === "threads") handler = options.handler;
+			},
+		} as unknown as ExtensionAPI;
+
+		registerThreadsCommand(pi, { list } as unknown as ThreadManager);
+		if (handler === undefined) throw new Error("/threads command was not registered");
+		const registeredHandler = handler;
+
+		await Promise.all(
+			[
+				"start Review docs",
+				"poll review_docs",
+				"wait review_docs 30s",
+				"send review_docs Continue",
+				"stop review_docs --force",
+				"resume review_docs",
+				"fork review_docs",
+				"archive review_docs",
+			].map((args) =>
+				registeredHandler(args, {
+					mode: "print",
+					hasUI: false,
+					ui: { notify },
+				} as unknown as ExtensionCommandContext),
+			),
+		);
+
+		expect(list).not.toHaveBeenCalled();
+		expect(notify).toHaveBeenCalledTimes(8);
+		expect(notify).toHaveBeenLastCalledWith(
+			expect.stringContaining("Ask Pi what you want done in natural language."),
+			"error",
+		);
 	});
 
 	it("opens the TUI browser as a native editor replacement", async () => {

@@ -10,21 +10,36 @@ export const ROOT_THREAD_PATH = asThreadPath("/root");
 
 export type ThreadPhase = "starting" | "busy" | "idle" | "stopping";
 
-export type ThreadSession =
-	| { readonly kind: "unknown" }
-	| {
-			readonly kind: "known";
-			readonly file: string;
-			readonly id: string;
-			readonly name: string | null;
-			readonly pendingMessageCount: number | null;
-	  };
+export interface UnknownThreadSession {
+	readonly kind: "unknown";
+}
+
+export interface KnownThreadSession {
+	readonly kind: "known";
+	readonly file: string;
+	readonly id: string;
+	readonly name: string | null;
+	readonly pendingMessageCount: number | null;
+}
+
+export type ThreadSession = UnknownThreadSession | KnownThreadSession;
+
+type ProcessThreadExit<K extends "exited" | "stopped"> = {
+	readonly kind: K;
+	readonly code: number | null;
+	readonly signal: string | null;
+};
+
+type MessageThreadExit<K extends "stale" | "failed"> = {
+	readonly kind: K;
+	readonly message: string;
+};
 
 export type ThreadExit =
-	| { readonly kind: "exited"; readonly code: number | null; readonly signal: string | null }
-	| { readonly kind: "stopped"; readonly code: number | null; readonly signal: string | null }
-	| { readonly kind: "stale"; readonly message: string }
-	| { readonly kind: "failed"; readonly message: string };
+	| ProcessThreadExit<"exited">
+	| ProcessThreadExit<"stopped">
+	| MessageThreadExit<"stale">
+	| MessageThreadExit<"failed">;
 
 export type ThreadEvent =
 	| {
@@ -96,8 +111,7 @@ export type ThreadEvent =
 			readonly message: string;
 	  };
 
-export type LiveThreadSnapshot = {
-	readonly state: "live";
+export interface ThreadSnapshotBase {
 	readonly id: ThreadId;
 	readonly name: string;
 	readonly taskName: string;
@@ -110,35 +124,23 @@ export type LiveThreadSnapshot = {
 	readonly args: readonly string[];
 	readonly createdAt: string;
 	readonly lastEventAt: string;
+	readonly session: ThreadSession;
+	readonly lastAssistantText: string | null;
+	readonly recentEvents: readonly ThreadEvent[];
+	readonly stderrTail: string;
+}
+
+export interface LiveThreadSnapshot extends ThreadSnapshotBase {
+	readonly state: "live";
 	readonly pid: number;
 	readonly phase: ThreadPhase;
-	readonly session: ThreadSession;
-	readonly lastAssistantText: string | null;
 	readonly lastPartialText: string | null;
-	readonly recentEvents: readonly ThreadEvent[];
-	readonly stderrTail: string;
-};
+}
 
-export type ClosedThreadSnapshot = {
+export interface ClosedThreadSnapshot extends ThreadSnapshotBase {
 	readonly state: "closed";
-	readonly id: ThreadId;
-	readonly name: string;
-	readonly taskName: string;
-	readonly path: ThreadPath;
-	readonly parentPath: ThreadPath;
-	readonly parentThreadId: ThreadId | null;
-	readonly depth: number;
-	readonly archived: boolean;
-	readonly cwd: string;
-	readonly args: readonly string[];
-	readonly createdAt: string;
-	readonly lastEventAt: string;
 	readonly exit: ThreadExit;
-	readonly session: ThreadSession;
-	readonly lastAssistantText: string | null;
-	readonly recentEvents: readonly ThreadEvent[];
-	readonly stderrTail: string;
-};
+}
 
 export type ThreadSnapshot = LiveThreadSnapshot | ClosedThreadSnapshot;
 

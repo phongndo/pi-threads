@@ -149,6 +149,30 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
     controls,
   - easier parent/child navigation.
 
+## 10. Product alignment and code-quality polish
+
+- [x] Keep `/threads` observability-first; do not expose user-facing lifecycle
+      subcommands such as `/threads start`, `/threads send`, or
+      `/threads resume`.
+- [x] Ensure user-facing UI only supports safe observation, navigation,
+      refresh/poll, and emergency stop; keep start/send/resume/fork/archive as
+      agent/tool-level orchestration primitives.
+- [x] Improve usage/help copy so users understand the intended model: describe
+      intent naturally, then Pi manages threads through the `thread` tool.
+- [x] Refactor duplicated public thread snapshot shapes with shared base
+      interfaces while preserving plain JSON/discriminated-union boundaries.
+- [x] Audit discriminated unions vs classes/interfaces.
+  - Keep discriminated unions for serialized/domain data such as events,
+    exits, sessions, snapshots, tool params, and result details.
+  - Prefer `interface extends` for shared DTO fields.
+  - Consider classes only for internal behavior-heavy collaborators that do not
+    cross the JSON/session/tool-result boundary.
+- [ ] Split `ThreadManager` responsibilities where practical without a risky
+      rewrite, e.g. target resolution, durable registry persistence, launch
+      preparation, and snapshot helpers.
+- [x] Add regression tests for product boundaries so shorthand-looking
+      lifecycle arguments continue to be rejected.
+
 ## 11. Safety and resource controls
 
 - [ ] Keep per-session concurrency limits.
@@ -169,4 +193,4 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
 7. Explicit no-inherited-context behavior.
 8. Pi-native resume/fork/archive semantics.
 9. `/threads` browser improvements.
-10. Manual shorthand invocation.
+10. Product alignment and code-quality polish.

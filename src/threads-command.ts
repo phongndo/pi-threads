@@ -47,6 +47,13 @@ const THREAD_HELP_ITEMS = [
 	"type search",
 	"esc close",
 ];
+const THREADS_COMMAND_USAGE = [
+	"Usage: /threads",
+	"",
+	"Use /threads to observe managed Pi threads.",
+	"Thread lifecycle is managed by Pi through the thread tool.",
+	"Ask Pi what you want done in natural language.",
+].join("\n");
 
 export function registerThreadsCommand(
 	pi: ExtensionAPI,
@@ -59,10 +66,10 @@ export function registerThreadsCommand(
 		description: "Browse Pi threads interactively",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			options.beforeUse?.(ctx);
-			const trimmed = args?.trim().toLowerCase() || "";
+			const trimmed = args?.trim() || "";
 			const command = parseThreadsCommand(trimmed);
 			if (command === null) {
-				ctx.ui.notify("Usage: /threads", "error");
+				ctx.ui.notify(THREADS_COMMAND_USAGE, "error");
 				return;
 			}
 

@@ -591,11 +591,24 @@ describe("session shutdown thread lifecycle", () => {
 });
 
 describe("thread commands", () => {
-	it("does not register user-facing thread exit commands", () => {
+	it("registers only the observability browser as a user-facing thread command", () => {
 		const handlers = registeredCommandHandlers();
 
+		expect(handlers.has("threads")).toBe(true);
+		for (const name of [
+			"thread",
+			"thread_start",
+			"thread_poll",
+			"thread_wait",
+			"thread_send",
+			"thread_stop",
+			"thread_resume",
+			"thread_fork",
+			"thread_archive",
+		]) {
+			expect(handlers.has(name)).toBe(false);
+		}
 		expect(handlers.has("exit")).toBe(false);
-		expect(handlers.has("thread")).toBe(false);
 	});
 });
 
