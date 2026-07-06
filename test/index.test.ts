@@ -642,30 +642,82 @@ describe("thread tool rendering", () => {
 					.trimEnd(),
 			).toBe('thread start "Draft a plan"');
 			expect(
+				renderCall(
+					{ action: "start", name: "Review docs", prompt: "Verbose implementation prompt" },
+					theme,
+				)
+					.render(80)
+					.join("\n")
+					.trimEnd(),
+			).toBe('thread start "Review docs"');
+			expect(
 				renderCall({ action: "list", state: "all" }, theme).render(80).join("\n").trimEnd(),
 			).toBe("thread list");
 			expect(
 				renderCall({ action: "wait", timeoutMs: 1500 }, theme).render(80).join("\n").trimEnd(),
-			).toBe("thread wait 1.5s");
+			).toBe("thread wait");
 			expect(
 				renderCall({ action: "wait", id: "/root/review_tests", timeoutMs: 1500 }, theme)
 					.render(80)
 					.join("\n")
 					.trimEnd(),
-			).toBe("thread wait /root/review_tests 1.5s");
+			).toBe("thread wait review_tests");
 			expect(
-				renderCall({ action: "send", id: "review_tests", message: "Check failures" }, theme)
+				renderCall(
+					{ action: "send", id: "review_tests", mode: "follow_up", message: "Check failures" },
+					theme,
+				)
 					.render(80)
 					.join("\n")
 					.trimEnd(),
-			).toBe('thread send review_tests "Check failures"');
+			).toBe("thread send review_tests");
+			expect(
+				renderCall(
+					{
+						action: "send",
+						id: "thread_cleanup_job",
+						mode: "follow_up",
+						message: "Check failures",
+					},
+					theme,
+				)
+					.render(80)
+					.join("\n")
+					.trimEnd(),
+			).toBe("thread send thread_cleanup_job");
+			expect(
+				renderCall(
+					{
+						action: "fork",
+						id: "/root/review_tests",
+						entryId: "abc12345",
+						taskName: "forked_review",
+					},
+					theme,
+				)
+					.render(80)
+					.join("\n")
+					.trimEnd(),
+			).toBe("thread fork review_tests");
+			expect(
+				renderCall({ action: "stop", id: "/root/review_tests", force: true }, theme)
+					.render(80)
+					.join("\n")
+					.trimEnd(),
+			).toBe("thread stop review_tests force");
+			expect(
+				renderCall({ action: "archive", id: "/root/review_tests", archived: false }, theme)
+					.render(80)
+					.join("\n")
+					.trimEnd(),
+			).toBe("thread unarchive review_tests");
 			expect(listCalls).toBe(0);
 		} finally {
 			restoreManager();
 		}
 	});
 
-	it("renders wait timeouts precisely instead of rounding fractional seconds", () => {
+	it("keeps wait call labels quiet by hiding timeout and detail knobs", () => {
 		let renderCall:
 			| ((
 					args: Record<string, unknown>,
@@ -686,12 +738,11 @@ describe("thread tool rendering", () => {
 		extension(pi);
 
 		const rendered = renderCall?.(
-			{ action: "wait", id: "/root/review_tests", timeoutMs: 1500 },
+			{ action: "wait", id: "/root/review_tests", detail: "full", timeoutMs: 1500 },
 			theme,
 		);
 
-		expect(rendered?.render(80).join("\n")).toContain("1.5s");
-		expect(rendered?.render(80).join("\n")).not.toContain("2s");
+		expect(rendered?.render(80).join("\n").trimEnd()).toBe("thread wait review_tests");
 	});
 
 	it("uses Pi's default result renderer to keep historical thread output plain", () => {

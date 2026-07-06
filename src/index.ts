@@ -9,6 +9,7 @@ import { Text } from "@earendil-works/pi-tui";
 import {
 	DEFAULT_THREAD_DETAIL,
 	assertNever,
+	isThreadIdText,
 	toThreadRuntimeSnapshot,
 	type ThreadDetail,
 	type ThreadRuntimeSnapshot,
@@ -57,13 +58,66 @@ function clearProcessManager(manager: ThreadManager): void {
 	if (store[PROCESS_MANAGER_KEY] === manager) delete store[PROCESS_MANAGER_KEY];
 }
 
-function formatTimeoutMsForTitle(timeoutMs: number): string {
-	if (!Number.isInteger(timeoutMs) || timeoutMs < 1000) return `${timeoutMs}ms`;
-	const wholeSeconds = Math.trunc(timeoutMs / 1000);
-	const milliseconds = timeoutMs % 1000;
-	if (milliseconds === 0) return `${wholeSeconds}s`;
-	const fractionalSeconds = String(milliseconds).padStart(3, "0").replace(/0+$/u, "");
-	return `${wholeSeconds}.${fractionalSeconds}s`;
+function compactInlineText(value: string, maxLength: number): string {
+	let safe = "";
+	for (const char of value) {
+		const code = char.codePointAt(0) ?? 0;
+		safe += code < 0x20 || code === 0x7f ? " " : char;
+	}
+	const compact = safe.replace(/\s+/gu, " ").trim();
+	if (compact.length <= maxLength) return compact;
+	return `${compact.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function quotedPreview(value: string, maxLength = 48): string {
+	const preview = compactInlineText(value, maxLength).replace(/["\\]/gu, "\\$&");
+	return `"${preview}"`;
+}
+
+function compactThreadReference(value: string): string {
+	const trimmed = value.trim();
+	if (trimmed === "") return "";
+
+	const withoutTrailingSlash = trimmed.length > 1 ? trimmed.replace(/\/+$/u, "") : trimmed;
+	if (isThreadIdText(withoutTrailingSlash)) {
+		return withoutTrailingSlash.slice(0, 13);
+	}
+
+	if (!withoutTrailingSlash.includes("/")) return compactInlineText(withoutTrailingSlash, 48);
+	const parts = withoutTrailingSlash.split("/").filter((part) => part !== "");
+	return compactInlineText(parts[parts.length - 1] ?? withoutTrailingSlash, 48);
+}
+
+function stringArg(args: Record<string, unknown>, key: string): string {
+	const value = args[key];
+	return typeof value === "string" ? value : "";
+}
+
+function threadCallActionLabel(args: Record<string, unknown>, action: string): string {
+	return action === "archive" && args["archived"] === false ? "unarchive" : action;
+}
+
+function threadCallTarget(args: Record<string, unknown>, action: string): string {
+	switch (action) {
+		case "poll":
+		case "wait":
+		case "send":
+		case "stop":
+		case "resume":
+		case "archive":
+		case "fork":
+			return compactThreadReference(stringArg(args, "id"));
+		default:
+			return "";
+	}
+}
+
+function threadCallPreview(args: Record<string, unknown>, action: string): string {
+	if (action !== "start") return "";
+	const name = stringArg(args, "name");
+	if (name !== "") return quotedPreview(name);
+	const prompt = stringArg(args, "prompt");
+	return prompt === "" ? "" : quotedPreview(prompt);
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
@@ -354,81 +408,16 @@ export default function (pi: ExtensionAPI) {
 
 		renderCall(args, theme) {
 			const action = typeof args["action"] === "string" ? args["action"] : "unknown";
-			let text = theme.fg("toolTitle", theme.bold("thread")) + " " + theme.fg("accent", action);
+			const label = threadCallActionLabel(args, action);
+			let text = theme.fg("toolTitle", theme.bold("thread")) + " " + theme.fg("accent", label);
 
-			switch (action) {
-				case "start": {
-					const prompt = typeof args["prompt"] === "string" ? args["prompt"] : "";
-					if (prompt) {
-						const summary = prompt.length > 60 ? prompt.slice(0, 57) + "..." : prompt;
-						text += " " + theme.fg("dim", `"${summary}"`);
-					}
-					const taskName =
-						"taskName" in args && typeof args["taskName"] === "string" ? args["taskName"] : "";
-					if (taskName) text += " " + theme.fg("muted", `[${taskName}]`);
-					break;
-				}
-				case "fork": {
-					const id = typeof args["id"] === "string" ? args["id"] : "";
-					const entryId = typeof args["entryId"] === "string" ? args["entryId"] : "";
-					const taskName =
-						"taskName" in args && typeof args["taskName"] === "string" ? args["taskName"] : "";
-					if (id) text += " " + theme.fg("accent", id);
-					if (entryId) text += " " + theme.fg("muted", `entry:${entryId}`);
-					if (taskName) text += " " + theme.fg("muted", `[${taskName}]`);
-					break;
-				}
-				case "poll":
-				case "resume":
-				case "archive":
-				case "stop": {
-					const id = typeof args["id"] === "string" ? args["id"] : "";
-					if (id) text += " " + theme.fg("accent", id);
-					const detail = typeof args["detail"] === "string" ? args["detail"] : "";
-					if (action === "poll" && detail) text += " " + theme.fg("muted", detail);
-					break;
-				}
-				case "send": {
-					const id = typeof args["id"] === "string" ? args["id"] : "";
-					const msg =
-						"message" in args && typeof args["message"] === "string" ? args["message"] : "";
-					const mode = "mode" in args && typeof args["mode"] === "string" ? args["mode"] : "";
-					if (id) text += " " + theme.fg("accent", id);
-					if (mode) {
-						const shortMode =
-							mode === "follow_up"
-								? "f/u"
-								: mode === "steer"
-									? "s"
-									: mode === "prompt"
-										? "p"
-										: mode;
-						text += " " + theme.fg("muted", shortMode);
-					}
-					if (msg) {
-						const summary = msg.length > 40 ? msg.slice(0, 37) + "..." : msg;
-						text += " " + theme.fg("dim", `"${summary}"`);
-					}
-					break;
-				}
-				case "wait": {
-					const id = typeof args["id"] === "string" ? args["id"] : "";
-					if (id) text += " " + theme.fg("accent", id);
-					const detail = typeof args["detail"] === "string" ? args["detail"] : "";
-					if (detail) text += " " + theme.fg("muted", detail);
-					const timeoutMs =
-						"timeoutMs" in args && typeof args["timeoutMs"] === "number"
-							? args["timeoutMs"]
-							: undefined;
-					if (timeoutMs !== undefined) {
-						text += " " + theme.fg("muted", formatTimeoutMsForTitle(timeoutMs));
-					}
-					break;
-				}
-				case "list":
-				default:
-					break;
-			}
+			const target = threadCallTarget(args, action);
+			if (target !== "") text += " " + theme.fg("accent", target);
+
+			if (action === "stop" && args["force"] === true) text += " " + theme.fg("warning", "force");
+
+			const preview = threadCallPreview(args, action);
+			if (preview !== "") text += " " + theme.fg("dim", preview);
 
 			return new Text(text, 0, 0);
 		},
