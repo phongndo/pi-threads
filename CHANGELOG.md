@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+No changes yet.
+
+## [0.3.0] - 2026-07-05
+
 ### Added
 
 - Repository community health documentation: contributing guide, security policy,
@@ -19,8 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - CI now uses least-privilege read permissions and performs an npm pack smoke
   test.
-- Package peer dependency ranges now document the tested Pi and TypeBox
-  compatibility window.
+- Package metadata now follows Pi package guidance by keeping Pi-bundled runtime
+  packages as wildcard peer dependencies.
+- Package description now reflects the broader background-thread lifecycle.
 - `/threads` usage/docs now clarify that the command is observability-first, not
   a manual thread lifecycle control surface.
 - Public thread snapshot typings now use shared base interfaces to reduce

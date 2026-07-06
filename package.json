@@ -1,7 +1,7 @@
 {
   "name": "@phongndo/pi-threads",
-  "version": "0.2.4",
-  "description": "A minimal Pi extension that lets Pi sessions start, poll, message, list, and stop other Pi sessions.",
+  "version": "0.3.0",
+  "description": "A minimal Pi extension for managing background Pi child sessions.",
   "keywords": [
     "agents",
     "pi-extension",
@@ -63,10 +63,10 @@
     "vitest": "^4.1.9"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.80.3 <1.0.0",
-    "@earendil-works/pi-coding-agent": ">=0.80.3 <1.0.0",
-    "@earendil-works/pi-tui": ">=0.80.3 <1.0.0",
-    "typebox": ">=1.1.38 <2.0.0"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "simple-git-hooks": {
     "pre-commit": "pnpm exec lint-staged"
