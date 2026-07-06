@@ -750,12 +750,34 @@ export class ThreadManager {
 			}
 
 			const sleepMs = Math.min(WAIT_POLL_INTERVAL_MS, remainingMs);
+			const sleepReachesDeadline = sleepMs === remainingMs;
 			if (refreshed.state === "live") {
 				// eslint-disable-next-line no-await-in-loop -- wait intentionally sleeps between status checks.
-				await Promise.race([refreshed.closed, delay(sleepMs, options.signal)]);
+				const sleepResult = await Promise.race([
+					refreshed.closed.then(() => "closed" as const),
+					delay(sleepMs, options.signal).then(() => "timer" as const),
+				]);
+				if (sleepResult === "timer" && sleepReachesDeadline) {
+					const current = this.#required(id);
+					return {
+						kind: "waited",
+						timedOut: current.state !== "closed",
+						waitedMs: Date.now() - startedAt,
+						...snapshotPair(current),
+					};
+				}
 			} else {
 				// eslint-disable-next-line no-await-in-loop -- wait intentionally sleeps between status checks.
 				await delay(sleepMs, options.signal);
+				if (sleepReachesDeadline) {
+					const current = this.#required(id);
+					return {
+						kind: "waited",
+						timedOut: current.state !== "closed",
+						waitedMs: Date.now() - startedAt,
+						...snapshotPair(current),
+					};
+				}
 			}
 		}
 	}
