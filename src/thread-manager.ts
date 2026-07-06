@@ -9,6 +9,7 @@ import {
 	asThreadPath,
 	asThreadId,
 	assertTaskName,
+	humanizeTaskName,
 	joinThreadPath,
 	newThreadId,
 	nowIso,
@@ -53,11 +54,18 @@ const RPC_QUICK_TIMEOUT_MS = 1_500;
 const RPC_SEND_TIMEOUT_MS = 5_000;
 const STOP_GRACE_MS = 1_500;
 const STOP_KILL_WAIT_MS = 300;
+const DEFAULT_IDLE_CLEANUP_MS = 0;
+const DEFAULT_LIVE_TIMEOUT_MS = 0;
+const MAX_SET_TIMEOUT_DELAY_MS = 2_147_483_647;
 const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
 const MAX_WAIT_TIMEOUT_MS = 600_000;
 const WAIT_POLL_INTERVAL_MS = 250;
 const BUSY_SEND_IDLE_SETTLE_REFRESHES = 2;
 const MESSAGE_UPDATE_EMIT_THROTTLE_MS = 250;
+const PERSIST_FLUSH_DELAY_MS = 500;
+// Durable registry entries append a full snapshot to the parent session file, so
+// cap free-form texts there to keep a chatty child from ballooning that file.
+const REGISTRY_TEXT_LIMIT = 20_000;
 const TASK_NAME_MAX_LENGTH = 64;
 const DISPLAY_NAME_MAX_LENGTH = 80;
 export const PI_THREAD_REGISTRY_ENTRY_TYPE = "pi-threads-registry";
@@ -89,6 +97,9 @@ type ThreadBase = {
 
 type LiveThread = ThreadBase & {
 	readonly state: "live";
+	readonly processLaunchToken: symbol;
+	readonly liveStartedAt: string;
+	idleStartedAt: string | null;
 	phase: ThreadPhase;
 	readonly pid: number;
 	readonly child: ChildProcessWithoutNullStreams;
@@ -98,6 +109,7 @@ type LiveThread = ThreadBase & {
 	hasRun: boolean;
 	activityGeneration: number;
 	userMessageStartGeneration: number;
+	inFlightSendCount: number;
 	awaitingSend: AwaitingSend | null;
 	pendingInitialPrompt: PendingInitialPrompt | null;
 	turnOpen: boolean;
@@ -129,6 +141,7 @@ type PendingInitialPrompt = {
 type ClosedThread = ThreadBase & {
 	readonly state: "closed";
 	readonly exit: ThreadExit;
+	readonly processLaunchToken?: symbol;
 };
 
 type ManagedThread = LiveThread | ClosedThread;
@@ -197,7 +210,7 @@ type ThreadRegistryPersistence = {
 	) => void;
 };
 
-type ThreadRegistryEntryScope = {
+export type ThreadRegistryEntryScope = {
 	readonly sessionId: string;
 };
 
@@ -220,6 +233,11 @@ type ThreadRegistryRestoreScope = {
 	readonly registryGeneration: number;
 };
 
+type ThreadRegistryOwnership = {
+	readonly registrySession: ThreadRegistrySession | null;
+	readonly registryGeneration: number;
+};
+
 type LaunchThreadInput = {
 	readonly id: ThreadId;
 	readonly name: string;
@@ -228,6 +246,8 @@ type LaunchThreadInput = {
 	readonly parentPath: ThreadPath;
 	readonly parentThreadId: ThreadId | null;
 	readonly depth: number;
+	readonly registrySession: ThreadRegistrySession | null;
+	readonly registryGeneration: number;
 	readonly cwd: string;
 	readonly args: readonly string[];
 	readonly createdAt?: string;
@@ -272,12 +292,18 @@ export class ThreadManager {
 	#depth: number;
 	readonly #maxDepth: number;
 	readonly #maxThreads: number;
+	readonly #idleCleanupMs: number;
+	readonly #liveTimeoutMs: number;
 	#selfThreadId: ThreadId | null;
 	#currentPath: ThreadPath;
 	readonly #rootSessionId: string;
 	#registrySession: ThreadRegistrySession | null = null;
 	#registryGeneration = 0;
 	#persistence: ThreadRegistryPersistence = {};
+	readonly #dirtyPersistThreadIds = new Set<ThreadId>();
+	#persistFlushTimer: ReturnType<typeof setTimeout> | null = null;
+	#cleanupTimer: ReturnType<typeof setTimeout> | null = null;
+	#cleanupInFlight: Promise<void> | null = null;
 
 	constructor(environment: NodeJS.ProcessEnv = process.env) {
 		const baseDepth = readInteger(environment["PI_THREADS_DEPTH"], 0);
@@ -291,6 +317,14 @@ export class ThreadManager {
 		this.#depth = baseDepth;
 		this.#maxDepth = readInteger(environment["PI_THREADS_MAX_DEPTH"], DEFAULT_MAX_DEPTH);
 		this.#maxThreads = readInteger(environment["PI_THREADS_MAX_THREADS"], DEFAULT_MAX_THREADS);
+		this.#idleCleanupMs = readInteger(
+			environment["PI_THREADS_IDLE_CLEANUP_MS"],
+			DEFAULT_IDLE_CLEANUP_MS,
+		);
+		this.#liveTimeoutMs = readInteger(
+			environment["PI_THREADS_LIVE_TIMEOUT_MS"],
+			DEFAULT_LIVE_TIMEOUT_MS,
+		);
 		this.#selfThreadId = baseSelfThreadId;
 		this.#currentPath = baseCurrentPath;
 		this.#rootSessionId = environment["PI_THREADS_ROOT_SESSION_ID"] ?? `root_${process.pid}`;
@@ -303,6 +337,13 @@ export class ThreadManager {
 	#setRegistrySession(session: ThreadRegistrySession | null): void {
 		if (!threadRegistrySessionsMatch(this.#registrySession, session)) this.#registryGeneration++;
 		this.#registrySession = session;
+	}
+
+	#getRegistryOwnership(): ThreadRegistryOwnership {
+		return {
+			registrySession: this.#registrySession,
+			registryGeneration: this.#registryGeneration,
+		};
 	}
 
 	hydrateFromSession(ctx: Pick<ExtensionContext, "sessionManager">): void {
@@ -321,10 +362,17 @@ export class ThreadManager {
 		let changed = false;
 		for (const restored of restoreDurableThreads(entries, restoreScope)) {
 			const existing = this.#threads.get(restored.id);
-			if (existing?.state === "live") continue;
-			if (existing !== undefined && threadSnapshotsMatch(existing, restored)) {
-				if (!threadRegistryMetadataMatches(existing, restored))
-					this.#threads.set(restored.id, restored);
+			if (existing !== undefined) {
+				if (existing.state === "live") continue;
+				const restoredWithPreservedText = preserveRegistryTruncatedText(existing, restored);
+				if (threadSnapshotsMatch(existing, restoredWithPreservedText)) {
+					if (!threadRegistryMetadataMatches(existing, restored)) {
+						this.#threads.set(restored.id, withThreadRegistryMetadata(existing, restored));
+					}
+					continue;
+				}
+				this.#threads.set(restored.id, restoredWithPreservedText);
+				changed = true;
 				continue;
 			}
 			this.#threads.set(restored.id, restored);
@@ -405,12 +453,15 @@ export class ThreadManager {
 	}
 
 	async start(command: StartCommand, ctx: ExtensionContext): Promise<StartOutcome> {
-		this.#assertStartAllowed();
+		const scope = this.getScope();
+		const registryOwnership = this.#getRegistryOwnership();
+		await this.#cleanupExpiredLiveThreads();
+		this.#assertStartAllowed(scope);
 
 		const id = newThreadId();
-		const taskName = command.taskName ?? this.#generateUniqueTaskName(command, id);
+		const taskName = command.taskName ?? this.#generateUniqueTaskName(command, id, scope);
 		assertTaskName(taskName);
-		const threadPath = joinThreadPath(this.#currentPath, taskName);
+		const threadPath = joinThreadPath(scope.currentPath, taskName);
 		this.#assertPathAvailable(threadPath);
 
 		const name = command.name ?? generateDisplayName(command.prompt, taskName, id);
@@ -424,9 +475,10 @@ export class ThreadManager {
 				name,
 				taskName,
 				path: threadPath,
-				parentPath: this.#currentPath,
-				parentThreadId: this.#selfThreadId,
-				depth: this.#depth + 1,
+				parentPath: scope.currentPath,
+				parentThreadId: scope.selfThreadId,
+				depth: scope.depth + 1,
+				...registryOwnership,
 				cwd,
 				args: extraArgs,
 				session: preparedSession?.session,
@@ -460,29 +512,39 @@ export class ThreadManager {
 
 	async send(command: SendCommand): Promise<SendOutcome> {
 		let thread = this.#liveByTarget(command.id);
-		const refreshed = await this.#refreshState(thread, { emitChange: false });
-		thread = this.#liveByTarget(thread.id);
-		const mode = command.mode ?? defaultSendMode(thread.phase);
-		const sendAcceptanceBaseline = captureSendAcceptanceBaseline(thread, {
-			allowActivityFastPath: refreshed,
-		});
-		const response = await sendMessage(thread, mode, command.message);
-		if (response.success) {
-			const current = this.#threads.get(thread.id);
-			if (current?.state === "live") {
-				recordAcceptedSend(current, sendAcceptanceBaseline);
-				this.#persistThreadSnapshot(current);
-			}
-		}
-		this.#emitChange();
+		const id = thread.id;
+		thread.inFlightSendCount++;
+		let sendTracked = true;
 
-		return {
-			kind: "sent",
-			mode,
-			accepted: response.success,
-			error: response.success ? null : (response.error ?? "Message was rejected by child Pi."),
-			...snapshotPair(this.#required(thread.id)),
-		};
+		try {
+			const refreshed = await this.#refreshState(thread, { emitChange: false });
+			thread = this.#liveByTarget(id);
+			const mode = command.mode ?? defaultSendMode(thread.phase);
+			const sendAcceptanceBaseline = captureSendAcceptanceBaseline(thread, {
+				allowActivityFastPath: refreshed,
+			});
+			const response = await sendMessage(thread, mode, command.message);
+			if (response.success) {
+				const current = this.#threads.get(id);
+				if (current?.state === "live") {
+					recordAcceptedSend(current, sendAcceptanceBaseline);
+					this.#persistThreadSnapshot(current);
+				}
+			}
+			this.#finishInFlightSend(id);
+			sendTracked = false;
+			this.#emitChange();
+
+			return {
+				kind: "sent",
+				mode,
+				accepted: response.success,
+				error: response.success ? null : (response.error ?? "Message was rejected by child Pi."),
+				...snapshotPair(this.#required(id)),
+			};
+		} finally {
+			if (sendTracked) this.#finishInFlightSend(id);
+		}
 	}
 
 	async stop(command: StopCommand): Promise<StopOutcome> {
@@ -495,32 +557,29 @@ export class ThreadManager {
 		thread = this.#required(id);
 		if (thread.state === "closed") return { kind: "stopped", ...snapshotPair(thread) };
 
-		thread.stopRequested = true;
-		thread.phase = "stopping";
-		appendThreadEvent(thread, { type: "thread_stopping" });
-		this.#persistThreadSnapshot(thread);
-		this.#emitChange();
-
-		if (command.force === true) {
-			thread.child.kill("SIGKILL");
-		} else {
-			await thread.rpc.request({ type: "abort" }, RPC_QUICK_TIMEOUT_MS).catch(() => undefined);
-			thread.child.kill("SIGTERM");
-			await delay(STOP_GRACE_MS);
-			if (this.#threads.get(id)?.state === "live") thread.child.kill("SIGKILL");
-		}
-
-		await Promise.race([thread.closed, delay(STOP_GRACE_MS)]);
-		this.#emitChange();
+		await this.#stopLiveThread(thread, { force: command.force === true });
 		return { kind: "stopped", ...snapshotPair(this.#required(id)) };
 	}
 
 	async resume(command: ResumeCommand, ctx: ExtensionContext): Promise<ResumeOutcome> {
-		const thread = this.#requiredByTarget(command.id);
+		const scope = this.getScope();
+		let thread = this.#requiredByTarget(command.id, scope);
+		const id = thread.id;
+		const registryOwnership: ThreadRegistryOwnership = {
+			registrySession: thread.registrySession,
+			registryGeneration: thread.registryGeneration,
+		};
 		if (thread.state === "live") {
 			return { kind: "resumed", alreadyLive: true, ...snapshotPair(thread) };
 		}
-		this.#assertStartAllowed();
+		await this.#cleanupExpiredLiveThreads();
+
+		thread = this.#required(id);
+		if (thread.state === "live") {
+			return { kind: "resumed", alreadyLive: true, ...snapshotPair(thread) };
+		}
+
+		this.#assertStartAllowed(scope);
 		if (thread.session.kind !== "known") {
 			throw new Error(
 				`Cannot resume ${thread.path}: no saved Pi session file is known. Repair: resume only managed threads with a known session file, or start a new thread.`,
@@ -537,6 +596,7 @@ export class ThreadManager {
 				parentPath: thread.parentPath,
 				parentThreadId: thread.parentThreadId,
 				depth: thread.depth,
+				...registryOwnership,
 				cwd: thread.cwd,
 				args: thread.args,
 				createdAt: thread.createdAt,
@@ -551,11 +611,14 @@ export class ThreadManager {
 			ctx,
 		);
 
-		return { kind: "resumed", alreadyLive: false, ...snapshotPair(this.#required(thread.id)) };
+		return { kind: "resumed", alreadyLive: false, ...snapshotPair(this.#required(id)) };
 	}
 
 	async fork(command: ForkCommand, ctx: ExtensionContext): Promise<ForkOutcome> {
-		this.#assertStartAllowed();
+		const scope = this.getScope();
+		const registryOwnership = this.#getRegistryOwnership();
+		await this.#cleanupExpiredLiveThreads();
+		this.#assertStartAllowed(scope);
 
 		const id = newThreadId();
 		const extraArgs = command.args ?? [];
@@ -564,19 +627,23 @@ export class ThreadManager {
 		let threadPath: ThreadPath | null = null;
 		if (command.taskName !== undefined) {
 			taskName = assertTaskName(command.taskName);
-			threadPath = joinThreadPath(this.#currentPath, taskName);
+			threadPath = joinThreadPath(scope.currentPath, taskName);
 			this.#assertPathAvailable(threadPath);
 		} else if (command.name !== undefined) {
-			taskName = this.#uniqueTaskName(taskNameFromText(command.name) ?? shortTaskName(id), id);
-			threadPath = joinThreadPath(this.#currentPath, taskName);
+			taskName = this.#uniqueTaskName(
+				taskNameFromText(command.name) ?? shortTaskName(id),
+				id,
+				scope,
+			);
+			threadPath = joinThreadPath(scope.currentPath, taskName);
 			this.#assertPathAvailable(threadPath);
 		}
 
-		const source = this.#resolveForkSource(command, ctx);
+		const source = this.#resolveForkSource(command, ctx, scope);
 		const baseName = command.name ?? `Fork of ${source.displayName}`;
 		if (taskName === null || threadPath === null) {
-			taskName = this.#uniqueTaskName(taskNameFromText(baseName) ?? shortTaskName(id), id);
-			threadPath = joinThreadPath(this.#currentPath, taskName);
+			taskName = this.#uniqueTaskName(taskNameFromText(baseName) ?? shortTaskName(id), id, scope);
+			threadPath = joinThreadPath(scope.currentPath, taskName);
 			this.#assertPathAvailable(threadPath);
 		}
 		const forked = createForkedManagedSession(source, command);
@@ -587,9 +654,10 @@ export class ThreadManager {
 				name: baseName,
 				taskName,
 				path: threadPath,
-				parentPath: this.#currentPath,
-				parentThreadId: this.#selfThreadId,
-				depth: this.#depth + 1,
+				parentPath: scope.currentPath,
+				parentThreadId: scope.selfThreadId,
+				depth: scope.depth + 1,
+				...registryOwnership,
 				cwd: forked.cwd,
 				args: extraArgs,
 				session: forked.session,
@@ -700,21 +768,68 @@ export class ThreadManager {
 	}
 
 	async shutdown(): Promise<void> {
+		this.#clearScheduledCleanup();
 		const liveThreads = Array.from(this.#threads.values()).filter(
 			(thread): thread is LiveThread => thread.state === "live",
 		);
-		await Promise.all(
-			liveThreads.map(async (thread) => {
-				thread.stopRequested = true;
-				thread.child.kill("SIGTERM");
-				await Promise.race([thread.closed, delay(STOP_KILL_WAIT_MS)]);
-				if (this.#threads.get(thread.id)?.state === "live") {
-					thread.child.kill("SIGKILL");
-					await Promise.race([thread.closed, delay(STOP_KILL_WAIT_MS)]);
-				}
-			}),
-		);
+		await Promise.all(liveThreads.map((thread) => this.#stopLiveThread(thread, { force: false })));
+		this.#flushScheduledPersists();
 		this.#emitChange();
+	}
+
+	/**
+	 * Forget all closed threads. Used after a full shutdown when the parent moves
+	 * to an unrelated session: the process-wide manager instance stays referenced
+	 * by registered tool/command closures, and without this purge the next session
+	 * would still list the previous session's threads. Live threads are kept
+	 * defensively; a full shutdown closes them first.
+	 */
+	clearThreads(): void {
+		this.#clearScheduledPersistFlush();
+		let changed = false;
+		for (const [id, thread] of this.#threads) {
+			if (thread.state !== "closed") continue;
+			this.#threads.delete(id);
+			changed = true;
+		}
+		if (changed) this.#emitChange();
+	}
+
+	async #stopLiveThread(
+		thread: LiveThread,
+		options: { readonly force: boolean },
+	): Promise<ManagedThread> {
+		const id = thread.id;
+		const current = this.#threads.get(id);
+		if (current !== thread) return current ?? thread;
+
+		current.stopRequested = true;
+		if (current.phase !== "stopping") {
+			setThreadPhase(current, "stopping");
+			appendThreadEvent(current, { type: "thread_stopping" });
+			this.#persistThreadSnapshot(current);
+			this.#emitChange();
+		}
+
+		if (options.force) {
+			current.child.kill("SIGKILL");
+			await Promise.race([current.closed, delay(STOP_KILL_WAIT_MS)]);
+		} else {
+			await current.rpc.request({ type: "abort" }, RPC_QUICK_TIMEOUT_MS).catch(() => undefined);
+			if (this.#threads.get(id) === current) current.child.kill("SIGTERM");
+			await Promise.race([current.closed, delay(STOP_GRACE_MS)]);
+			if (this.#threads.get(id) === current) {
+				current.child.kill("SIGKILL");
+				await Promise.race([current.closed, delay(STOP_KILL_WAIT_MS)]);
+			}
+		}
+
+		if (this.#threads.get(id) === current) {
+			this.#closeThread(id, { kind: "stopped", code: null, signal: "SIGKILL" });
+		}
+
+		this.#emitChange();
+		return this.#required(id);
 	}
 
 	async #launchThread(
@@ -735,6 +850,8 @@ export class ThreadManager {
 			PI_THREADS_DEPTH: String(input.depth),
 			PI_THREADS_MAX_DEPTH: String(this.#maxDepth),
 			PI_THREADS_MAX_THREADS: String(this.#maxThreads),
+			PI_THREADS_IDLE_CLEANUP_MS: String(this.#idleCleanupMs),
+			PI_THREADS_LIVE_TIMEOUT_MS: String(this.#liveTimeoutMs),
 			PI_THREADS_SELF_ID: input.id,
 			PI_THREADS_PARENT_ID: input.parentThreadId ?? "",
 			PI_THREADS_PARENT_THREAD_ID: input.parentThreadId ?? "",
@@ -760,21 +877,27 @@ export class ThreadManager {
 			spawnError: Error | null;
 			close: { readonly code: number | null; readonly signal: string | null } | null;
 		} = { spawnError: null, close: null };
+		let launchedThread: LiveThread | null = null;
 		child.once("error", (error) => {
-			if (!this.#threads.has(input.id)) {
+			if (launchedThread === null) {
 				pendingStart.spawnError = error;
 				return;
 			}
+			if (this.#threads.get(input.id) !== launchedThread) return;
 			this.#closeThread(input.id, { kind: "failed", message: error.message });
 		});
 
 		child.once("close", (code, signal) => {
-			const current = this.#threads.get(input.id);
-			if (current === undefined) {
+			if (launchedThread === null) {
 				pendingStart.close = { code, signal };
 				return;
 			}
-			const stopped = current.state === "live" && current.stopRequested;
+			const current = this.#threads.get(input.id);
+			if (current !== launchedThread) {
+				this.#recordLateProcessExit(launchedThread, code, signal);
+				return;
+			}
+			const stopped = current.stopRequested;
 			this.#closeThread(input.id, classifyProcessExit({ code, signal, stopped }));
 		});
 
@@ -786,12 +909,14 @@ export class ThreadManager {
 		}
 
 		const previousThread = this.#threads.get(input.id);
-		const registrySession = previousThread?.registrySession ?? this.#registrySession;
-		const registryGeneration = previousThread?.registryGeneration ?? this.#registryGeneration;
+		const registrySession = previousThread?.registrySession ?? input.registrySession;
+		const registryGeneration = previousThread?.registryGeneration ?? input.registryGeneration;
 		const closedDeferred = createDeferred<void>();
 		const recentEvents = [...(input.recentEvents ?? [])];
+		const liveStartedAt = nowIso();
 		const thread: LiveThread = {
 			state: "live",
+			processLaunchToken: Symbol(input.id),
 			id: input.id,
 			name: input.name,
 			taskName: input.taskName,
@@ -804,22 +929,28 @@ export class ThreadManager {
 			archived: input.archived ?? false,
 			cwd: input.cwd,
 			args: [...input.args],
-			createdAt: input.createdAt ?? nowIso(),
-			lastEventAt: nowIso(),
+			createdAt: input.createdAt ?? liveStartedAt,
+			lastEventAt: liveStartedAt,
 			session: input.session ?? { kind: "unknown" },
 			lastAssistantText: input.lastAssistantText ?? null,
 			lastPartialText: null,
 			recentEvents,
 			nextEventSeq: Math.max(0, ...recentEvents.map((event) => event.seq)) + 1,
 			stderrTail: input.stderrTail ?? "",
+			liveStartedAt,
+			idleStartedAt: null,
 			phase: "starting",
 			pid: child.pid,
 			child,
-			rpc: new RpcClient(child, (event) => this.#handleRpcEvent(input.id, event)),
+			rpc: new RpcClient(child, (event) => {
+				if (launchedThread === null || this.#threads.get(input.id) !== launchedThread) return;
+				this.#handleRpcEvent(input.id, event);
+			}),
 			stopRequested: false,
 			hasRun: false,
 			activityGeneration: 0,
 			userMessageStartGeneration: 0,
+			inFlightSendCount: 0,
 			awaitingSend: null,
 			pendingInitialPrompt: null,
 			turnOpen: false,
@@ -827,6 +958,7 @@ export class ThreadManager {
 			resolveClosed: closedDeferred.resolve,
 		};
 
+		launchedThread = thread;
 		this.#threads.set(input.id, thread);
 		appendLaunchThreadEvent(thread, input, child.pid);
 		this.#persistThreadSnapshot(thread);
@@ -834,7 +966,7 @@ export class ThreadManager {
 
 		child.stderr.on("data", (chunk: Buffer | string) => {
 			const current = this.#threads.get(input.id);
-			if (!current) return;
+			if (current !== thread) return;
 			current.stderrTail = tail(`${current.stderrTail}${String(chunk)}`, STDERR_TAIL_LIMIT);
 			current.lastEventAt = nowIso();
 		});
@@ -875,7 +1007,8 @@ export class ThreadManager {
 			}
 		} else if (this.#threads.get(input.id)?.state === "live") {
 			const current = this.#threads.get(input.id);
-			if (current?.state === "live" && current.phase === "starting") current.phase = "idle";
+			if (current?.state === "live" && current.phase === "starting")
+				setThreadPhase(current, "idle");
 		}
 
 		const current = this.#threads.get(input.id);
@@ -889,10 +1022,15 @@ export class ThreadManager {
 	}
 
 	#persistThreadSnapshot(thread: ManagedThread): void {
+		this.#dirtyPersistThreadIds.delete(thread.id);
 		try {
 			const target = this.#registryTarget(thread);
 			if (target === null) return;
-			this.#persistence.appendSnapshot?.(snapshot(thread), registryScope(target), target);
+			this.#persistence.appendSnapshot?.(
+				truncateSnapshotForRegistry(snapshot(thread)),
+				registryScope(target),
+				target,
+			);
 		} catch {
 			// Persistence should never affect process lifecycle management.
 		}
@@ -901,6 +1039,35 @@ export class ThreadManager {
 	#persistThreadSnapshotAndEmitChange(thread: ManagedThread): void {
 		this.#persistThreadSnapshot(thread);
 		this.#emitChange();
+	}
+
+	// High-frequency lifecycle events (tool starts/ends) coalesce into one trailing
+	// registry append instead of one per event; any direct persist supersedes them.
+	#schedulePersistThreadSnapshot(thread: ManagedThread): void {
+		this.#dirtyPersistThreadIds.add(thread.id);
+		if (this.#persistFlushTimer !== null) return;
+		this.#persistFlushTimer = setTimeout(() => {
+			this.#persistFlushTimer = null;
+			this.#flushScheduledPersists();
+		}, PERSIST_FLUSH_DELAY_MS);
+		this.#persistFlushTimer.unref?.();
+	}
+
+	#flushScheduledPersists(): void {
+		const ids = [...this.#dirtyPersistThreadIds];
+		this.#dirtyPersistThreadIds.clear();
+		for (const id of ids) {
+			const thread = this.#threads.get(id);
+			if (thread !== undefined) this.#persistThreadSnapshot(thread);
+		}
+	}
+
+	#clearScheduledPersistFlush(): void {
+		if (this.#persistFlushTimer !== null) {
+			clearTimeout(this.#persistFlushTimer);
+			this.#persistFlushTimer = null;
+		}
+		this.#dirtyPersistThreadIds.clear();
 	}
 
 	#registryTarget(thread: ManagedThread): ThreadRegistryPersistenceTarget | null {
@@ -919,10 +1086,10 @@ export class ThreadManager {
 		return { sessionId: null, sessionFile: null, sessionDir: null, isCurrentSession: true };
 	}
 
-	#assertStartAllowed(): void {
-		if (this.#depth >= this.#maxDepth) {
+	#assertStartAllowed(scope: ThreadManagerScope): void {
+		if (scope.depth >= this.#maxDepth) {
 			throw new Error(
-				`pi-threads recursion depth ${this.#depth} has reached PI_THREADS_MAX_DEPTH=${this.#maxDepth}`,
+				`pi-threads recursion depth ${scope.depth} has reached PI_THREADS_MAX_DEPTH=${this.#maxDepth}`,
 			);
 		}
 
@@ -940,10 +1107,10 @@ export class ThreadManager {
 		return thread;
 	}
 
-	#requiredByTarget(target: string): ManagedThread {
+	#requiredByTarget(target: string, scope: ThreadManagerScope = this.getScope()): ManagedThread {
 		return this.#required(
 			resolveThreadTarget(target, {
-				currentPath: this.#currentPath,
+				currentPath: scope.currentPath,
 				threads: this.#threads.values(),
 			}),
 		);
@@ -955,9 +1122,13 @@ export class ThreadManager {
 		return thread;
 	}
 
-	#resolveForkSource(command: ForkCommand, ctx: ExtensionContext): ForkSource {
+	#resolveForkSource(
+		command: ForkCommand,
+		ctx: ExtensionContext,
+		scope: ThreadManagerScope,
+	): ForkSource {
 		if (command.id !== undefined) {
-			const sourceThread = this.#requiredByTarget(command.id);
+			const sourceThread = this.#requiredByTarget(command.id, scope);
 			if (sourceThread.session.kind !== "known") {
 				throw new Error(
 					`Cannot fork ${sourceThread.path}: no saved Pi session file is known. Repair: fork only managed threads with known session files, or omit fork.id to fork the current parent session.`,
@@ -988,16 +1159,16 @@ export class ThreadManager {
 		};
 	}
 
-	#generateUniqueTaskName(command: StartCommand, id: ThreadId): string {
+	#generateUniqueTaskName(command: StartCommand, id: ThreadId, scope: ThreadManagerScope): string {
 		const base =
 			taskNameFromText(command.name) ?? taskNameFromText(command.prompt) ?? shortTaskName(id);
-		return this.#uniqueTaskName(base, id);
+		return this.#uniqueTaskName(base, id, scope);
 	}
 
-	#uniqueTaskName(base: string, id: ThreadId): string {
+	#uniqueTaskName(base: string, id: ThreadId, scope: ThreadManagerScope): string {
 		for (let attempt = 1; attempt <= 10_000; attempt += 1) {
 			const candidate = taskNameWithNumericSuffix(base, attempt);
-			if (this.#findByPath(joinThreadPath(this.#currentPath, candidate)) === undefined) {
+			if (this.#findByPath(joinThreadPath(scope.currentPath, candidate)) === undefined) {
 				return candidate;
 			}
 		}
@@ -1005,13 +1176,13 @@ export class ThreadManager {
 		const idBase = assertTaskName(id);
 		for (let attempt = 1; attempt <= 100; attempt += 1) {
 			const candidate = taskNameWithNumericSuffix(idBase, attempt);
-			if (this.#findByPath(joinThreadPath(this.#currentPath, candidate)) === undefined) {
+			if (this.#findByPath(joinThreadPath(scope.currentPath, candidate)) === undefined) {
 				return candidate;
 			}
 		}
 
 		throw new Error(
-			`Unable to generate a unique taskName under ${this.#currentPath}. Repair: provide an explicit unique start.taskName.`,
+			`Unable to generate a unique taskName under ${scope.currentPath}. Repair: provide an explicit unique start.taskName.`,
 		);
 	}
 
@@ -1028,12 +1199,49 @@ export class ThreadManager {
 		}
 	}
 
+	// A forced stop synthesizes a close after SIGKILL if the process "close" event
+	// has not been observed yet. When the real exit arrives later, replace the
+	// synthetic exit so the snapshot reflects what actually happened.
+	#recordLateProcessExit(
+		launchedThread: LiveThread,
+		code: number | null,
+		signal: string | null,
+	): void {
+		const id = launchedThread.id;
+		const current = this.#threads.get(id);
+		if (
+			current === undefined ||
+			current.state !== "closed" ||
+			current.processLaunchToken !== launchedThread.processLaunchToken ||
+			current.exit.kind !== "stopped" ||
+			current.exit.code !== null ||
+			current.exit.signal !== "SIGKILL"
+		) {
+			return;
+		}
+
+		const observed = classifyProcessExit({ code, signal, stopped: true });
+		if (
+			observed.kind === "stopped" &&
+			observed.code === current.exit.code &&
+			observed.signal === current.exit.signal
+		) {
+			return;
+		}
+
+		const updated: ClosedThread = { ...current, exit: observed, lastEventAt: nowIso() };
+		this.#threads.set(id, updated);
+		this.#persistThreadSnapshot(updated);
+		this.#emitChange();
+	}
+
 	#closeThread(id: ThreadId, exit: ThreadExit): void {
 		const thread = this.#threads.get(id);
 		if (!thread || thread.state === "closed") return;
 
 		const closed: ClosedThread = {
 			state: "closed",
+			processLaunchToken: thread.processLaunchToken,
 			id: thread.id,
 			name: thread.name,
 			taskName: thread.taskName,
@@ -1074,7 +1282,7 @@ export class ThreadManager {
 		if (response.success) {
 			recordAcceptedInitialPrompt(thread);
 		} else if (thread.phase === "starting") {
-			thread.phase = "idle";
+			setThreadPhase(thread, "idle");
 		}
 		return true;
 	}
@@ -1103,7 +1311,7 @@ export class ThreadManager {
 		switch (type) {
 			case "agent_start": {
 				recordPromptRunActivity(thread);
-				thread.phase = "busy";
+				setThreadPhase(thread, "busy");
 				thread.hasRun = true;
 				recordThreadTurnStarted(thread);
 				this.#persistThreadSnapshotAndEmitChange(thread);
@@ -1111,7 +1319,7 @@ export class ThreadManager {
 			}
 			case "agent_end": {
 				recordPromptRunActivity(thread);
-				thread.phase = "idle";
+				setThreadPhase(thread, "idle");
 				thread.lastPartialText = null;
 				allowAwaitingSendRunActivity(thread);
 				clearObservedSendIfIdle(thread);
@@ -1121,7 +1329,7 @@ export class ThreadManager {
 			}
 			case "turn_start": {
 				recordPromptRunActivity(thread);
-				thread.phase = "busy";
+				setThreadPhase(thread, "busy");
 				thread.hasRun = true;
 				recordThreadTurnStarted(thread);
 				this.#persistThreadSnapshotAndEmitChange(thread);
@@ -1130,7 +1338,7 @@ export class ThreadManager {
 			case "message_start": {
 				recordPromptRunActivity(thread);
 				if (isUserMessage(event["message"])) thread.userMessageStartGeneration++;
-				thread.phase = "busy";
+				setThreadPhase(thread, "busy");
 				thread.hasRun = true;
 				recordThreadTurnStarted(thread);
 				this.#persistThreadSnapshotAndEmitChange(thread);
@@ -1166,13 +1374,14 @@ export class ThreadManager {
 			}
 			case "tool_execution_start": {
 				recordPromptRunActivity(thread);
-				thread.phase = "busy";
+				setThreadPhase(thread, "busy");
 				recordThreadTurnStarted(thread);
 				appendThreadEvent(thread, {
 					type: "tool_started",
 					toolName: stringField(event, "toolName") ?? "unknown",
 				});
-				this.#persistThreadSnapshotAndEmitChange(thread);
+				this.#schedulePersistThreadSnapshot(thread);
+				this.#emitChange();
 				return;
 			}
 			case "tool_execution_update": {
@@ -1186,7 +1395,8 @@ export class ThreadManager {
 					toolName: stringField(event, "toolName") ?? "unknown",
 					error: event["isError"] === true,
 				});
-				this.#persistThreadSnapshotAndEmitChange(thread);
+				this.#schedulePersistThreadSnapshot(thread);
+				this.#emitChange();
 				return;
 			}
 			case "extension_ui_request": {
@@ -1273,7 +1483,7 @@ export class ThreadManager {
 		}
 		if (thread.phase !== "stopping") {
 			if (isStreaming || isCompacting || hasPendingMessages) {
-				thread.phase = "busy";
+				setThreadPhase(thread, "busy");
 			} else if (thread.awaitingSend !== null) {
 				// A successful prompt can be fully handled without starting an agent turn
 				// (for example slash commands or extension input handlers). Once a fresh
@@ -1286,17 +1496,17 @@ export class ThreadManager {
 				// a previous turn ending is not mistaken for new-send work.
 				allowAwaitingSendRunActivity(thread);
 				if (thread.awaitingSend.observedActivity) {
-					thread.phase = "idle";
+					setThreadPhase(thread, "idle");
 					clearObservedSendIfIdle(thread);
 				} else if (thread.awaitingSend.requireObservedActivity) {
-					thread.phase = "busy";
+					setThreadPhase(thread, "busy");
 				} else {
 					thread.awaitingSend.idleRefreshCount++;
 					if (thread.awaitingSend.idleRefreshCount >= thread.awaitingSend.idleRefreshesToSettle) {
 						thread.awaitingSend = null;
-						thread.phase = "idle";
+						setThreadPhase(thread, "idle");
 					} else {
-						thread.phase = "busy";
+						setThreadPhase(thread, "busy");
 					}
 				}
 			} else if (
@@ -1304,7 +1514,7 @@ export class ThreadManager {
 				thread.hasRun ||
 				thread.lastAssistantText !== null
 			) {
-				thread.phase = "idle";
+				setThreadPhase(thread, "idle");
 			}
 		}
 		if (childAppearsIdle && thread.phase !== "stopping") recordThreadTurnCompleted(thread);
@@ -1322,14 +1532,119 @@ export class ThreadManager {
 		this.#messageUpdateChangeTimer.unref();
 	}
 
+	#finishInFlightSend(id: ThreadId): void {
+		const current = this.#threads.get(id);
+		if (current?.state === "live" && current.inFlightSendCount > 0) {
+			current.inFlightSendCount--;
+		}
+		this.#scheduleCleanup();
+	}
+
 	#clearScheduledMessageUpdateChange(): void {
 		if (this.#messageUpdateChangeTimer === null) return;
 		clearTimeout(this.#messageUpdateChangeTimer);
 		this.#messageUpdateChangeTimer = null;
 	}
 
+	#scheduleCleanup(): void {
+		this.#clearScheduledCleanup();
+		if (this.#idleCleanupMs <= 0 && this.#liveTimeoutMs <= 0) return;
+
+		const nextAt = this.#nextCleanupAt(Date.now());
+		if (nextAt === null) return;
+		const delayMs = Math.max(0, nextAt - Date.now());
+
+		this.#cleanupTimer = setTimeout(
+			() => {
+				this.#cleanupTimer = null;
+				void this.#cleanupExpiredLiveThreads();
+			},
+			// Node overflows larger timeout delays to 1ms, so wait in safe chunks.
+			Math.min(delayMs, MAX_SET_TIMEOUT_DELAY_MS),
+		);
+		this.#cleanupTimer.unref?.();
+	}
+
+	#clearScheduledCleanup(): void {
+		if (this.#cleanupTimer === null) return;
+		clearTimeout(this.#cleanupTimer);
+		this.#cleanupTimer = null;
+	}
+
+	#nextCleanupAt(nowMs: number): number | null {
+		let nextAt: number | null = null;
+		for (const thread of this.#threads.values()) {
+			if (thread.state !== "live") continue;
+			const deadline = this.#cleanupDeadline(thread);
+			if (deadline === null) continue;
+			const boundedDeadline = Math.max(nowMs, deadline);
+			if (nextAt === null || boundedDeadline < nextAt) nextAt = boundedDeadline;
+		}
+		return nextAt;
+	}
+
+	#cleanupDeadline(thread: LiveThread): number | null {
+		if (thread.stopRequested || thread.phase === "stopping") return null;
+		const deadlines: number[] = [];
+		if (this.#liveTimeoutMs > 0)
+			deadlines.push(isoTimeMs(thread.liveStartedAt) + this.#liveTimeoutMs);
+		if (
+			this.#idleCleanupMs > 0 &&
+			thread.phase === "idle" &&
+			thread.inFlightSendCount === 0 &&
+			thread.awaitingSend === null &&
+			hasNoPendingMessages(thread)
+		) {
+			// lastEventAt includes parent-side RPC responses (for example poll/get_state),
+			// so base idle cleanup on the idle deadline anchor instead.
+			const idleSinceMs = isoTimeMs(thread.idleStartedAt ?? thread.lastEventAt);
+			deadlines.push(idleSinceMs + this.#idleCleanupMs);
+		}
+		return deadlines.length === 0 ? null : Math.min(...deadlines);
+	}
+
+	async #cleanupExpiredLiveThreads(): Promise<void> {
+		for (;;) {
+			const inFlight = this.#cleanupInFlight;
+			if (inFlight !== null) {
+				// eslint-disable-next-line no-await-in-loop -- callers must wait for the active pass, then re-check newly expired threads.
+				await inFlight;
+				continue;
+			}
+
+			if (this.#expiredLiveThreads(Date.now()).length === 0) {
+				this.#scheduleCleanup();
+				return;
+			}
+
+			const cleanup = Promise.resolve().then(() => this.#runCleanupExpiredLiveThreads());
+			this.#cleanupInFlight = cleanup;
+			try {
+				// eslint-disable-next-line no-await-in-loop -- cleanup drains expiration waves before limit checks continue.
+				await cleanup;
+			} finally {
+				if (this.#cleanupInFlight === cleanup) this.#cleanupInFlight = null;
+				this.#scheduleCleanup();
+			}
+		}
+	}
+
+	#expiredLiveThreads(nowMs: number): LiveThread[] {
+		return Array.from(this.#threads.values()).filter(
+			(thread): thread is LiveThread =>
+				thread.state === "live" &&
+				(this.#cleanupDeadline(thread) ?? Number.POSITIVE_INFINITY) <= nowMs,
+		);
+	}
+
+	async #runCleanupExpiredLiveThreads(): Promise<void> {
+		const expired = this.#expiredLiveThreads(Date.now());
+		await Promise.all(expired.map((thread) => this.#stopLiveThread(thread, { force: false })));
+	}
+
 	#emitChange(): void {
 		this.#clearScheduledMessageUpdateChange();
+		this.#scheduleCleanup();
 		if (this.#listeners.size === 0) return;
 		const threads = Array.from(this.#threads.values())
 			.toSorted((left, right) => left.path.localeCompare(right.path))
@@ -1371,6 +1686,23 @@ function captureSession(thread: LiveThread, data: Record<string, unknown>): bool
 
 function registryScope(target: ThreadRegistryPersistenceTarget): ThreadRegistryEntryScope | null {
 	return target.sessionId === null ? null : { sessionId: target.sessionId };
+}
+
+function truncateSnapshotForRegistry(threadSnapshot: ThreadSnapshot): ThreadSnapshot {
+	const lastAssistantText = truncateRegistryText(threadSnapshot.lastAssistantText);
+	if (threadSnapshot.state === "live") {
+		return {
+			...threadSnapshot,
+			lastAssistantText,
+			lastPartialText: truncateRegistryText(threadSnapshot.lastPartialText),
+		};
+	}
+	return { ...threadSnapshot, lastAssistantText };
+}
+
+function truncateRegistryText(text: string | null): string | null {
+	if (text === null || text.length <= REGISTRY_TEXT_LIMIT) return text;
+	return `${text.slice(0, REGISTRY_TEXT_LIMIT)}\n[truncated ${text.length - REGISTRY_TEXT_LIMIT} chars for registry persistence]`;
 }
 
 function threadRegistrySessionFromContext(
@@ -1620,6 +1952,42 @@ function restoreDurableThreads(
 
 function threadSnapshotsMatch(left: ManagedThread, right: ManagedThread): boolean {
 	return JSON.stringify(snapshot(left)) === JSON.stringify(snapshot(right));
+}
+
+function preserveRegistryTruncatedText(
+	existing: ClosedThread,
+	restored: ClosedThread,
+): ClosedThread {
+	if (!registryTruncatedTextMatchesFull(restored.lastAssistantText, existing.lastAssistantText)) {
+		return restored;
+	}
+
+	return { ...restored, lastAssistantText: existing.lastAssistantText };
+}
+
+function registryTruncatedTextMatchesFull(
+	truncatedText: string | null,
+	fullText: string | null,
+): boolean {
+	if (truncatedText === null || fullText === null) return false;
+	const match = /\n\[truncated ([1-9]\d*) chars for registry persistence\]$/u.exec(truncatedText);
+	if (match === null) return false;
+
+	const prefix = truncatedText.slice(0, match.index);
+	const omittedLength = Number(match[1]);
+	return (
+		Number.isSafeInteger(omittedLength) &&
+		fullText.length === prefix.length + omittedLength &&
+		fullText.startsWith(prefix)
+	);
+}
+
+function withThreadRegistryMetadata(thread: ClosedThread, restored: ClosedThread): ClosedThread {
+	return {
+		...thread,
+		registrySession: restored.registrySession,
+		registryGeneration: restored.registryGeneration,
+	};
 }
 
 function threadRegistryMetadataMatches(left: ManagedThread, right: ManagedThread): boolean {
@@ -1885,24 +2253,40 @@ const SENSITIVE_BOOLEAN_FLAGS = new Set([
 ]);
 
 const PACKAGE_SUBCOMMANDS = new Set(["config", "install", "list", "remove", "uninstall", "update"]);
-const NO_TOOLS_FLAGS = new Set(["--no-tools", "-nt"]);
-const NO_BUILTIN_TOOLS_FLAGS = new Set(["--no-builtin-tools", "-nbt"]);
-const NO_EXTENSIONS_FLAGS = new Set(["--no-extensions", "-ne"]);
-const NO_SKILLS_FLAGS = new Set(["--no-skills", "-ns"]);
-const NO_PROMPT_TEMPLATES_FLAGS = new Set(["--no-prompt-templates", "-np"]);
-const NO_THEMES_FLAGS = new Set(["--no-themes"]);
-const TOOLS_FLAGS = new Set(["--tools", "-t"]);
-const EXTENSION_FLAGS = new Set(["--extension", "-e"]);
-const SKILL_FLAGS = new Set(["--skill"]);
-const PROMPT_TEMPLATE_FLAGS = new Set(["--prompt-template"]);
-const THEME_FLAGS = new Set(["--theme"]);
-const EXCLUDE_TOOLS_FLAGS = new Set(["--exclude-tools", "-xt"]);
-const MODEL_SCOPE_FLAGS = new Set(["--models"]);
+
+// Derive alias sets from CLI_FLAG_SPECS so adding an alias cannot silently drift.
+function flagAliases(...canonicals: readonly string[]): ReadonlySet<string> {
+	const aliases = new Set<string>();
+	for (const canonical of canonicals) {
+		let found = false;
+		for (const [alias, spec] of CLI_FLAG_SPECS) {
+			if (spec.canonical !== canonical) continue;
+			aliases.add(alias);
+			found = true;
+		}
+		if (!found) throw new Error(`Unknown CLI flag spec: ${canonical}`);
+	}
+	return aliases;
+}
+
+const NO_TOOLS_FLAGS = flagAliases("--no-tools");
+const NO_BUILTIN_TOOLS_FLAGS = flagAliases("--no-builtin-tools");
+const NO_EXTENSIONS_FLAGS = flagAliases("--no-extensions");
+const NO_SKILLS_FLAGS = flagAliases("--no-skills");
+const NO_PROMPT_TEMPLATES_FLAGS = flagAliases("--no-prompt-templates");
+const NO_THEMES_FLAGS = flagAliases("--no-themes");
+const TOOLS_FLAGS = flagAliases("--tools");
+const EXTENSION_FLAGS = flagAliases("--extension");
+const SKILL_FLAGS = flagAliases("--skill");
+const PROMPT_TEMPLATE_FLAGS = flagAliases("--prompt-template");
+const THEME_FLAGS = flagAliases("--theme");
+const EXCLUDE_TOOLS_FLAGS = flagAliases("--exclude-tools");
+const MODEL_SCOPE_FLAGS = flagAliases("--models");
 const ALLOWED_EXTRA_ARGS_HELP =
 	"allowed start.args are safe narrowing flags such as --provider <value>, --model <value>, --models <value>, --thinking <value>, --exclude-tools <value>, --no-tools, --no-builtin-tools, --offline, --no-extensions, --no-skills, --no-prompt-templates, --no-themes, and --no-context-files";
 // Pi applies --thinking after scoped model thinking, so it can widen an inherited
 // --models scope just like selecting a different model/provider can.
-const MODEL_SCOPE_OVERRIDE_FLAGS = new Set(["--provider", "--model", "--models", "--thinking"]);
+const MODEL_SCOPE_OVERRIDE_FLAGS = flagAliases("--provider", "--model", "--models", "--thinking");
 const BUILTIN_TOOL_NAMES = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
 const INHERITED_ENABLE_RESTRICTIONS: readonly {
 	readonly restrictionFlags: ReadonlySet<string>;
@@ -2346,11 +2730,6 @@ function truncateDisplayName(value: string): string {
 	return `${value.slice(0, DISPLAY_NAME_MAX_LENGTH - 3).trimEnd()}...`;
 }
 
-function humanizeTaskName(taskName: string): string | null {
-	const text = taskName.replaceAll("_", " ").trim();
-	return text === "" ? null : text;
-}
-
 function shortTaskName(id: ThreadId): string {
 	return assertTaskName(id.slice(0, "thread_".length + 6));
 }
@@ -2479,6 +2858,16 @@ function sameSessionFile(left: string, right: string): boolean {
 	return path.resolve(left) === path.resolve(right);
 }
 
+function setThreadPhase(thread: LiveThread, phase: ThreadPhase): void {
+	if (thread.phase === phase) {
+		if (phase === "idle" && thread.idleStartedAt === null) thread.idleStartedAt = nowIso();
+		return;
+	}
+
+	thread.phase = phase;
+	thread.idleStartedAt = phase === "idle" ? nowIso() : null;
+}
+
 function defaultSendMode(phase: ThreadPhase): SendMode {
 	return phase === "idle" ? "prompt" : "follow_up";
 }
@@ -2520,7 +2909,7 @@ function recordAcceptedSend(thread: LiveThread, baseline: SendAcceptanceBaseline
 		if (observedActivity && thread.phase === "idle") {
 			clearObservedSendIfIdle(thread);
 		} else {
-			thread.phase = "busy";
+			setThreadPhase(thread, "busy");
 		}
 	}
 }
@@ -2534,7 +2923,7 @@ function recordAcceptedInitialPrompt(thread: LiveThread): void {
 		idleRefreshesToSettle: 1,
 		pendingMessageBaseline: getPendingMessageCount(thread),
 	};
-	if (thread.phase !== "stopping") thread.phase = "busy";
+	if (thread.phase !== "stopping") setThreadPhase(thread, "busy");
 }
 
 function recordPromptRunActivity(thread: LiveThread): void {
@@ -2548,6 +2937,9 @@ function clearPendingInitialPrompt(thread: LiveThread): void {
 
 function recordSendActivity(thread: LiveThread): void {
 	thread.activityGeneration++;
+	// Child-side activity while the thread remains idle should start a fresh
+	// idle-cleanup window without letting parent-side polls extend it.
+	if (thread.phase === "idle") thread.idleStartedAt = nowIso();
 	if (thread.awaitingSend !== null && !thread.awaitingSend.ignoreRunActivityUntilIdle) {
 		thread.awaitingSend.observedActivity = true;
 	}
@@ -2670,8 +3062,15 @@ function tail(text: string, maxBytes: number): string {
 
 function readInteger(value: string | undefined, fallback: number): number {
 	if (value === undefined) return fallback;
+	// Reject partial parses such as "5x" instead of silently reading them as 5.
+	if (!/^\d+$/u.test(value.trim())) return fallback;
 	const parsed = Number.parseInt(value, 10);
-	return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+	return Number.isSafeInteger(parsed) ? parsed : fallback;
+}
+
+function isoTimeMs(value: string): number {
+	const parsed = Date.parse(value);
+	return Number.isFinite(parsed) ? parsed : Date.now();
 }
 
 function readOptionalThreadId(value: string | undefined): ThreadId | null {

@@ -10,7 +10,6 @@ import {
 
 export type ThreadReferenceEntry = {
 	readonly id: ThreadId;
-	readonly name: string;
 	readonly taskName: string;
 	readonly path: ThreadPath;
 };
@@ -103,10 +102,7 @@ function resolveThreadTargetFromList(
 	}
 
 	const matches = threads.filter(
-		(thread) =>
-			thread.taskName === target ||
-			threadPathBasename(thread.path) === target ||
-			thread.name === target,
+		(thread) => thread.taskName === target || threadPathBasename(thread.path) === target,
 	);
 	if (matches.length === 1) return matches[0]!.id;
 	if (matches.length > 1) {
@@ -130,6 +126,6 @@ function unknownThreadReferenceErrorFromList(
 			? " No threads are currently managed by this parent."
 			: ` Known threads: ${suggestions.join("; ")}.`;
 	return new Error(
-		`Unknown thread reference: "${reference}". Accepted reference forms: thread id (thread_012345abcdef), canonical path (/root/task), relative path from the current thread (task or parent/task), or unambiguous taskName/name.${known} Repair: use a known path/id, run { "action": "list" }, or start the thread first.`,
+		`Unknown thread reference: "${reference}". Accepted reference forms: thread id (thread_012345abcdef), canonical path (/root/task), relative path from the current thread (task or parent/task), or unambiguous taskName.${known} Repair: use a known path/id, run { "action": "list" }, or start the thread first.`,
 	);
 }

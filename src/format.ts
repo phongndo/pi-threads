@@ -1,8 +1,11 @@
 import {
 	DEFAULT_THREAD_DETAIL,
+	currentAssistantOutputText,
+	humanizeTaskName,
 	isThreadExitFailed,
 	isThreadRunning,
 	nextSuggestedThreadActions,
+	nonBlankText,
 	threadPathBasename,
 	toThreadRuntimeSnapshot,
 	type ThreadDetail,
@@ -182,12 +185,6 @@ function formatResultLines(thread: ThreadSnapshot, detail: ThreadDetail): string
 	return lines;
 }
 
-function currentAssistantOutputText(thread: ThreadSnapshot): string | null {
-	const assistantText = nonBlankText(thread.lastAssistantText);
-	if (thread.state === "closed") return assistantText;
-	return nonBlankText(thread.lastPartialText) ?? assistantText;
-}
-
 function formatResultLabel(result: ThreadResultSummary): string {
 	const label = result.status === "partial" ? "Current assistant summary" : "Result summary";
 	const detail = formatResultMeta(result);
@@ -201,18 +198,19 @@ function formatResultMeta(result: ThreadResultSummary): string {
 	return parts.join(", ");
 }
 
-export function nextThreadActions(thread: ThreadSnapshot): readonly string[] {
-	return nextSuggestedThreadActions(thread);
-}
-
-function formatStatus(thread: ThreadSnapshot): string {
+export function formatThreadStateText(thread: ThreadSnapshot): string {
 	if (thread.state === "closed") {
 		if (thread.exit.kind === "stale") return "closed/stale";
 		if (isThreadExitFailed(thread.exit)) return "closed/failed";
 		return `closed/${thread.exit.kind}`;
 	}
 
-	return `live/${thread.phase} pid=${thread.pid}`;
+	return `live/${thread.phase}`;
+}
+
+function formatStatus(thread: ThreadSnapshot): string {
+	const stateText = formatThreadStateText(thread);
+	return thread.state === "live" ? `${stateText} pid=${thread.pid}` : stateText;
 }
 
 export function formatThreadEvent(event: ThreadEvent): string {
@@ -267,27 +265,13 @@ function formatExit(exit: ThreadExit): string {
 }
 
 function formatNextLine(thread: ThreadSnapshot): string {
-	return `Next: ${formatActionList(nextThreadActions(thread))}`;
+	return `Next: ${formatActionList(nextSuggestedThreadActions(thread))}`;
 }
 
 function formatActionList(actions: readonly string[]): string {
 	if (actions.length === 0) return "none";
 	if (actions.length === 1) return actions[0]!;
 	return `${actions.slice(0, -1).join(", ")}, or ${actions[actions.length - 1]!}`;
-}
-
-export function formatThreadLabel(idText: string, threads: readonly ThreadSnapshot[]): string {
-	// Try to find a thread by id, path, or taskName
-	for (const t of threads) {
-		if (t.id === idText || t.path === idText || t.taskName === idText || t.name === idText) {
-			return formatThreadTitle(t);
-		}
-	}
-	// Fall back to path basename or raw id
-	if (idText.startsWith("/")) {
-		return humanizeTaskName(idText.slice(idText.lastIndexOf("/") + 1));
-	}
-	return idText;
 }
 
 export function formatThreadTitle(thread: ThreadSnapshot): string {
@@ -301,23 +285,12 @@ export function formatThreadTitle(thread: ThreadSnapshot): string {
 	}
 
 	const taskName = cleanDisplayText(thread.taskName);
-	if (taskName !== null && taskName !== thread.id) return humanizeTaskName(taskName);
+	if (taskName !== null && taskName !== thread.id) return humanizeTaskName(taskName) ?? taskName;
 
 	const basename = threadPathBasename(thread.path);
-	if (basename !== thread.id) return humanizeTaskName(basename);
+	if (basename !== thread.id) return humanizeTaskName(basename) ?? basename;
 
 	return shortThreadId(thread.id);
-}
-
-export function formatThreadReference(thread: ThreadSnapshot): string {
-	return `${formatThreadTitle(thread)} (${thread.path})`;
-}
-
-export function formatThreadUserStatus(
-	thread: ThreadSnapshot,
-): "working" | "idle" | "done" | "failed" {
-	if (thread.state === "closed") return isThreadExitFailed(thread.exit) ? "failed" : "done";
-	return thread.phase === "idle" ? "idle" : "working";
 }
 
 export function formatThreadStateBadge(
@@ -344,14 +317,7 @@ export function formatThreadStateBadge(
 }
 
 export function formatThreadSummary(thread: ThreadSnapshot, maxLen?: number): string {
-	const statePart =
-		thread.state === "closed"
-			? thread.exit.kind === "stale"
-				? "closed/stale"
-				: isThreadExitFailed(thread.exit)
-					? "closed/failed"
-					: `closed/${thread.exit.kind}`
-			: `live/${thread.phase}`;
+	const statePart = formatThreadStateText(thread);
 	const pidPart = thread.state === "live" ? ` pid=${thread.pid}` : "";
 
 	const assistantText = nonBlankText(thread.lastAssistantText);
@@ -379,16 +345,6 @@ function cleanDisplayText(value: string | null): string | null {
 	if (value === null) return null;
 	const trimmed = value.trim();
 	return trimmed === "" ? null : trimmed;
-}
-
-function nonBlankText(value: string | null): string | null {
-	return value === null || value.trim() === "" ? null : value;
-}
-
-function humanizeTaskName(value: string): string {
-	const trimmed = value.trim();
-	if (trimmed === "") return trimmed;
-	return trimmed.replaceAll("_", " ");
 }
 
 function shortThreadId(value: string): string {

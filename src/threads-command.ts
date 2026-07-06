@@ -18,6 +18,7 @@ import {
 	formatPoll,
 	formatThreadEvent,
 	formatThreadStateBadge,
+	formatThreadStateText,
 	formatThreadSummary,
 	formatThreadTitle,
 } from "./format.ts";
@@ -463,7 +464,7 @@ export class ThreadsTreeComponent implements Component {
 		const parentManaged = this.threads.some((candidate) => candidate.path === thread.parentPath);
 		const lines = [
 			`Selected: ${formatThreadTitle(thread)}  ${thread.path}`,
-			`State: ${browserStateText(thread)}  Archived: ${thread.archived ? "yes" : "no"}  Saved session: ${thread.session.kind === "known" ? "yes" : "no"}  Resumable: ${thread.state === "closed" && thread.session.kind === "known" ? "yes" : "no"}  Children: ${children}`,
+			`State: ${formatThreadStateText(thread)}  Archived: ${thread.archived ? "yes" : "no"}  Saved session: ${thread.session.kind === "known" ? "yes" : "no"}  Resumable: ${thread.state === "closed" && thread.session.kind === "known" ? "yes" : "no"}  Children: ${children}`,
 			`Parent: ${thread.parentPath}${parentManaged ? " (managed)" : ""}`,
 			`Cwd: ${thread.cwd}`,
 		];
@@ -661,13 +662,6 @@ function browserStatus(thread: ThreadSnapshot): BrowserStatus {
 	if (thread.exit.kind === "stale") return "stale";
 	if (isThreadExitFailed(thread.exit)) return "failed";
 	return "done";
-}
-
-function browserStateText(thread: ThreadSnapshot): string {
-	if (thread.state === "live") return `live/${thread.phase}`;
-	if (thread.exit.kind === "stale") return "closed/stale";
-	if (isThreadExitFailed(thread.exit)) return "closed/failed";
-	return `closed/${thread.exit.kind}`;
 }
 
 function matchesStatusFilter(thread: ThreadSnapshot, filter: StatusFilter): boolean {

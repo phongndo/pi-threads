@@ -497,7 +497,6 @@ describe("session shutdown thread lifecycle", () => {
 		expect(
 			shouldShutdownThreadsOnSessionShutdown(
 				event({ targetSessionFile: "/tmp/child.jsonl" }),
-				ctx(),
 				managerWithThread(threadSnapshot()),
 			),
 		).toBe(false);
@@ -526,16 +525,12 @@ describe("session shutdown thread lifecycle", () => {
 		} as unknown as ThreadManager;
 
 		expect(
-			getThreadsSessionShutdownAction(
-				event({ targetSessionFile: "/tmp/child.jsonl" }),
-				ctx(),
-				manager,
-			).kind,
+			getThreadsSessionShutdownAction(event({ targetSessionFile: "/tmp/child.jsonl" }), manager)
+				.kind,
 		).toBe("stop_target");
 		expect(
 			shouldShutdownThreadsOnSessionShutdown(
 				event({ targetSessionFile: "/tmp/child.jsonl" }),
-				ctx(),
 				manager,
 			),
 		).toBe(true);
@@ -575,7 +570,6 @@ describe("session shutdown thread lifecycle", () => {
 		expect(
 			shouldShutdownThreadsOnSessionShutdown(
 				event({ reason: "quit" }),
-				ctx(),
 				managerWithThread(threadSnapshot()),
 			),
 		).toBe(true);
@@ -583,7 +577,6 @@ describe("session shutdown thread lifecycle", () => {
 		expect(
 			shouldShutdownThreadsOnSessionShutdown(
 				event({ targetSessionFile: "/tmp/other.jsonl" }),
-				ctx(),
 				managerWithThread(threadSnapshot()),
 			),
 		).toBe(true);

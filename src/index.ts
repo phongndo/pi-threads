@@ -32,11 +32,13 @@ import { registerThreadsCommand } from "./threads-command.ts";
 import {
 	PI_THREAD_REGISTRY_ENTRY_TYPE,
 	ThreadManager,
+	type ThreadRegistryEntryScope,
 	type ThreadRegistryPersistenceTarget,
 	type ThreadManagerScope,
 	type WaitProgress,
 } from "./thread-manager.ts";
-import { PI_THREAD_DESCRIPTION } from "./prompt.ts";
+
+export const PI_THREAD_DESCRIPTION = "Start and manage background Pi child sessions.";
 
 const PROCESS_MANAGER_KEY = "__piThreadsProcessManager";
 
@@ -74,10 +76,6 @@ type ThreadsSessionShutdownAction =
 	| { readonly kind: "shutdown" }
 	| { readonly kind: "preserve" }
 	| { readonly kind: "stop_target"; readonly thread: ThreadSnapshot };
-
-type ThreadRegistryEntryScope = {
-	readonly sessionId: string;
-};
 
 type SingleThreadResultDetails = {
 	readonly kind: string;
@@ -137,6 +135,9 @@ function scopeForThread(thread: ThreadSnapshot): ThreadManagerScope {
 }
 
 export function syncThreadManagerScope(ctx: ExtensionContext, manager: ThreadManager): void {
+	// The manager lives on globalThis, so after an in-place extension upgrade this
+	// can be an instance built by an older module version; feature-check methods
+	// that newer versions added before calling them.
 	if (typeof manager.hydrateFromSession === "function") manager.hydrateFromSession(ctx);
 	const sessionFile = ctx.sessionManager.getSessionFile();
 	if (sessionFile !== undefined) {
@@ -152,7 +153,6 @@ export function syncThreadManagerScope(ctx: ExtensionContext, manager: ThreadMan
 
 export function getThreadsSessionShutdownAction(
 	event: SessionShutdownEvent,
-	ctx: ExtensionContext,
 	manager: ThreadManager,
 ): ThreadsSessionShutdownAction {
 	if (event.reason !== "resume") return { kind: "shutdown" };
@@ -171,10 +171,9 @@ export function getThreadsSessionShutdownAction(
 
 export function shouldShutdownThreadsOnSessionShutdown(
 	event: SessionShutdownEvent,
-	ctx: ExtensionContext,
 	manager: ThreadManager,
 ): boolean {
-	return getThreadsSessionShutdownAction(event, ctx, manager).kind !== "preserve";
+	return getThreadsSessionShutdownAction(event, manager).kind !== "preserve";
 }
 
 export async function prepareThreadsForSessionShutdown(
@@ -182,7 +181,7 @@ export async function prepareThreadsForSessionShutdown(
 	ctx: ExtensionContext,
 	manager: ThreadManager,
 ): Promise<boolean> {
-	const action = getThreadsSessionShutdownAction(event, ctx, manager);
+	const action = getThreadsSessionShutdownAction(event, manager);
 	if (action.kind !== "stop_target") return action.kind === "shutdown";
 
 	try {
@@ -254,6 +253,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (event, ctx) => {
 		if (!(await prepareThreadsForSessionShutdown(event, ctx, manager))) return;
 		await manager.shutdown();
+		// Registered closures keep referencing this manager after the global is
+		// cleared, so forget the closed threads too — otherwise a later session in
+		// the same process would still list this session's threads.
+		if (typeof manager.clearThreads === "function") manager.clearThreads();
 		clearProcessManager(manager);
 	});
 

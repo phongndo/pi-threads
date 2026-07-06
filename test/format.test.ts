@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	asThreadId,
 	asThreadPath,
+	nextSuggestedThreadActions,
 	toThreadRuntimeSnapshot,
 	type ClosedThreadSnapshot,
 	type LiveThreadSnapshot,
@@ -9,12 +10,10 @@ import {
 } from "../src/domain.ts";
 import {
 	formatPoll,
-	formatThreadLabel,
+	formatThreadStateText,
 	formatThreadTitle,
-	formatThreadUserStatus,
 	formatWait,
 	formatWaitProgress,
-	nextThreadActions,
 } from "../src/format.ts";
 
 function liveThread(overrides: Partial<LiveThreadSnapshot> = {}): ThreadSnapshot {
@@ -93,18 +92,15 @@ describe("thread display formatting", () => {
 		expect(formatThreadTitle(thread)).toBe("review tests");
 	});
 
-	it("resolves labels from stable thread references", () => {
-		const thread = liveThread();
-		const threads = [thread];
-
-		expect(formatThreadLabel(thread.id, threads)).toBe("inspect repo");
-		expect(formatThreadLabel(thread.path, threads)).toBe("inspect repo");
-		expect(formatThreadLabel("/root/review_tests", threads)).toBe("review tests");
-	});
-
-	it("describes live idle threads as idle", () => {
-		expect(formatThreadUserStatus(liveThread({ phase: "idle" }))).toBe("idle");
-		expect(formatThreadUserStatus(liveThread({ phase: "busy" }))).toBe("working");
+	it("renders one canonical state text for live and closed threads", () => {
+		expect(formatThreadStateText(liveThread({ phase: "busy" }))).toBe("live/busy");
+		expect(formatThreadStateText(closedThread())).toBe("closed/exited");
+		expect(
+			formatThreadStateText(closedThread({ exit: { kind: "stale", message: "restored" } })),
+		).toBe("closed/stale");
+		expect(formatThreadStateText(closedThread({ exit: { kind: "failed", message: "boom" } }))).toBe(
+			"closed/failed",
+		);
 	});
 
 	it("shows running state and next actions in poll output", () => {
@@ -113,7 +109,7 @@ describe("thread display formatting", () => {
 		expect(output).toContain("Running: yes");
 		expect(output).toContain("Detail: summary");
 		expect(output).toContain("Next: wait, poll, send follow_up, or stop");
-		expect(nextThreadActions(liveThread({ phase: "busy" }))).toEqual([
+		expect(nextSuggestedThreadActions(liveThread({ phase: "busy" }))).toEqual([
 			"wait",
 			"poll",
 			"send follow_up",

@@ -175,12 +175,12 @@ Non-goal: no built-in agent profiles, roles, or workflow presets.
 
 ## 11. Safety and resource controls
 
-- [ ] Keep per-session concurrency limits.
-- [ ] Keep recursive thread depth limits.
-- [ ] Add optional timeout/idle cleanup for stale live children.
-- [ ] Ensure children never loosen parent restrictions.
-- [ ] Continue validating and allowlisting child CLI args.
-- [ ] Make shutdown behavior predictable for live children.
+- [x] Keep per-session concurrency limits.
+- [x] Keep recursive thread depth limits.
+- [x] Add optional timeout/idle cleanup for stale live children.
+- [x] Ensure children never loosen parent restrictions.
+- [x] Continue validating and allowlisting child CLI args.
+- [x] Make shutdown behavior predictable for live children.
 
 ## Suggested implementation order
 

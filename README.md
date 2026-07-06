@@ -237,10 +237,12 @@ pi install /path/to/pi-threads
 
 ## Configuration
 
-| Variable                 | Default | Purpose                                 |
-| ------------------------ | ------- | --------------------------------------- |
-| `PI_THREADS_MAX_DEPTH`   | `2`     | How deep threads can spawn threads.     |
-| `PI_THREADS_MAX_THREADS` | `8`     | Max concurrent live threads per parent. |
+| Variable                     | Default | Purpose                                                   |
+| ---------------------------- | ------- | --------------------------------------------------------- |
+| `PI_THREADS_MAX_DEPTH`       | `2`     | How deep threads can spawn threads.                       |
+| `PI_THREADS_MAX_THREADS`     | `8`     | Max concurrent live threads per parent.                   |
+| `PI_THREADS_IDLE_CLEANUP_MS` | `0`     | Stop idle live children after this many ms; 0 disables.   |
+| `PI_THREADS_LIVE_TIMEOUT_MS` | `0`     | Stop live children after this total lifetime; 0 disables. |
 
 ## Safety
 

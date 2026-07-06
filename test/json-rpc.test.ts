@@ -119,6 +119,35 @@ describe("RpcClient", () => {
 			cancelled: true,
 		});
 	});
+
+	it("reports stdio stream errors instead of crashing the parent", () => {
+		const fake = createRpcProcess();
+		const events: RpcClientEvent[] = [];
+		const client = new RpcClient(fake.process, (event) => events.push(event));
+
+		fake.process.stdin.emit("error", new Error("write EPIPE"));
+		fake.process.stdout.emit("error", new Error("read ECONNRESET"));
+
+		expect(client).toBeInstanceOf(RpcClient);
+		expect(events).toEqual([
+			expect.objectContaining({ kind: "parse_error", message: "RPC stdin error: write EPIPE" }),
+			expect.objectContaining({
+				kind: "parse_error",
+				message: "RPC stdout error: read ECONNRESET",
+			}),
+		]);
+	});
+
+	it("refuses new requests once stdin is no longer writable", () => {
+		const fake = createRpcProcess();
+		const client = new RpcClient(fake.process, () => undefined);
+
+		fake.process.stdin.end();
+
+		expect(() => client.requestWithHandle({ type: "get_state" }, 1_000)).toThrow(
+			/RPC process is closed/u,
+		);
+	});
 });
 
 async function endStream(stream: PassThrough, chunk: string): Promise<void> {

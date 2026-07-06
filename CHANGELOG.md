@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Repository community health documentation: contributing guide, security policy,
   code of conduct, issue templates, and pull request template.
 - README links for project quality, support, security, and license information.
+- Optional `PI_THREADS_IDLE_CLEANUP_MS` and `PI_THREADS_LIVE_TIMEOUT_MS` safety
+  controls for stale live children.
 
 ### Changed
 
@@ -23,3 +25,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a manual thread lifecycle control surface.
 - Public thread snapshot typings now use shared base interfaces to reduce
   duplicated domain shape definitions.
+- Live-child shutdown now uses a shared bounded stop path with SIGTERM then
+  SIGKILL fallback and a persisted final stopped snapshot.

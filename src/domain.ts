@@ -353,14 +353,19 @@ function summarizeThreadResult(thread: ThreadSnapshot, detail: ThreadDetail): Th
 	};
 }
 
-function currentAssistantOutputText(thread: ThreadSnapshot): string | null {
+export function currentAssistantOutputText(thread: ThreadSnapshot): string | null {
 	const assistantText = nonBlankText(thread.lastAssistantText);
 	if (thread.state === "closed") return assistantText;
 	return nonBlankText(thread.lastPartialText) ?? assistantText;
 }
 
-function nonBlankText(text: string | null): string | null {
+export function nonBlankText(text: string | null): string | null {
 	return text === null || text.trim() === "" ? null : text;
+}
+
+export function humanizeTaskName(taskName: string): string | null {
+	const text = taskName.replaceAll("_", " ").trim();
+	return text === "" ? null : text;
 }
 
 function projectThreadEvents(

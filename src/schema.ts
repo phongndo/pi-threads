@@ -2,6 +2,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
 import type { TLocalizedValidationError } from "typebox/error";
 import { Value } from "typebox/value";
+import { isRecord } from "./json.ts";
 
 const Strict = { additionalProperties: false } as const;
 const ActionValues = [
@@ -517,10 +518,6 @@ function fieldNameFromInstancePath(instancePath: string): string | null {
 		.join(".");
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function isAction(value: unknown): value is Action {
 	return typeof value === "string" && ActionValues.includes(value as Action);
 }
@@ -554,12 +551,11 @@ function requiredFieldsForAction(action: Action): readonly string[] {
 			return ["prompt"];
 		case "send":
 			return ["id", "message"];
-		case "resume":
-		case "archive":
-			return ["id"];
 		case "poll":
 		case "stop":
 		case "wait":
+		case "resume":
+		case "archive":
 			return ["id"];
 		case "fork":
 		case "list":

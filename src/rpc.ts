@@ -10,11 +10,8 @@ export type RpcCommand =
 			readonly message: string;
 			readonly streamingBehavior?: PromptStreamingBehavior;
 	  }
-	| { readonly type: "steer"; readonly message: string }
-	| { readonly type: "follow_up"; readonly message: string }
 	| { readonly type: "abort" }
 	| { readonly type: "get_state" }
-	| { readonly type: "get_last_assistant_text" }
 	| { readonly type: "extension_ui_response"; readonly id: string; readonly cancelled: true };
 
 export type RpcResponse = {
@@ -43,21 +40,38 @@ export type RpcRequestHandle = {
 };
 
 export class RpcClient {
-	readonly #process: ChildProcessWithoutNullStreams;
+	readonly #child: ChildProcessWithoutNullStreams;
 	readonly #pending = new Map<string, PendingResponse>();
 	readonly #onEvent: (event: RpcClientEvent) => void;
 	#closed = false;
 
-	constructor(process: ChildProcessWithoutNullStreams, onEvent: (event: RpcClientEvent) => void) {
-		this.#process = process;
+	constructor(child: ChildProcessWithoutNullStreams, onEvent: (event: RpcClientEvent) => void) {
+		this.#child = child;
 		this.#onEvent = onEvent;
 
-		attachJsonlReader(this.#process.stdout, (line) => this.#handleLine(line), {
+		attachJsonlReader(this.#child.stdout, (line) => this.#handleLine(line), {
 			onError: (error) => {
 				this.#onEvent({ kind: "parse_error", line: "", message: error.message });
 			},
 		});
-		this.#process.once("close", () => {
+		// Stdio streams emit "error" independently of the process "close"/"error"
+		// events (for example EPIPE when a write races the child dying). Without
+		// listeners those become uncaught exceptions in the parent process.
+		this.#child.stdin.on("error", (error: Error) => {
+			this.#onEvent({
+				kind: "parse_error",
+				line: "",
+				message: `RPC stdin error: ${error.message}`,
+			});
+		});
+		this.#child.stdout.on("error", (error: Error) => {
+			this.#onEvent({
+				kind: "parse_error",
+				line: "",
+				message: `RPC stdout error: ${error.message}`,
+			});
+		});
+		this.#child.once("close", () => {
 			this.#closed = true;
 			this.#rejectAll(new Error("Pi RPC process closed"));
 		});
@@ -74,7 +88,7 @@ export class RpcClient {
 		command: Exclude<RpcCommand, { readonly type: "extension_ui_response" }>,
 		timeoutMs: number,
 	): RpcRequestHandle {
-		if (this.#closed) throw new Error("Pi RPC process is closed");
+		if (!this.#writable()) throw new Error("Pi RPC process is closed");
 
 		const id = `req_${randomUUID()}`;
 		const payload = { ...command, id };
@@ -93,12 +107,24 @@ export class RpcClient {
 	}
 
 	respondToUiRequest(id: string): void {
-		if (this.#closed) return;
+		if (!this.#writable()) return;
 		this.#write({ type: "extension_ui_response", id, cancelled: true });
 	}
 
+	#writable(): boolean {
+		return !this.#closed && this.#child.stdin.writable;
+	}
+
 	#write(payload: Record<string, unknown>): void {
-		this.#process.stdin.write(`${JSON.stringify(payload)}\n`);
+		try {
+			this.#child.stdin.write(`${JSON.stringify(payload)}\n`);
+		} catch (error) {
+			this.#onEvent({
+				kind: "parse_error",
+				line: "",
+				message: `RPC stdin write failed: ${error instanceof Error ? error.message : String(error)}`,
+			});
+		}
 	}
 
 	#handleLine(line: string): void {

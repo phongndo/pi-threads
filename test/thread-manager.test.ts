@@ -95,6 +95,7 @@ function mockResponsiveChild(sessionId: string): FakeChildProcess {
 		}
 
 		if (request["type"] === "prompt") respond(child, request);
+		if (request["type"] === "abort") respond(child, request);
 	});
 	return child;
 }
@@ -120,6 +121,49 @@ function writeSessionHeader(file: string, id = "session-test", cwd = process.cwd
 	);
 }
 
+function closedKnownSnapshot(options: {
+	readonly id: string;
+	readonly name?: string;
+	readonly taskName: string;
+	readonly threadPath: string;
+	readonly parentPath?: string;
+	readonly parentThreadId?: string | null;
+	readonly depth?: number;
+	readonly cwd: string;
+	readonly sessionFile: string;
+	readonly sessionId: string;
+}): ThreadSnapshot {
+	return {
+		state: "closed",
+		id: asThreadId(options.id),
+		name: options.name ?? options.taskName,
+		taskName: options.taskName,
+		path: asThreadPath(options.threadPath),
+		parentPath: asThreadPath(options.parentPath ?? "/root"),
+		parentThreadId:
+			options.parentThreadId === undefined || options.parentThreadId === null
+				? null
+				: asThreadId(options.parentThreadId),
+		depth: options.depth ?? 1,
+		archived: false,
+		cwd: options.cwd,
+		args: [],
+		createdAt: "2026-01-01T00:00:00.000Z",
+		lastEventAt: "2026-01-01T00:00:00.000Z",
+		exit: { kind: "stale", message: "restored" },
+		session: {
+			kind: "known",
+			file: options.sessionFile,
+			id: options.sessionId,
+			name: null,
+			pendingMessageCount: null,
+		},
+		lastAssistantText: null,
+		recentEvents: [],
+		stderrTail: "",
+	};
+}
+
 describe("ThreadManager session metadata", () => {
 	beforeEach(() => {
 		spawnMock.mockReset();
@@ -138,19 +182,25 @@ describe("ThreadManager session metadata", () => {
 
 	it("reports ambiguous references with candidate paths", async () => {
 		const manager = new ThreadManager(managerEnvironment());
-		mockResponsiveChild("session-alpha");
-		await manager.start(
-			{ action: "start", prompt: "one", taskName: "alpha", name: "Shared" },
-			context(),
-		);
-		mockResponsiveChild("session-beta");
-		await manager.start(
-			{ action: "start", prompt: "two", taskName: "beta", name: "Shared" },
-			context(),
-		);
+		manager.rebindScope({
+			currentPath: asThreadPath("/root/alpha"),
+			depth: 1,
+			selfThreadId: null,
+		});
+		mockResponsiveChild("session-alpha-shared");
+		await manager.start({ action: "start", prompt: "one", taskName: "shared" }, context());
 
-		await expect(manager.poll("Shared")).rejects.toThrow(
-			/Ambiguous thread reference "Shared".*Candidate paths: \/root\/alpha, \/root\/beta.*Repair/u,
+		manager.rebindScope({
+			currentPath: asThreadPath("/root/beta"),
+			depth: 1,
+			selfThreadId: null,
+		});
+		mockResponsiveChild("session-beta-shared");
+		await manager.start({ action: "start", prompt: "two", taskName: "shared" }, context());
+		manager.resetScope();
+
+		await expect(manager.poll("shared")).rejects.toThrow(
+			/Ambiguous thread reference "shared".*Candidate paths: \/root\/alpha\/shared, \/root\/beta\/shared.*Repair/u,
 		);
 	});
 
@@ -164,6 +214,169 @@ describe("ThreadManager session metadata", () => {
 		).rejects.toThrow(
 			/Thread path already exists: \/root\/alpha.*choose a unique start\.taskName/u,
 		);
+	});
+
+	it("keeps the per-session live thread concurrency limit", async () => {
+		const manager = new ThreadManager({
+			...managerEnvironment(),
+			PI_THREADS_MAX_THREADS: "1",
+		});
+		mockResponsiveChild("session-alpha");
+
+		await manager.start({ action: "start", prompt: "one", taskName: "alpha" }, context());
+
+		await expect(
+			manager.start({ action: "start", prompt: "two", taskName: "beta" }, context()),
+		).rejects.toThrow(/pi-threads live thread limit reached: 1\/1/u);
+		await expect(manager.fork({ action: "fork" }, context())).rejects.toThrow(
+			/pi-threads live thread limit reached: 1\/1/u,
+		);
+		expect(spawnMock).toHaveBeenCalledTimes(1);
+
+		await manager.stop({ action: "stop", id: "/root/alpha" });
+		mockResponsiveChild("session-beta");
+
+		await expect(
+			manager.start({ action: "start", prompt: "two", taskName: "beta" }, context()),
+		).resolves.toMatchObject({ thread: { path: "/root/beta" } });
+		expect(spawnMock).toHaveBeenCalledTimes(2);
+	});
+
+	it("awaits an in-flight cleanup before enforcing the live thread limit", async () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			const oldChild = new FakeChildProcess();
+			spawnMock.mockReturnValueOnce(oldChild);
+			attachRpc(oldChild, (request) => {
+				if (request["type"] === "get_state") {
+					respond(oldChild, request, {
+						sessionFile: "/tmp/session-old-cleanup.jsonl",
+						sessionId: "session-old-cleanup",
+						pendingMessageCount: 0,
+						isStreaming: false,
+					});
+					return;
+				}
+
+				if (request["type"] === "prompt") respond(oldChild, request);
+				// Keep abort pending so cleanup remains in flight while start is called.
+			});
+			const manager = new ThreadManager({
+				...managerEnvironment(),
+				PI_THREADS_MAX_THREADS: "1",
+				PI_THREADS_LIVE_TIMEOUT_MS: "1000",
+			});
+
+			await manager.start({ action: "start", prompt: "old", taskName: "old" }, context());
+			await vi.advanceTimersByTimeAsync(1000);
+			expect(manager.list({ action: "list", state: "live" })).toHaveLength(1);
+
+			mockResponsiveChild("session-new-cleanup");
+			const started = manager
+				.start({ action: "start", prompt: "new", taskName: "new" }, context())
+				.then(
+					(value) => ({ status: "fulfilled" as const, value }),
+					(reason: unknown) => ({ status: "rejected" as const, reason }),
+				);
+
+			await vi.advanceTimersByTimeAsync(1499);
+			expect(spawnMock).toHaveBeenCalledTimes(1);
+
+			await vi.advanceTimersByTimeAsync(1);
+			const result = await started;
+			if (result.status === "rejected") throw result.reason;
+
+			expect(oldChild.kill).toHaveBeenCalledWith("SIGTERM");
+			expect(result.value.thread).toMatchObject({ path: "/root/new", state: "live" });
+			expect(spawnMock).toHaveBeenCalledTimes(2);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("re-checks for newly expired threads after awaiting an in-flight cleanup", async () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			const firstChild = new FakeChildProcess();
+			let firstAbortRequest: Record<string, unknown> | null = null;
+			let resolveFirstAbortSeen!: () => void;
+			const firstAbortSeen = new Promise<void>((resolve) => {
+				resolveFirstAbortSeen = resolve;
+			});
+			spawnMock.mockReturnValueOnce(firstChild);
+			attachRpc(firstChild, (request) => {
+				if (request["type"] === "get_state") {
+					respond(firstChild, request, {
+						sessionFile: "/tmp/session-first-cleanup.jsonl",
+						sessionId: "session-first-cleanup",
+						pendingMessageCount: 0,
+						isStreaming: false,
+					});
+					return;
+				}
+
+				if (request["type"] === "prompt") respond(firstChild, request);
+				if (request["type"] === "abort") {
+					firstAbortRequest = request;
+					resolveFirstAbortSeen();
+				}
+			});
+			const manager = new ThreadManager({
+				...managerEnvironment(),
+				PI_THREADS_MAX_THREADS: "2",
+				PI_THREADS_LIVE_TIMEOUT_MS: "1000",
+			});
+
+			await manager.start({ action: "start", prompt: "first", taskName: "first" }, context());
+			await vi.advanceTimersByTimeAsync(500);
+			const secondChild = mockResponsiveChild("session-second-cleanup");
+			await manager.start({ action: "start", prompt: "second", taskName: "second" }, context());
+
+			await vi.advanceTimersByTimeAsync(500);
+			await firstAbortSeen;
+
+			mockResponsiveChild("session-third-cleanup");
+			const started = manager
+				.start({ action: "start", prompt: "third", taskName: "third" }, context())
+				.then(
+					(value) => ({ status: "fulfilled" as const, value }),
+					(reason: unknown) => ({ status: "rejected" as const, reason }),
+				);
+
+			await vi.advanceTimersByTimeAsync(500);
+			expect(secondChild.kill).not.toHaveBeenCalled();
+			expect(spawnMock).toHaveBeenCalledTimes(2);
+
+			if (firstAbortRequest === null) throw new Error("expected first abort request");
+			respond(firstChild, firstAbortRequest);
+			const result = await started;
+			if (result.status === "rejected") throw result.reason;
+
+			expect(firstChild.kill).toHaveBeenCalledWith("SIGTERM");
+			expect(secondChild.kill).toHaveBeenCalledWith("SIGTERM");
+			expect(result.value.thread).toMatchObject({ path: "/root/third", state: "live" });
+			expect(spawnMock).toHaveBeenCalledTimes(3);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("keeps the recursive thread depth limit", async () => {
+		const manager = new ThreadManager({
+			...managerEnvironment(),
+			PI_THREADS_DEPTH: "2",
+			PI_THREADS_MAX_DEPTH: "2",
+		});
+
+		await expect(
+			manager.start({ action: "start", prompt: "too deep", taskName: "too_deep" }, context()),
+		).rejects.toThrow(/recursion depth 2 has reached PI_THREADS_MAX_DEPTH=2/u);
+		await expect(manager.fork({ action: "fork" }, context())).rejects.toThrow(
+			/recursion depth 2 has reached PI_THREADS_MAX_DEPTH=2/u,
+		);
+		expect(spawnMock).not.toHaveBeenCalled();
 	});
 
 	it("auto-generates task names from display names when taskName is omitted", async () => {
@@ -360,6 +573,75 @@ describe("ThreadManager session metadata", () => {
 		expect(refreshSnapshot.recentEvents.map((event) => event.type)).toContain("turn_completed");
 	});
 
+	it("truncates oversized assistant output in persisted registry snapshots only", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+		const snapshots: ThreadSnapshot[] = [];
+		manager.setPersistence({ appendSnapshot: (snapshot) => snapshots.push(snapshot) });
+		const child = mockResponsiveChild("session-alpha");
+
+		await manager.start({ action: "start", prompt: "work", taskName: "alpha" }, context());
+		snapshots.length = 0;
+
+		const longText = "x".repeat(30_000);
+		emitRpcEvent(child, {
+			type: "message_end",
+			message: { role: "assistant", content: [{ type: "text", text: longText }] },
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		const persisted = snapshots.at(-1);
+		if (persisted === undefined) throw new Error("expected a persisted snapshot");
+		expect(persisted.lastAssistantText).not.toBeNull();
+		expect(persisted.lastAssistantText?.length).toBeLessThan(longText.length);
+		expect(persisted.lastAssistantText).toContain("[truncated");
+
+		const inMemory = manager.list({ action: "list", state: "all" })[0];
+		expect(inMemory?.lastAssistantText).toBe(longText);
+	});
+
+	it("does not downgrade in-memory output when hydrating truncated registry snapshots", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+		const snapshots: ThreadSnapshot[] = [];
+		manager.setPersistence({ appendSnapshot: (snapshot) => snapshots.push(snapshot) });
+		const child = mockResponsiveChild("session-alpha");
+
+		await manager.start({ action: "start", prompt: "work", taskName: "alpha" }, context());
+
+		const longText = "x".repeat(30_000);
+		emitRpcEvent(child, {
+			type: "message_end",
+			message: { role: "assistant", content: [{ type: "text", text: longText }] },
+		});
+		child.emit("close", 0, null);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		const latest = snapshots.at(-1);
+		if (latest === undefined) throw new Error("expected a persisted snapshot");
+		expect(latest.state).toBe("closed");
+		expect(latest.lastAssistantText).toContain("[truncated");
+		expect(manager.list({ action: "list", state: "all" })[0]?.lastAssistantText).toBe(longText);
+
+		manager.hydrateFromSession({
+			sessionManager: { getBranch: () => [registryEntry(latest)] },
+		} as unknown as ExtensionContext);
+
+		expect(manager.list({ action: "list", state: "all" })[0]?.lastAssistantText).toBe(longText);
+	});
+
+	it("forgets closed threads on clearThreads so a later session starts clean", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+		const child = mockResponsiveChild("session-alpha");
+
+		await manager.start({ action: "start", prompt: "work", taskName: "alpha" }, context());
+		child.emit("close", 0, null);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(manager.list({ action: "list", state: "all" })).toHaveLength(1);
+
+		manager.clearThreads();
+
+		expect(manager.list({ action: "list", state: "all", visibility: "all" })).toHaveLength(0);
+	});
+
 	it("keeps background persistence bound to the thread owner's session after switches", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-owner-session-"));
 		try {
@@ -420,6 +702,115 @@ describe("ThreadManager session metadata", () => {
 				}),
 			});
 		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps starts bound to the captured registry owner when cleanup awaits", async () => {
+		vi.useFakeTimers();
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-cleanup-owner-"));
+		try {
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			const rootSessionFile = path.join(root, "root.jsonl");
+			const otherSessionFile = path.join(root, "other.jsonl");
+			const manager = new ThreadManager({
+				...managerEnvironment(),
+				PI_THREADS_LIVE_TIMEOUT_MS: "1",
+			});
+			const writes: Array<{
+				readonly path: string;
+				readonly scope: unknown;
+				readonly target: unknown;
+			}> = [];
+			manager.setPersistence({
+				appendSnapshot: (snapshot, scope, target) => {
+					writes.push({ path: snapshot.path, scope, target });
+				},
+			});
+			manager.hydrateFromSession({
+				sessionManager: {
+					getBranch: () => [],
+					getSessionId: () => "session-root",
+					getSessionFile: () => rootSessionFile,
+					getSessionDir: () => root,
+				},
+			} as unknown as ExtensionContext);
+
+			const expiredChild = new FakeChildProcess();
+			let abortRequest: Record<string, unknown> | null = null;
+			let resolveAbortSeen!: () => void;
+			const abortSeen = new Promise<void>((resolve) => {
+				resolveAbortSeen = resolve;
+			});
+			spawnMock.mockReturnValueOnce(expiredChild);
+			attachRpc(expiredChild, (request) => {
+				if (request["type"] === "get_state") {
+					respond(expiredChild, request, {
+						sessionFile: "/tmp/session-expired.jsonl",
+						sessionId: "session-expired",
+						pendingMessageCount: 0,
+						isStreaming: false,
+					});
+					return;
+				}
+				if (request["type"] === "prompt") {
+					respond(expiredChild, request);
+					return;
+				}
+				if (request["type"] === "abort") {
+					abortRequest = request;
+					resolveAbortSeen();
+				}
+			});
+
+			await manager.start({ action: "start", prompt: "expire me", taskName: "expired" }, context());
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.002Z"));
+
+			const newChild = new FakeChildProcess();
+			spawnMock.mockReturnValueOnce(newChild);
+			attachRpc(newChild, (request) => {
+				if (request["type"] === "get_state") {
+					respond(newChild, request, {
+						sessionFile: "/tmp/session-new.jsonl",
+						sessionId: "session-new",
+						pendingMessageCount: 0,
+						isStreaming: false,
+					});
+					return;
+				}
+				if (request["type"] === "prompt") respond(newChild, request);
+			});
+
+			const start = manager.start(
+				{ action: "start", prompt: "new work", taskName: "new_work" },
+				context(),
+			);
+			await abortSeen;
+
+			manager.hydrateFromSession({
+				sessionManager: {
+					getBranch: () => [],
+					getSessionId: () => "session-other",
+					getSessionFile: () => otherSessionFile,
+					getSessionDir: () => root,
+				},
+			} as unknown as ExtensionContext);
+
+			if (abortRequest === null) throw new Error("expected cleanup abort request");
+			respond(expiredChild, abortRequest);
+
+			await expect(start).resolves.toMatchObject({ thread: { path: "/root/new_work" } });
+			expect(writes.find((write) => write.path === "/root/new_work")).toEqual({
+				path: "/root/new_work",
+				scope: { sessionId: "session-root" },
+				target: expect.objectContaining({
+					sessionId: "session-root",
+					sessionFile: rootSessionFile,
+					isCurrentSession: false,
+				}),
+			});
+		} finally {
+			vi.useRealTimers();
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
@@ -805,6 +1196,71 @@ describe("ThreadManager session metadata", () => {
 		}
 	});
 
+	it("coalesces overlapping resume calls for the same closed thread", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-resume-race-"));
+		try {
+			const sessionFile = path.join(root, "child.jsonl");
+			writeSessionHeader(sessionFile, "session-child", root);
+			const snapshot: ThreadSnapshot = {
+				state: "closed",
+				id: asThreadId("thread_012345abcdef"),
+				name: "alpha",
+				taskName: "alpha",
+				path: asThreadPath("/root/alpha"),
+				parentPath: asThreadPath("/root"),
+				parentThreadId: null,
+				depth: 1,
+				archived: false,
+				cwd: root,
+				args: [],
+				createdAt: "2026-01-01T00:00:00.000Z",
+				lastEventAt: "2026-01-01T00:00:00.000Z",
+				exit: { kind: "stale", message: "restored" },
+				session: {
+					kind: "known",
+					file: sessionFile,
+					id: "session-child",
+					name: null,
+					pendingMessageCount: null,
+				},
+				lastAssistantText: null,
+				recentEvents: [],
+				stderrTail: "",
+			};
+			const manager = new ThreadManager(managerEnvironment());
+			manager.hydrateFromSession({
+				sessionManager: { getBranch: () => [registryEntry(snapshot)] },
+			} as unknown as ExtensionContext);
+
+			spawnMock.mockImplementation(() => {
+				const child = new FakeChildProcess();
+				attachRpc(child, (request) => {
+					if (request["type"] === "get_state") {
+						respond(child, request, {
+							sessionFile,
+							sessionId: "session-child",
+							pendingMessageCount: 0,
+							isStreaming: false,
+						});
+					}
+				});
+				return child;
+			});
+
+			const [first, second] = await Promise.all([
+				manager.resume({ action: "resume", id: "/root/alpha" }, context({ cwd: root })),
+				manager.resume({ action: "resume", id: "/root/alpha" }, context({ cwd: root })),
+			]);
+
+			expect(spawnMock).toHaveBeenCalledTimes(1);
+			expect(first).toMatchObject({ alreadyLive: false, thread: { state: "live" } });
+			expect(second).toMatchObject({ alreadyLive: true, thread: { state: "live" } });
+			expect(manager.list({ action: "list", state: "live" })).toHaveLength(1);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("unarchives resumed sessions so live work remains visible", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-resume-archive-"));
 		try {
@@ -968,6 +1424,202 @@ describe("ThreadManager session metadata", () => {
 		);
 	});
 
+	it("captures start scope before cleanup yields", async () => {
+		const manager = new ThreadManager({
+			...managerEnvironment(),
+			PI_THREADS_MAX_DEPTH: "3",
+		});
+		manager.rebindScope({
+			currentPath: asThreadPath("/root/alpha"),
+			depth: 1,
+			selfThreadId: asThreadId("thread_aaaaaaaaaaaa"),
+		});
+		mockResponsiveChild("session-alpha-child");
+
+		const started = manager.start(
+			{ action: "start", prompt: "nested", taskName: "child" },
+			context(),
+		);
+		manager.rebindScope({
+			currentPath: asThreadPath("/root/beta"),
+			depth: 1,
+			selfThreadId: asThreadId("thread_bbbbbbbbbbbb"),
+		});
+
+		const outcome = await started;
+
+		expect(outcome.thread.path).toBe("/root/alpha/child");
+		expect(outcome.thread.parentPath).toBe("/root/alpha");
+		expect(outcome.thread.parentThreadId).toBe("thread_aaaaaaaaaaaa");
+		expect(outcome.thread.depth).toBe(2);
+		expect(spawnMock).toHaveBeenCalledWith(
+			expect.any(String),
+			expect.any(Array),
+			expect.objectContaining({
+				env: expect.objectContaining({
+					PI_THREADS_PARENT_ID: "thread_aaaaaaaaaaaa",
+					PI_THREADS_PARENT_PATH: "/root/alpha",
+					PI_THREADS_PATH: "/root/alpha/child",
+				}),
+			}),
+		);
+	});
+
+	it("captures fork scope and source before cleanup yields", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-fork-scope-race-"));
+		try {
+			const alphaSessionFile = path.join(root, "alpha-source.jsonl");
+			const betaSessionFile = path.join(root, "beta-source.jsonl");
+			writeSessionHeader(alphaSessionFile, "session-alpha-source", root);
+			writeSessionHeader(betaSessionFile, "session-beta-source", root);
+			const alphaSource = closedKnownSnapshot({
+				id: "thread_aaaaaaaaaaaa",
+				name: "Alpha source",
+				taskName: "source",
+				threadPath: "/root/alpha/source",
+				parentPath: "/root/alpha",
+				depth: 2,
+				cwd: root,
+				sessionFile: alphaSessionFile,
+				sessionId: "session-alpha-source",
+			});
+			const betaSource = closedKnownSnapshot({
+				id: "thread_bbbbbbbbbbbb",
+				name: "Beta source",
+				taskName: "source",
+				threadPath: "/root/beta/source",
+				parentPath: "/root/beta",
+				depth: 2,
+				cwd: root,
+				sessionFile: betaSessionFile,
+				sessionId: "session-beta-source",
+			});
+			const manager = new ThreadManager({
+				...managerEnvironment(),
+				PI_THREADS_MAX_DEPTH: "3",
+			});
+			manager.hydrateFromSession({
+				sessionManager: {
+					getBranch: () => [registryEntry(alphaSource), registryEntry(betaSource)],
+				},
+			} as unknown as ExtensionContext);
+			manager.rebindScope({
+				currentPath: asThreadPath("/root/alpha"),
+				depth: 1,
+				selfThreadId: asThreadId("thread_111111111111"),
+			});
+			mockResponsiveChild("session-alpha-fork");
+
+			const forked = manager.fork(
+				{ action: "fork", id: "source", taskName: "forked" },
+				context({ cwd: root }),
+			);
+			manager.rebindScope({
+				currentPath: asThreadPath("/root/beta"),
+				depth: 1,
+				selfThreadId: asThreadId("thread_222222222222"),
+			});
+
+			const outcome = await forked;
+
+			expect(outcome.sourceSessionFile).toBe(alphaSessionFile);
+			expect(outcome.thread.path).toBe("/root/alpha/forked");
+			expect(outcome.thread.parentPath).toBe("/root/alpha");
+			expect(outcome.thread.parentThreadId).toBe("thread_111111111111");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("captures resume depth before cleanup yields", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-resume-scope-race-"));
+		try {
+			const sessionFile = path.join(root, "alpha.jsonl");
+			writeSessionHeader(sessionFile, "session-alpha", root);
+			const snapshot = closedKnownSnapshot({
+				id: "thread_aaaaaaaaaaaa",
+				taskName: "alpha",
+				threadPath: "/root/alpha",
+				cwd: root,
+				sessionFile,
+				sessionId: "session-alpha",
+			});
+			const manager = new ThreadManager({
+				...managerEnvironment(),
+				PI_THREADS_MAX_DEPTH: "2",
+			});
+			manager.hydrateFromSession({
+				sessionManager: { getBranch: () => [registryEntry(snapshot)] },
+			} as unknown as ExtensionContext);
+			const child = new FakeChildProcess();
+			spawnMock.mockReturnValueOnce(child);
+			attachRpc(child, (request) => {
+				if (request["type"] === "get_state") {
+					respond(child, request, {
+						sessionFile,
+						sessionId: "session-alpha",
+						pendingMessageCount: 0,
+						isStreaming: false,
+					});
+				}
+			});
+
+			const resumed = manager.resume({ action: "resume", id: "alpha" }, context({ cwd: root }));
+			manager.rebindScope({
+				currentPath: asThreadPath("/root/beta/deep"),
+				depth: 2,
+				selfThreadId: asThreadId("thread_bbbbbbbbbbbb"),
+			});
+
+			await expect(resumed).resolves.toMatchObject({
+				alreadyLive: false,
+				thread: { path: "/root/alpha", state: "live" },
+			});
+			expect(spawnMock).toHaveBeenCalledTimes(1);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("propagates cleanup limits from the manager environment to children", async () => {
+		const previousIdleCleanupMs = process.env["PI_THREADS_IDLE_CLEANUP_MS"];
+		const previousLiveTimeoutMs = process.env["PI_THREADS_LIVE_TIMEOUT_MS"];
+		let manager: InstanceType<typeof ThreadManager> | null = null;
+		process.env["PI_THREADS_IDLE_CLEANUP_MS"] = "111";
+		process.env["PI_THREADS_LIVE_TIMEOUT_MS"] = "222";
+
+		try {
+			mockResponsiveChild("session-cleanup-env");
+			manager = new ThreadManager({
+				...managerEnvironment(),
+				PI_THREADS_IDLE_CLEANUP_MS: "3333",
+				PI_THREADS_LIVE_TIMEOUT_MS: "4444",
+			});
+
+			await manager.start(
+				{ action: "start", prompt: "cleanup env", taskName: "cleanup_env" },
+				context(),
+			);
+
+			expect(spawnMock).toHaveBeenCalledWith(
+				expect.any(String),
+				expect.any(Array),
+				expect.objectContaining({
+					env: expect.objectContaining({
+						PI_THREADS_IDLE_CLEANUP_MS: "3333",
+						PI_THREADS_LIVE_TIMEOUT_MS: "4444",
+					}),
+				}),
+			);
+		} finally {
+			await manager?.shutdown();
+			if (previousIdleCleanupMs === undefined) delete process.env["PI_THREADS_IDLE_CLEANUP_MS"];
+			else process.env["PI_THREADS_IDLE_CLEANUP_MS"] = previousIdleCleanupMs;
+			if (previousLiveTimeoutMs === undefined) delete process.env["PI_THREADS_LIVE_TIMEOUT_MS"];
+			else process.env["PI_THREADS_LIVE_TIMEOUT_MS"] = previousLiveTimeoutMs;
+		}
+	});
+
 	it("allows list filters to use unmanaged path-only ancestors", async () => {
 		const manager = new ThreadManager(managerEnvironment());
 		manager.rebindScope({
@@ -1027,6 +1679,23 @@ describe("ThreadManager session metadata", () => {
 
 		expect(requests).toEqual(["get_state", "prompt"]);
 		expect(prompts).toEqual(["/review ignored\n\nUse only this prompt."]);
+	});
+
+	it("validates start args before spawning a child", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+
+		await expect(
+			manager.start(
+				{
+					action: "start",
+					prompt: "invalid args",
+					taskName: "invalid_args",
+					args: ["--session", "/tmp/nope.jsonl"],
+				},
+				context(),
+			),
+		).rejects.toThrow(/Unsupported child Pi arg.*--session/u);
+		expect(spawnMock).not.toHaveBeenCalled();
 	});
 
 	it("records canonical lifecycle events with stable sequence numbers", async () => {
@@ -1181,6 +1850,614 @@ describe("ThreadManager session metadata", () => {
 		await manager.poll("/root/alpha");
 
 		expect(onChange).toHaveBeenCalledTimes(1);
+	});
+
+	it("optionally cleans up idle live children after the configured idle timeout", async () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			const child = mockResponsiveChild("session-idle-cleanup");
+			const manager = new ThreadManager({
+				...managerEnvironment(),
+				PI_THREADS_IDLE_CLEANUP_MS: "1000",
+			});
+
+			await manager.start(
+				{ action: "start", prompt: "idle cleanup", taskName: "idle_cleanup" },
+				context(),
+			);
+			emitRpcEvent(child, { type: "agent_end" });
+
+			await vi.advanceTimersByTimeAsync(999);
+			expect(manager.list({ action: "list", state: "live" })).toHaveLength(1);
+
+			await vi.advanceTimersByTimeAsync(1);
+
+			expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+			expect(manager.list({ action: "list", state: "live" })).toEqual([]);
+			expect(manager.list({ action: "list", state: "closed" })[0]).toMatchObject({
+				state: "closed",
+				exit: { kind: "stopped", signal: "SIGTERM" },
+			});
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not idle-cleanup a child with an accepted send still pending", async () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			const child = new FakeChildProcess();
+			let reportBusyState = false;
+			spawnMock.mockReturnValue(child);
+			attachRpc(child, (request) => {
+				if (request["type"] === "get_state") {
+					respond(child, request, {
+						sessionFile: "/tmp/session-idle-cleanup-pending-send.jsonl",
+						sessionId: "session-idle-cleanup-pending-send",
+						pendingMessageCount: 0,
+						isStreaming: reportBusyState,
+						isCompacting: false,
+					});
+					return;
+				}
+
+				if (request["type"] === "prompt") respond(child, request);
+				if (request["type"] === "abort") respond(child, request);
+			});
+			const manager = new ThreadManager({
+				...managerEnvironment(),
+				PI_THREADS_IDLE_CLEANUP_MS: "1000",
+			});
+
+			await manager.start(
+				{
+					action: "start",
+					prompt: "idle cleanup pending send",
+					taskName: "idle_cleanup_pending_send",
+				},
+				context(),
+			);
+			emitRpcEvent(child, { type: "agent_start" });
+			reportBusyState = true;
+
+			const sendOutcome = await manager.send({
+				action: "send",
+				id: "idle_cleanup_pending_send",
+				mode: "follow_up",
+				message: "queued",
+			});
+			expect(sendOutcome.accepted).toBe(true);
+
+			reportBusyState = false;
+			emitRpcEvent(child, { type: "agent_end" });
+			expect(manager.list({ action: "list", state: "live" })[0]).toMatchObject({
+				phase: "idle",
+			});
+
+			await vi.advanceTimersByTimeAsync(1000);
+
+			expect(child.kill).not.toHaveBeenCalled();
+			expect(manager.list({ action: "list", state: "live" })).toHaveLength(1);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not idle-cleanup a child while a send is awaiting acceptance", async () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			const child = new FakeChildProcess();
+			let promptCount = 0;
+			let sendPromptRequest: Record<string, unknown> | null = null;
+			let resolveSendPromptSeen!: () => void;
+			const sendPromptSeen = new Promise<void>((resolve) => {
+				resolveSendPromptSeen = resolve;
+			});
+			spawnMock.mockReturnValue(child);
+			attachRpc(child, (request) => {
+				if (request["type"] === "get_state") {
+					respond(child, request, {
+						sessionFile: "/tmp/session-idle-cleanup-in-flight-send.jsonl",
+						sessionId: "session-idle-cleanup-in-flight-send",
+						pendingMessageCount: 0,
+						isStreaming: false,
+						isCompacting: false,
+					});
+					return;
+				}
+
+				if (request["type"] === "prompt") {
+					promptCount++;
+					if (promptCount === 1) {
+						respond(child, request);
+						return;
+					}
+
+					sendPromptRequest = request;
+					resolveSendPromptSeen();
+					return;
+				}
+
+				if (request["type"] === "abort") respond(child, request);
+			});
+			const manager = new ThreadManager({
+				...managerEnvironment(),
+				PI_THREADS_IDLE_CLEANUP_MS: "1000",
+			});
+
+			await manager.start(
+				{
+					action: "start",
+					prompt: "idle cleanup in-flight send",
+					taskName: "idle_cleanup_in_flight_send",
+				},
+				context(),
+			);
+			emitRpcEvent(child, { type: "agent_end" });
+
+			await vi.advanceTimersByTimeAsync(999);
+			const sent = manager.send({
+				action: "send",
+				id: "idle_cleanup_in_flight_send",
+				mode: "prompt",
+				message: "queued",
+			});
+			await sendPromptSeen;
+
+			await vi.advanceTimersByTimeAsync(1);
+
+			expect(child.kill).not.toHaveBeenCalled();
+			expect(manager.list({ action: "list", state: "live" })).toHaveLength(1);
+
+			if (sendPromptRequest === null) throw new Error("expected send prompt request");
+			respond(child, sendPromptRequest);
+			await expect(sent).resolves.toMatchObject({ accepted: true });
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not extend idle cleanup when an idle child is polled", async () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			const child = mockResponsiveChild("session-idle-cleanup-poll");
+			const manager = new ThreadManager({
+				...managerEnvironment(),
+				PI_THREADS_IDLE_CLEANUP_MS: "1000",
+			});
+
+			await manager.start(
+				{ action: "start", prompt: "idle cleanup poll", taskName: "idle_cleanup_poll" },
+				context(),
+			);
+			emitRpcEvent(child, { type: "agent_end" });
+
+			await vi.advanceTimersByTimeAsync(900);
+			await manager.poll("/root/idle_cleanup_poll");
+
+			await vi.advanceTimersByTimeAsync(100);
+
+			expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+			expect(manager.list({ action: "list", state: "live" })).toEqual([]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("extends idle cleanup after idle child-side activity", async () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			const child = mockResponsiveChild("session-idle-cleanup-activity");
+			const manager = new ThreadManager({
+				...managerEnvironment(),
+				PI_THREADS_IDLE_CLEANUP_MS: "1000",
+			});
+
+			await manager.start(
+				{ action: "start", prompt: "idle cleanup activity", taskName: "idle_cleanup_activity" },
+				context(),
+			);
+			emitRpcEvent(child, { type: "agent_end" });
+
+			await vi.advanceTimersByTimeAsync(900);
+			emitRpcEvent(child, { type: "extension_ui_request", id: "ui-1", method: "notify" });
+
+			await vi.advanceTimersByTimeAsync(999);
+			expect(child.kill).not.toHaveBeenCalled();
+
+			await vi.advanceTimersByTimeAsync(1);
+			expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+			expect(manager.list({ action: "list", state: "live" })).toEqual([]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("bases idle cleanup on when a resumed child becomes idle", async () => {
+		vi.useFakeTimers();
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-idle-start-"));
+		try {
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			const sessionFile = path.join(root, "child.jsonl");
+			writeSessionHeader(sessionFile, "session-idle-start", root);
+			const snapshot: ThreadSnapshot = {
+				state: "closed",
+				id: asThreadId("thread_abcdef012345"),
+				name: "alpha",
+				taskName: "alpha",
+				path: asThreadPath("/root/alpha"),
+				parentPath: asThreadPath("/root"),
+				parentThreadId: null,
+				depth: 1,
+				archived: false,
+				cwd: root,
+				args: [],
+				createdAt: "2025-12-31T00:00:00.000Z",
+				lastEventAt: "2025-12-31T00:00:00.000Z",
+				exit: { kind: "stale", message: "restored" },
+				session: {
+					kind: "known",
+					file: sessionFile,
+					id: "session-idle-start",
+					name: null,
+					pendingMessageCount: null,
+				},
+				lastAssistantText: null,
+				recentEvents: [],
+				stderrTail: "",
+			};
+			const manager = new ThreadManager({
+				...managerEnvironment(),
+				PI_THREADS_IDLE_CLEANUP_MS: "1000",
+			});
+			manager.hydrateFromSession({
+				sessionManager: { getBranch: () => [registryEntry(snapshot)] },
+			} as unknown as ExtensionContext);
+
+			const child = new FakeChildProcess();
+			spawnMock.mockReturnValueOnce(child);
+			attachRpc(child, (request) => {
+				if (request["type"] === "abort") respond(child, request);
+				// Leave get_state unanswered so resume spends longer than the idle timeout starting.
+			});
+
+			const resumed = manager.resume(
+				{ action: "resume", id: "/root/alpha" },
+				context({ cwd: root }),
+			);
+			await vi.advanceTimersByTimeAsync(1500);
+
+			await expect(resumed).resolves.toMatchObject({
+				thread: { state: "live", phase: "idle" },
+			});
+			await vi.advanceTimersByTimeAsync(0);
+			expect(child.kill).not.toHaveBeenCalled();
+
+			await vi.advanceTimersByTimeAsync(999);
+			expect(child.kill).not.toHaveBeenCalled();
+
+			await vi.advanceTimersByTimeAsync(1);
+			expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+		} finally {
+			vi.useRealTimers();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("optionally stops long-running live children after the configured live timeout", async () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			const child = mockResponsiveChild("session-live-timeout");
+			const manager = new ThreadManager({
+				...managerEnvironment(),
+				PI_THREADS_LIVE_TIMEOUT_MS: "1000",
+			});
+
+			await manager.start(
+				{ action: "start", prompt: "live timeout", taskName: "live_timeout" },
+				context(),
+			);
+
+			await vi.advanceTimersByTimeAsync(1000);
+
+			expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+			expect(manager.list({ action: "list", state: "live" })).toEqual([]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("chunks cleanup timer delays larger than Node supports", async () => {
+		const maxSetTimeoutDelayMs = 2_147_483_647;
+		const oversizedLiveTimeoutMs = maxSetTimeoutDelayMs + 1_000;
+		vi.useFakeTimers();
+		const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
+		try {
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			const child = mockResponsiveChild("session-large-live-timeout");
+			const manager = new ThreadManager({
+				...managerEnvironment(),
+				PI_THREADS_LIVE_TIMEOUT_MS: String(oversizedLiveTimeoutMs),
+			});
+
+			await manager.start(
+				{ action: "start", prompt: "large timeout", taskName: "large_timeout" },
+				context(),
+			);
+
+			const scheduledDelays = setTimeoutSpy.mock.calls
+				.map(([, delayMs]) => delayMs)
+				.filter((delayMs): delayMs is number => typeof delayMs === "number");
+			expect(scheduledDelays).toContain(maxSetTimeoutDelayMs);
+			expect(scheduledDelays.every((delayMs) => delayMs <= maxSetTimeoutDelayMs)).toBe(true);
+
+			await vi.advanceTimersByTimeAsync(maxSetTimeoutDelayMs);
+			expect(child.kill).not.toHaveBeenCalled();
+
+			await vi.advanceTimersByTimeAsync(1_000);
+			expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+		} finally {
+			setTimeoutSpy.mockRestore();
+			vi.useRealTimers();
+		}
+	});
+
+	it("bases live timeout on the current resume launch", async () => {
+		vi.useFakeTimers();
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-resume-timeout-"));
+		try {
+			vi.setSystemTime(new Date("2026-01-02T00:00:00.000Z"));
+			const sessionFile = path.join(root, "child.jsonl");
+			writeSessionHeader(sessionFile, "session-resume-timeout", root);
+			const snapshot: ThreadSnapshot = {
+				state: "closed",
+				id: asThreadId("thread_012345abcdef"),
+				name: "alpha",
+				taskName: "alpha",
+				path: asThreadPath("/root/alpha"),
+				parentPath: asThreadPath("/root"),
+				parentThreadId: null,
+				depth: 1,
+				archived: false,
+				cwd: root,
+				args: [],
+				createdAt: "2026-01-01T00:00:00.000Z",
+				lastEventAt: "2026-01-01T00:00:00.000Z",
+				exit: { kind: "stale", message: "restored" },
+				session: {
+					kind: "known",
+					file: sessionFile,
+					id: "session-resume-timeout",
+					name: null,
+					pendingMessageCount: null,
+				},
+				lastAssistantText: null,
+				recentEvents: [],
+				stderrTail: "",
+			};
+			const manager = new ThreadManager({
+				...managerEnvironment(),
+				PI_THREADS_LIVE_TIMEOUT_MS: "1000",
+			});
+			manager.hydrateFromSession({
+				sessionManager: { getBranch: () => [registryEntry(snapshot)] },
+			} as unknown as ExtensionContext);
+
+			const child = new FakeChildProcess();
+			spawnMock.mockReturnValueOnce(child);
+			attachRpc(child, (request) => {
+				if (request["type"] === "get_state") {
+					respond(child, request, {
+						sessionFile,
+						sessionId: "session-resume-timeout",
+						pendingMessageCount: 0,
+						isStreaming: false,
+					});
+				}
+
+				if (request["type"] === "abort") respond(child, request);
+			});
+
+			await manager.resume({ action: "resume", id: "/root/alpha" }, context({ cwd: root }));
+			await vi.advanceTimersByTimeAsync(0);
+
+			expect(child.kill).not.toHaveBeenCalled();
+			expect(manager.list({ action: "list", state: "live" })).toHaveLength(1);
+
+			await vi.advanceTimersByTimeAsync(999);
+			expect(child.kill).not.toHaveBeenCalled();
+
+			await vi.advanceTimersByTimeAsync(1);
+
+			expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+			expect(manager.list({ action: "list", state: "live" })).toEqual([]);
+		} finally {
+			vi.useRealTimers();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("forces a closed stopped snapshot when a live child ignores shutdown signals", async () => {
+		const child = new FakeChildProcess();
+		child.kill.mockImplementation(() => true);
+		spawnMock.mockReturnValue(child);
+		attachRpc(child, (request) => {
+			if (request["type"] === "get_state") {
+				respond(child, request, {
+					sessionFile: "/tmp/stubborn.jsonl",
+					sessionId: "session-stubborn",
+					pendingMessageCount: 0,
+					isStreaming: false,
+				});
+				return;
+			}
+
+			if (request["type"] === "prompt" || request["type"] === "abort") respond(child, request);
+		});
+
+		const manager = new ThreadManager(managerEnvironment());
+		await manager.start({ action: "start", prompt: "stubborn", taskName: "stubborn" }, context());
+
+		vi.useFakeTimers();
+		try {
+			const shutdown = manager.shutdown();
+			await vi.advanceTimersByTimeAsync(2_000);
+			await shutdown;
+		} finally {
+			vi.useRealTimers();
+		}
+
+		expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+		expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+		expect(manager.list({ action: "list", state: "live" })).toEqual([]);
+		expect(manager.list({ action: "list", state: "closed" })[0]).toMatchObject({
+			state: "closed",
+			exit: { kind: "stopped", signal: "SIGKILL" },
+		});
+	});
+
+	it("ignores stale process close events after a force-closed thread is resumed", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-stale-close-"));
+		try {
+			const sessionFile = path.join(root, "child.jsonl");
+			writeSessionHeader(sessionFile, "session-stale-close", root);
+			const child = new FakeChildProcess();
+			child.kill.mockImplementation(() => true);
+			spawnMock.mockReturnValueOnce(child);
+			attachRpc(child, (request) => {
+				if (request["type"] === "get_state") {
+					respond(child, request, {
+						sessionFile,
+						sessionId: "session-stale-close",
+						pendingMessageCount: 0,
+						isStreaming: false,
+					});
+					return;
+				}
+
+				if (request["type"] === "prompt" || request["type"] === "abort") respond(child, request);
+			});
+
+			const manager = new ThreadManager(managerEnvironment());
+			await manager.start(
+				{ action: "start", prompt: "stubborn", taskName: "stubborn" },
+				context({ cwd: root }),
+			);
+
+			vi.useFakeTimers();
+			try {
+				const stopped = manager.stop({ action: "stop", id: "/root/stubborn" });
+				await vi.advanceTimersByTimeAsync(2_000);
+				await stopped;
+			} finally {
+				vi.useRealTimers();
+			}
+
+			const resumedChild = new FakeChildProcess();
+			spawnMock.mockReturnValueOnce(resumedChild);
+			attachRpc(resumedChild, (request) => {
+				if (request["type"] === "get_state") {
+					respond(resumedChild, request, {
+						sessionFile,
+						sessionId: "session-stale-close",
+						pendingMessageCount: 0,
+						isStreaming: false,
+					});
+				}
+			});
+			await manager.resume({ action: "resume", id: "/root/stubborn" }, context({ cwd: root }));
+
+			child.emit("close", null, "SIGKILL");
+
+			expect(resumedChild.kill).not.toHaveBeenCalled();
+			expect(manager.list({ action: "list", state: "live" })).toHaveLength(1);
+			expect(manager.list({ action: "list", state: "live" })[0]).toMatchObject({
+				state: "live",
+				path: "/root/stubborn",
+			});
+		} finally {
+			vi.useRealTimers();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("ignores stale process close events from superseded launches", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-superseded-close-"));
+		try {
+			const sessionFile = path.join(root, "child.jsonl");
+			writeSessionHeader(sessionFile, "session-superseded-close", root);
+			const child = new FakeChildProcess();
+			child.kill.mockImplementation(() => true);
+			spawnMock.mockReturnValueOnce(child);
+			attachRpc(child, (request) => {
+				if (request["type"] === "get_state") {
+					respond(child, request, {
+						sessionFile,
+						sessionId: "session-superseded-close",
+						pendingMessageCount: 0,
+						isStreaming: false,
+					});
+					return;
+				}
+
+				if (request["type"] === "prompt") respond(child, request);
+			});
+
+			const manager = new ThreadManager(managerEnvironment());
+			await manager.start(
+				{ action: "start", prompt: "stubborn", taskName: "stubborn" },
+				context({ cwd: root }),
+			);
+
+			vi.useFakeTimers();
+			try {
+				const stopped = manager.stop({ action: "stop", id: "/root/stubborn", force: true });
+				await vi.advanceTimersByTimeAsync(1_000);
+				await stopped;
+			} finally {
+				vi.useRealTimers();
+			}
+
+			const resumedChild = new FakeChildProcess();
+			resumedChild.kill.mockImplementation(() => true);
+			spawnMock.mockReturnValueOnce(resumedChild);
+			attachRpc(resumedChild, (request) => {
+				if (request["type"] === "get_state") {
+					respond(resumedChild, request, {
+						sessionFile,
+						sessionId: "session-superseded-close",
+						pendingMessageCount: 0,
+						isStreaming: false,
+					});
+				}
+			});
+			await manager.resume({ action: "resume", id: "/root/stubborn" }, context({ cwd: root }));
+
+			vi.useFakeTimers();
+			try {
+				const stopped = manager.stop({ action: "stop", id: "/root/stubborn", force: true });
+				await vi.advanceTimersByTimeAsync(1_000);
+				await stopped;
+			} finally {
+				vi.useRealTimers();
+			}
+
+			child.emit("close", 7, null);
+
+			expect(manager.list({ action: "list", state: "closed" })[0]).toMatchObject({
+				state: "closed",
+				exit: { kind: "stopped", code: null, signal: "SIGKILL" },
+			});
+		} finally {
+			vi.useRealTimers();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("throttles change notifications for streaming assistant updates", async () => {
