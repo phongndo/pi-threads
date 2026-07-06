@@ -141,6 +141,7 @@ export class ThreadsTreeComponent implements Component {
 	private closed = false;
 	private cachedWidth: number | undefined;
 	private cachedLines: string[] | undefined;
+	private cachedBrowserView: BrowserView | undefined;
 
 	constructor(
 		private readonly tui: ThreadsTui,
@@ -165,6 +166,7 @@ export class ThreadsTreeComponent implements Component {
 		if (this.closed) return;
 		const selectedId = this.selectedThread()?.id;
 		this.threads = [...threads];
+		this.invalidateBrowserView();
 
 		const filtered = this.filteredThreads();
 		const selectedIndex =
@@ -180,8 +182,9 @@ export class ThreadsTreeComponent implements Component {
 		if (this.cachedWidth === width && this.cachedLines) return this.cachedLines;
 
 		const t = this.theme;
-		const filtered = this.filteredThreads();
-		const counts = browserCounts(this.threads);
+		const view = this.browserView();
+		const filtered = view.filteredThreads;
+		const counts = view.counts;
 		const lines: string[] = [];
 		lines.push("");
 		lines.push(...this.renderBorder(width));
@@ -192,7 +195,7 @@ export class ThreadsTreeComponent implements Component {
 		lines.push("");
 
 		if (filtered.length === 0) {
-			const message = this.emptyMessage();
+			const message = this.emptyMessage(view);
 			lines.push(truncateToWidth(t.fg("muted", message), width));
 			lines.push(truncateToWidth(t.fg("muted", "  (0/0)"), width));
 		} else {
@@ -231,9 +234,8 @@ export class ThreadsTreeComponent implements Component {
 	handleInput(data: string): void {
 		if (this.closed) return;
 
-		const filtered = this.filteredThreads();
-
 		if (matchesKey(data, Key.up)) {
+			const filtered = this.filteredThreads();
 			if (filtered.length === 0) return;
 			this.selectedIndex = this.selectedIndex === 0 ? filtered.length - 1 : this.selectedIndex - 1;
 			this.rerender();
@@ -241,6 +243,7 @@ export class ThreadsTreeComponent implements Component {
 		}
 
 		if (matchesKey(data, Key.down)) {
+			const filtered = this.filteredThreads();
 			if (filtered.length === 0) return;
 			this.selectedIndex = this.selectedIndex === filtered.length - 1 ? 0 : this.selectedIndex + 1;
 			this.rerender();
@@ -271,6 +274,7 @@ export class ThreadsTreeComponent implements Component {
 			if (this.searchQuery !== "") {
 				this.searchQuery = "";
 				this.selectedIndex = 0;
+				this.invalidateBrowserView();
 				this.rerender();
 				return;
 			}
@@ -281,6 +285,7 @@ export class ThreadsTreeComponent implements Component {
 		if (matchesKey(data, Key.backspace)) {
 			if (this.searchQuery === "") return;
 			this.searchQuery = this.searchQuery.slice(0, -1);
+			this.invalidateBrowserView();
 			this.selectedIndex = Math.min(
 				this.selectedIndex,
 				Math.max(0, this.filteredThreads().length - 1),
@@ -307,6 +312,7 @@ export class ThreadsTreeComponent implements Component {
 		if (isPrintable(data)) {
 			this.searchQuery += data;
 			this.selectedIndex = 0;
+			this.invalidateBrowserView();
 			this.rerender();
 		}
 	}
@@ -406,46 +412,57 @@ export class ThreadsTreeComponent implements Component {
 	}
 
 	private filteredThreads(): readonly ThreadSnapshot[] {
-		const visibleThreads = this.threads.filter((thread) => {
-			if (this.visibilityFilter === "all") return true;
-			return thread.archived === (this.visibilityFilter === "archived");
-		});
-		const stateFiltered = visibleThreads.filter((thread) =>
-			matchesStatusFilter(thread, this.statusFilter),
-		);
-		const query = this.searchQuery.trim().toLowerCase();
-		if (query === "") return stateFiltered;
-		const tokens = query.split(/\s+/u).filter(Boolean);
-		return stateFiltered.filter((thread) => {
-			const haystack = [
-				formatThreadTitle(thread),
-				thread.name,
-				thread.taskName,
-				thread.path,
-				browserStatus(thread),
-				thread.archived ? "archived" : "active",
-				thread.session.kind === "known" ? thread.session.file : "",
-				formatThreadSummary(thread, 160),
-			]
-				.join(" ")
-				.toLowerCase();
-			return tokens.every((token) => haystack.includes(token));
-		});
+		return this.browserView().filteredThreads;
 	}
 
-	private emptyMessage(): string {
+	private browserView(): BrowserView {
+		if (this.cachedBrowserView) return this.cachedBrowserView;
+
+		const counts = emptyBrowserCounts();
+		const filteredThreads: ThreadSnapshot[] = [];
+		let visibleCount = 0;
+		let statusCount = 0;
+		const visibilityFilter = this.visibilityFilter;
+		const statusFilter = this.statusFilter;
+		const query = this.searchQuery.trim().toLowerCase();
+		const tokens = query === "" ? [] : query.split(/\s+/u).filter(Boolean);
+
+		for (const thread of this.threads) {
+			const status = browserStatus(thread);
+			if (thread.state === "live") counts.live += 1;
+			else counts.closed += 1;
+			if (status === "stale") counts.stale += 1;
+			if (status === "failed") counts.failed += 1;
+			if (thread.archived) counts.archived += 1;
+
+			const isVisible =
+				visibilityFilter === "all" || thread.archived === (visibilityFilter === "archived");
+			if (isVisible) visibleCount += 1;
+
+			const statusMatches = matchesStatusFilter(thread, statusFilter, status);
+			if (statusMatches) statusCount += 1;
+
+			if (!isVisible || !statusMatches) continue;
+			if (tokens.length > 0 && !matchesSearchTokens(thread, status, tokens)) continue;
+			filteredThreads.push(thread);
+		}
+
+		const view = { filteredThreads, counts, visibleCount, statusCount } satisfies BrowserView;
+		this.cachedBrowserView = view;
+		return view;
+	}
+
+	private emptyMessage(view: BrowserView = this.browserView()): string {
 		if (this.threads.length === 0) return "  No threads";
-		const visibleCount = this.threads.filter((thread) => {
-			if (this.visibilityFilter === "all") return true;
-			return thread.archived === (this.visibilityFilter === "archived");
-		}).length;
-		if (visibleCount === 0) return `  No ${this.visibilityFilter} threads`;
-		const filterCount = this.threads.filter((thread) =>
-			matchesStatusFilter(thread, this.statusFilter),
-		).length;
-		if (this.statusFilter !== "all" && filterCount === 0)
+		if (view.visibleCount === 0) return `  No ${this.visibilityFilter} threads`;
+		if (this.statusFilter !== "all" && view.statusCount === 0)
 			return `  No ${this.statusFilter} threads`;
 		return "  No matching threads";
+	}
+
+	private invalidateBrowserView(): void {
+		this.cachedBrowserView = undefined;
+		this.invalidate();
 	}
 
 	private selectedThread(): ThreadSnapshot | undefined {
@@ -547,11 +564,13 @@ export class ThreadsTreeComponent implements Component {
 		const index = this.threads.findIndex((candidate) => candidate.id === thread.id);
 		if (index >= 0) this.threads[index] = thread;
 		else this.threads.push(thread);
+		this.invalidateBrowserView();
 	}
 
 	private refreshList(): void {
 		if (this.closed) return;
 		this.threads = [...this.manager.list({ action: "list", state: "all", visibility: "all" })];
+		this.invalidateBrowserView();
 		this.selectedIndex = Math.min(
 			this.selectedIndex,
 			Math.max(0, this.filteredThreads().length - 1),
@@ -562,6 +581,7 @@ export class ThreadsTreeComponent implements Component {
 	private cycleStatusFilter(): void {
 		const currentIndex = STATUS_FILTER_CYCLE.indexOf(this.statusFilter);
 		this.statusFilter = STATUS_FILTER_CYCLE[(currentIndex + 1) % STATUS_FILTER_CYCLE.length]!;
+		this.invalidateBrowserView();
 		this.selectedIndex = Math.min(
 			this.selectedIndex,
 			Math.max(0, this.filteredThreads().length - 1),
@@ -573,6 +593,7 @@ export class ThreadsTreeComponent implements Component {
 		const currentIndex = VISIBILITY_FILTER_CYCLE.indexOf(this.visibilityFilter);
 		this.visibilityFilter =
 			VISIBILITY_FILTER_CYCLE[(currentIndex + 1) % VISIBILITY_FILTER_CYCLE.length]!;
+		this.invalidateBrowserView();
 		this.selectedIndex = Math.min(
 			this.selectedIndex,
 			Math.max(0, this.filteredThreads().length - 1),
@@ -647,13 +668,28 @@ type BrowserCounts = {
 	readonly archived: number;
 };
 
-function browserCounts(threads: readonly ThreadSnapshot[]): BrowserCounts {
+type MutableBrowserCounts = {
+	live: number;
+	closed: number;
+	stale: number;
+	failed: number;
+	archived: number;
+};
+
+type BrowserView = {
+	readonly filteredThreads: readonly ThreadSnapshot[];
+	readonly counts: BrowserCounts;
+	readonly visibleCount: number;
+	readonly statusCount: number;
+};
+
+function emptyBrowserCounts(): MutableBrowserCounts {
 	return {
-		live: threads.filter((thread) => thread.state === "live").length,
-		closed: threads.filter((thread) => thread.state === "closed").length,
-		stale: threads.filter((thread) => browserStatus(thread) === "stale").length,
-		failed: threads.filter((thread) => browserStatus(thread) === "failed").length,
-		archived: threads.filter((thread) => thread.archived).length,
+		live: 0,
+		closed: 0,
+		stale: 0,
+		failed: 0,
+		archived: 0,
 	};
 }
 
@@ -664,11 +700,35 @@ function browserStatus(thread: ThreadSnapshot): BrowserStatus {
 	return "done";
 }
 
-function matchesStatusFilter(thread: ThreadSnapshot, filter: StatusFilter): boolean {
+function matchesStatusFilter(
+	thread: ThreadSnapshot,
+	filter: StatusFilter,
+	status: BrowserStatus = browserStatus(thread),
+): boolean {
 	if (filter === "all") return true;
 	if (filter === "live") return thread.state === "live";
 	if (filter === "closed") return thread.state === "closed";
-	return browserStatus(thread) === filter;
+	return status === filter;
+}
+
+function matchesSearchTokens(
+	thread: ThreadSnapshot,
+	status: BrowserStatus,
+	tokens: readonly string[],
+): boolean {
+	const haystack = [
+		formatThreadTitle(thread),
+		thread.name,
+		thread.taskName,
+		thread.path,
+		status,
+		thread.archived ? "archived" : "active",
+		thread.session.kind === "known" ? thread.session.file : "",
+		formatThreadSummary(thread, 160),
+	]
+		.join(" ")
+		.toLowerCase();
+	return tokens.every((token) => haystack.includes(token));
 }
 
 function formatFilterValue(value: StatusFilter | VisibilityFilter): string {

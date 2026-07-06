@@ -4,20 +4,30 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { PassThrough } from "node:stream";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { asThreadId, asThreadPath, type ThreadSnapshot } from "../src/domain.ts";
 
-const { spawnMock } = vi.hoisted(() => ({
+const { execFileMock, spawnMock } = vi.hoisted(() => ({
+	execFileMock: vi.fn(
+		(
+			_command: string,
+			_args: readonly string[],
+			callback?: (error: Error | null, stdout: string, stderr: string) => void,
+		) => {
+			queueMicrotask(() => callback?.(null, "", ""));
+			return {};
+		},
+	),
 	spawnMock: vi.fn(),
 }));
 
 vi.mock("node:child_process", async () => {
 	const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
-	return { ...actual, spawn: spawnMock };
+	return { ...actual, execFile: execFileMock, spawn: spawnMock };
 });
 
-const { PI_THREAD_REGISTRY_ENTRY_TYPE, ThreadManager, shouldApproveChildCwd } =
-	await import("../src/thread-manager.ts");
+const { shouldApproveChildCwd } = await import("../src/arg-policy.ts");
+const { PI_THREAD_REGISTRY_ENTRY_TYPE, ThreadManager } = await import("../src/thread-manager.ts");
 
 class FakeChildProcess extends EventEmitter {
 	readonly pid = 12_345;
@@ -68,6 +78,27 @@ function attachRpc(child: FakeChildProcess, onRequest: (request: Record<string, 
 			onRequest(JSON.parse(line) as Record<string, unknown>);
 		}
 	});
+}
+
+function mockMissingProcessKill(): ReturnType<typeof vi.spyOn> {
+	return vi.spyOn(process, "kill").mockImplementation((() => {
+		const error = new Error("mock ESRCH") as NodeJS.ErrnoException;
+		error.code = "ESRCH";
+		throw error;
+	}) as typeof process.kill);
+}
+
+async function withPlatform<T>(
+	platform: NodeJS.Platform,
+	callback: () => T | Promise<T>,
+): Promise<T> {
+	const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+	Object.defineProperty(process, "platform", { value: platform });
+	try {
+		return await callback();
+	} finally {
+		if (descriptor !== undefined) Object.defineProperty(process, "platform", descriptor);
+	}
 }
 
 function managerEnvironment(): NodeJS.ProcessEnv {
@@ -165,8 +196,17 @@ function closedKnownSnapshot(options: {
 }
 
 describe("ThreadManager session metadata", () => {
+	let processKillSpy: ReturnType<typeof vi.spyOn> | null = null;
+
 	beforeEach(() => {
 		spawnMock.mockReset();
+		execFileMock.mockClear();
+		processKillSpy = mockMissingProcessKill();
+	});
+
+	afterEach(() => {
+		processKillSpy?.mockRestore();
+		processKillSpy = null;
 	});
 
 	it("reports unknown references with accepted forms and known suggestions", async () => {
@@ -214,6 +254,135 @@ describe("ThreadManager session metadata", () => {
 		).rejects.toThrow(
 			/Thread path already exists: \/root\/alpha.*choose a unique start\.taskName/u,
 		);
+	});
+
+	it("starts POSIX children detached so process-tree cleanup can signal the group", async () => {
+		await withPlatform("linux", async () => {
+			const manager = new ThreadManager(managerEnvironment());
+			mockResponsiveChild("session-detached-posix");
+
+			await manager.start({ action: "start", prompt: "work", taskName: "posix" }, context());
+
+			expect(spawnMock.mock.calls[0]?.[2]).toEqual(expect.objectContaining({ detached: true }));
+		});
+	});
+
+	it("does not detach Windows children", async () => {
+		await withPlatform("win32", async () => {
+			const manager = new ThreadManager(managerEnvironment());
+			mockResponsiveChild("session-detached-windows");
+
+			await manager.start({ action: "start", prompt: "work", taskName: "windows" }, context());
+
+			expect(spawnMock.mock.calls[0]?.[2]).toEqual(expect.objectContaining({ detached: false }));
+		});
+	});
+
+	it("stops POSIX process groups with SIGTERM when process-group signaling works", async () => {
+		await withPlatform("linux", async () => {
+			const child = mockResponsiveChild("session-stop-group");
+			processKillSpy?.mockImplementation(((pid: number, signal?: NodeJS.Signals) => {
+				queueMicrotask(() => child.emit("close", null, signal ?? null));
+				return true;
+			}) as typeof process.kill);
+			const manager = new ThreadManager(managerEnvironment());
+
+			await manager.start({ action: "start", prompt: "work", taskName: "group" }, context());
+			await manager.stop({ action: "stop", id: "/root/group" });
+
+			expect(processKillSpy).toHaveBeenCalledWith(-child.pid, "SIGTERM");
+			expect(child.kill).not.toHaveBeenCalledWith("SIGTERM");
+		});
+	});
+
+	it("falls back to direct child kills when POSIX process-group signaling fails", async () => {
+		await withPlatform("linux", async () => {
+			const child = mockResponsiveChild("session-stop-fallback");
+			const manager = new ThreadManager(managerEnvironment());
+
+			await manager.start({ action: "start", prompt: "work", taskName: "fallback" }, context());
+			await manager.stop({ action: "stop", id: "/root/fallback" });
+
+			expect(processKillSpy).toHaveBeenCalledWith(-child.pid, "SIGTERM");
+			expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+		});
+	});
+
+	it("force-stops POSIX process groups with SIGKILL", async () => {
+		await withPlatform("linux", async () => {
+			const child = mockResponsiveChild("session-force-group");
+			processKillSpy?.mockImplementation(((pid: number, signal?: NodeJS.Signals) => {
+				queueMicrotask(() => child.emit("close", null, signal ?? null));
+				return true;
+			}) as typeof process.kill);
+			const manager = new ThreadManager(managerEnvironment());
+
+			await manager.start({ action: "start", prompt: "work", taskName: "force_group" }, context());
+			await manager.stop({ action: "stop", id: "/root/force_group", force: true });
+
+			expect(processKillSpy).toHaveBeenCalledWith(-child.pid, "SIGKILL");
+			expect(child.kill).not.toHaveBeenCalledWith("SIGKILL");
+		});
+	});
+
+	it("uses taskkill to force-stop Windows process trees", async () => {
+		await withPlatform("win32", async () => {
+			const child = mockResponsiveChild("session-windows-taskkill");
+			execFileMock.mockImplementationOnce(
+				(
+					_command: string,
+					_args: readonly string[],
+					callback?: (error: Error | null, stdout: string, stderr: string) => void,
+				) => {
+					queueMicrotask(() => {
+						callback?.(null, "", "");
+						child.emit("close", null, "SIGKILL");
+					});
+					return {};
+				},
+			);
+			const manager = new ThreadManager(managerEnvironment());
+
+			await manager.start({ action: "start", prompt: "work", taskName: "win_force" }, context());
+			await manager.stop({ action: "stop", id: "/root/win_force", force: true });
+
+			expect(execFileMock).toHaveBeenCalledWith(
+				"taskkill.exe",
+				["/PID", String(child.pid), "/T", "/F"],
+				expect.any(Function),
+			);
+			expect(child.kill).not.toHaveBeenCalledWith("SIGKILL");
+		});
+	});
+
+	it("falls back to direct child SIGKILL when Windows taskkill fails", async () => {
+		await withPlatform("win32", async () => {
+			const child = mockResponsiveChild("session-windows-taskkill-fallback");
+			execFileMock.mockImplementationOnce(
+				(
+					_command: string,
+					_args: readonly string[],
+					callback?: (error: Error | null, stdout: string, stderr: string) => void,
+				) => {
+					queueMicrotask(() => callback?.(new Error("taskkill failed"), "", ""));
+					return {};
+				},
+			);
+			const manager = new ThreadManager(managerEnvironment());
+
+			await manager.start(
+				{ action: "start", prompt: "work", taskName: "win_force_fallback" },
+				context(),
+			);
+			await manager.stop({ action: "stop", id: "/root/win_force_fallback", force: true });
+
+			expect(execFileMock).toHaveBeenCalledWith(
+				"taskkill.exe",
+				["/PID", String(child.pid), "/T", "/F"],
+				expect.any(Function),
+			);
+			expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+		});
 	});
 
 	it("keeps the per-session live thread concurrency limit", async () => {

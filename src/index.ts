@@ -32,12 +32,10 @@ import { assertPiThreadParams, PiThreadParamsSchema } from "./schema.ts";
 import { registerThreadsCommand } from "./threads-command.ts";
 import {
 	PI_THREAD_REGISTRY_ENTRY_TYPE,
-	ThreadManager,
 	type ThreadRegistryEntryScope,
 	type ThreadRegistryPersistenceTarget,
-	type ThreadManagerScope,
-	type WaitProgress,
-} from "./thread-manager.ts";
+} from "./thread-registry.ts";
+import { ThreadManager, type ThreadManagerScope, type WaitProgress } from "./thread-manager.ts";
 
 export const PI_THREAD_DESCRIPTION = "Start and manage background Pi child sessions.";
 

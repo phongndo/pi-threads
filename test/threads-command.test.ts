@@ -274,6 +274,29 @@ describe("ThreadsTreeComponent input", () => {
 		expect(lines.join("\n")).not.toContain("READ ONLY");
 	});
 
+	it("keeps cached browser filtering fresh across search and thread updates", () => {
+		const tree = component({}, [thread()]);
+		expect(tree.render(160).join("\n")).toContain("/root/alpha");
+
+		tree.handleInput("b");
+		expect(tree.render(160).join("\n")).toContain("No matching threads");
+
+		tree.updateThreads([
+			thread({
+				id: asThreadId("thread_111111111111"),
+				name: "beta",
+				taskName: "beta",
+				path: asThreadPath("/root/beta"),
+			}),
+		]);
+		const rendered = tree.render(160).join("\n");
+
+		expect(rendered).toContain("Type to search: b");
+		expect(rendered).toContain("/root/beta");
+		expect(rendered).toContain("Selected: beta  /root/beta");
+		expect(rendered).not.toContain("No matching threads");
+	});
+
 	it("does not switch sessions for closed threads", () => {
 		const stoppedThread = closedThread({
 			session: {

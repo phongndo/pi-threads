@@ -125,7 +125,7 @@ If `start.cwd` is provided, it must resolve to an existing directory. Omit it to
 use the parent session's current working directory.
 
 Tool results include concise text plus structured `details`. Single-thread
-actions (`start`, `poll`, `send`, `wait`, and `stop`) include a normalized
+actions (`start`, `poll`, `send`, `wait`, `stop`, `resume`, `fork`, and `archive`) include a normalized
 `snapshot` with `id`, `path`, `status`, `phase`, `running`, `detail`,
 `resultSummary`, recent events, and `nextSuggestedActions`; `list` returns the
 same shape in `snapshots`. Recent events use compact canonical lifecycle names
@@ -145,8 +145,8 @@ as `--provider`, `--model`, `--models`, `--thinking`, `--exclude-tools`,
 `--no-skills`, `--no-prompt-templates`, `--no-themes`, and
 `--no-context-files` can be supplied when a child needs narrower behavior. If
 the parent was started with an inherited `--models` scope, child
-model-selection args (`--provider`, `--model`, or `--models`) are rejected so a
-tool call cannot loosen that scope.
+model/provider/thinking args (`--provider`, `--model`, `--models`, or
+`--thinking`) are rejected so a tool call cannot loosen that scope.
 
 Children also inherit relevant parent Pi restrictions and resource-loading flags
 that Pi parsed from the parent process, including model/provider choices, tool
@@ -246,7 +246,10 @@ pi install /path/to/pi-threads
 
 ## Safety
 
-- Threads are killed when the parent Pi session exits.
+- Threads are stopped when the parent Pi session exits; on POSIX systems
+  `pi-threads` launches children in their own process group so normal stop and
+  force-stop can clean up descendant processes too. Windows force-stop uses
+  `taskkill /T /F` as a best-effort process-tree cleanup.
 - Interactive prompts (dialogs, confirmations) in headless threads are auto-cancelled.
 - One-shot CLI modes (`--print`, `--export`, etc.) are blocked in child threads.
 - If a child `cwd` is outside the trusted parent project, it is launched with
@@ -286,6 +289,10 @@ local `pnpm check` command runs the same format, lint, typecheck, and test suite
 ## Project health
 
 - Contributing guide: [`CONTRIBUTING.md`](CONTRIBUTING.md)
+- Tool contract: [`docs/tool-contract.md`](docs/tool-contract.md)
+- Workflow authoring guide: [`docs/workflow-authoring.md`](docs/workflow-authoring.md)
+- Compatibility notes: [`docs/compatibility.md`](docs/compatibility.md)
+- Release checklist: [`docs/release-checklist.md`](docs/release-checklist.md)
 - Security policy: [`SECURITY.md`](SECURITY.md)
 - Code of conduct: [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)
 - Changelog: [`CHANGELOG.md`](CHANGELOG.md)

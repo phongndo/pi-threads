@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-No changes yet.
+### Added
+
+- Tool contract and workflow-authoring documentation, including example
+  user-authored workflow patterns.
+- Release compatibility and npm provenance checklist documentation.
+- Golden contract tests for runtime snapshots and tool result details.
+- Pure registry helper tests covering truncation, durable restore filtering, and
+  corrupt-entry rejection.
+
+### Changed
+
+- Split child CLI argument policy, task naming, and registry helpers out of
+  `ThreadManager` into focused modules.
+- `/threads` browser filtering and counts now use a cached single-pass view.
+- POSIX child Pi processes now launch in their own process group so stop/force
+  cleanup can target descendant processes; Windows force-stop uses
+  `taskkill /T /F` best-effort process-tree cleanup.
 
 ## [0.3.0] - 2026-07-05
 

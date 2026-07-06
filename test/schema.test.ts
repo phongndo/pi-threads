@@ -8,11 +8,7 @@ import {
 	StrictPiThreadParamsSchema,
 	type PiThreadParams,
 } from "../src/schema.ts";
-import {
-	assertAllowedExtraArgs,
-	buildPiArgs,
-	collectInheritedPiArgs,
-} from "../src/thread-manager.ts";
+import { assertAllowedExtraArgs, buildPiArgs, collectInheritedPiArgs } from "../src/arg-policy.ts";
 
 describe("thread schemas", () => {
 	it("exposes an object-root provider schema", () => {

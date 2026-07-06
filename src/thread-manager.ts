@@ -1,15 +1,12 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	ROOT_THREAD_PATH,
 	asThreadPath,
 	asThreadId,
 	assertTaskName,
-	humanizeTaskName,
 	joinThreadPath,
 	newThreadId,
 	nowIso,
@@ -26,8 +23,33 @@ import {
 	type ThreadSession,
 	toThreadRuntimeSnapshot,
 } from "./domain.ts";
+import {
+	assertAllowedExtraArgs,
+	buildPiArgs,
+	collectInheritedPiArgs,
+	shouldApproveChildCwd,
+} from "./arg-policy.ts";
 import { isRecord, numberField, stringField } from "./json.ts";
+import {
+	generateDisplayName,
+	shortTaskName,
+	taskNameFromText,
+	taskNameWithNumericSuffix,
+} from "./naming.ts";
 import { RpcClient, type RpcClientEvent, type RpcResponse } from "./rpc.ts";
+import {
+	registryScope,
+	registryTruncatedTextMatchesFull,
+	restoreDurableThreadData,
+	restoredThreadRegistrySession,
+	threadRegistrySessionsMatch,
+	truncateSnapshotForRegistry,
+	type DurableThreadData,
+	type ThreadRegistryPersistence,
+	type ThreadRegistryRestoreScope,
+	type ThreadRegistrySession,
+	type ThreadRegistryPersistenceTarget,
+} from "./thread-registry.ts";
 import type {
 	ListCommand,
 	ArchiveCommand,
@@ -44,6 +66,21 @@ import {
 	resolveThreadTarget,
 	unknownThreadReferenceError,
 } from "./thread-references.ts";
+
+export {
+	assertAllowedExtraArgs,
+	buildPiArgs,
+	collectInheritedPiArgs,
+	isCwdInsideOrEqual,
+	shouldApproveChildCwd,
+} from "./arg-policy.ts";
+export {
+	PI_THREAD_REGISTRY_ENTRY_TYPE,
+	type ThreadRegistryEntryScope,
+	type ThreadRegistryPersistence,
+	type ThreadRegistryPersistenceTarget,
+	type ThreadRegistrySession,
+} from "./thread-registry.ts";
 
 const DEFAULT_MAX_DEPTH = 2;
 const DEFAULT_MAX_THREADS = 8;
@@ -63,12 +100,6 @@ const WAIT_POLL_INTERVAL_MS = 250;
 const BUSY_SEND_IDLE_SETTLE_REFRESHES = 2;
 const MESSAGE_UPDATE_EMIT_THROTTLE_MS = 250;
 const PERSIST_FLUSH_DELAY_MS = 500;
-// Durable registry entries append a full snapshot to the parent session file, so
-// cap free-form texts there to keep a chatty child from ballooning that file.
-const REGISTRY_TEXT_LIMIT = 20_000;
-const TASK_NAME_MAX_LENGTH = 64;
-const DISPLAY_NAME_MAX_LENGTH = 80;
-export const PI_THREAD_REGISTRY_ENTRY_TYPE = "pi-threads-registry";
 // Pi resolves CLI resource flags from the process startup cwd, while ctx.cwd can
 // later point at a resumed or switched session in another project.
 const PROCESS_START_CWD = process.cwd();
@@ -102,6 +133,7 @@ type LiveThread = ThreadBase & {
 	idleStartedAt: string | null;
 	phase: ThreadPhase;
 	readonly pid: number;
+	readonly processGroupId: number | null;
 	readonly child: ChildProcessWithoutNullStreams;
 	readonly rpc: RpcClient;
 	lastPartialText: string | null;
@@ -202,37 +234,6 @@ type WaitOptions = {
 	readonly onProgress?: (progress: WaitProgress) => void;
 };
 
-type ThreadRegistryPersistence = {
-	readonly appendSnapshot?: (
-		snapshot: ThreadSnapshot,
-		scope: ThreadRegistryEntryScope | null,
-		target: ThreadRegistryPersistenceTarget | null,
-	) => void;
-};
-
-export type ThreadRegistryEntryScope = {
-	readonly sessionId: string;
-};
-
-type ThreadRegistrySession = {
-	readonly sessionId: string | null;
-	readonly sessionFile: string | null;
-	readonly sessionDir: string | null;
-};
-
-export type ThreadRegistryPersistenceTarget = ThreadRegistrySession & {
-	readonly isCurrentSession: boolean;
-};
-
-type ThreadRegistryRestoreScope = {
-	readonly sessionId: string | null;
-	readonly sessionStartedAt: string | null;
-	readonly currentPath: ThreadPath;
-	readonly isRootSessionFork: boolean;
-	readonly registrySession: ThreadRegistrySession | null;
-	readonly registryGeneration: number;
-};
-
 type ThreadRegistryOwnership = {
 	readonly registrySession: ThreadRegistrySession | null;
 	readonly registryGeneration: number;
@@ -261,14 +262,6 @@ type LaunchThreadInput = {
 	readonly sourceSessionFile?: string | undefined;
 	readonly sourceEntryId?: string | null;
 	readonly prompt?: string;
-};
-
-type DurableThreadData = {
-	readonly version: 1;
-	readonly kind: "thread_snapshot";
-	readonly snapshot: ThreadSnapshot;
-	readonly entryTimestamp: string | null;
-	readonly scope?: ThreadRegistryEntryScope;
 };
 
 type ForkSource = {
@@ -812,14 +805,14 @@ export class ThreadManager {
 		}
 
 		if (options.force) {
-			current.child.kill("SIGKILL");
+			await signalThreadProcessTree(current, "SIGKILL");
 			await Promise.race([current.closed, delay(STOP_KILL_WAIT_MS)]);
 		} else {
 			await current.rpc.request({ type: "abort" }, RPC_QUICK_TIMEOUT_MS).catch(() => undefined);
-			if (this.#threads.get(id) === current) current.child.kill("SIGTERM");
+			if (this.#threads.get(id) === current) await signalThreadProcessTree(current, "SIGTERM");
 			await Promise.race([current.closed, delay(STOP_GRACE_MS)]);
 			if (this.#threads.get(id) === current) {
-				current.child.kill("SIGKILL");
+				await signalThreadProcessTree(current, "SIGKILL");
 				await Promise.race([current.closed, delay(STOP_KILL_WAIT_MS)]);
 			}
 		}
@@ -865,6 +858,7 @@ export class ThreadManager {
 			child = spawn(invocation.command, invocation.args, {
 				cwd: input.cwd,
 				env: childEnvironment,
+				detached: shouldLaunchDetachedProcessGroup(),
 				shell: false,
 				stdio: ["pipe", "pipe", "pipe"],
 			});
@@ -941,6 +935,7 @@ export class ThreadManager {
 			idleStartedAt: null,
 			phase: "starting",
 			pid: child.pid,
+			processGroupId: process.platform === "win32" ? null : child.pid,
 			child,
 			rpc: new RpcClient(child, (event) => {
 				if (launchedThread === null || this.#threads.get(input.id) !== launchedThread) return;
@@ -1684,27 +1679,6 @@ function captureSession(thread: LiveThread, data: Record<string, unknown>): bool
 	return false;
 }
 
-function registryScope(target: ThreadRegistryPersistenceTarget): ThreadRegistryEntryScope | null {
-	return target.sessionId === null ? null : { sessionId: target.sessionId };
-}
-
-function truncateSnapshotForRegistry(threadSnapshot: ThreadSnapshot): ThreadSnapshot {
-	const lastAssistantText = truncateRegistryText(threadSnapshot.lastAssistantText);
-	if (threadSnapshot.state === "live") {
-		return {
-			...threadSnapshot,
-			lastAssistantText,
-			lastPartialText: truncateRegistryText(threadSnapshot.lastPartialText),
-		};
-	}
-	return { ...threadSnapshot, lastAssistantText };
-}
-
-function truncateRegistryText(text: string | null): string | null {
-	if (text === null || text.length <= REGISTRY_TEXT_LIMIT) return text;
-	return `${text.slice(0, REGISTRY_TEXT_LIMIT)}\n[truncated ${text.length - REGISTRY_TEXT_LIMIT} chars for registry persistence]`;
-}
-
 function threadRegistrySessionFromContext(
 	ctx: Pick<ExtensionContext, "sessionManager">,
 ): ThreadRegistrySession | null {
@@ -1713,23 +1687,6 @@ function threadRegistrySessionFromContext(
 	const sessionDir = safeGetSessionDir(ctx) ?? null;
 	if (sessionId === null && sessionFile === null && sessionDir === null) return null;
 	return { sessionId, sessionFile, sessionDir };
-}
-
-function threadRegistrySessionsMatch(
-	left: ThreadRegistrySession | null,
-	right: ThreadRegistrySession | null,
-): boolean {
-	if (left === null || right === null) return left === right;
-	if (left.sessionId !== null && right.sessionId !== null)
-		return left.sessionId === right.sessionId;
-	if (left.sessionFile !== null && right.sessionFile !== null) {
-		return sameSessionFile(left.sessionFile, right.sessionFile);
-	}
-	return (
-		left.sessionId === right.sessionId &&
-		left.sessionFile === right.sessionFile &&
-		left.sessionDir === right.sessionDir
-	);
 }
 
 function liveThreadDurabilitySignature(thread: LiveThread): string {
@@ -1939,15 +1896,9 @@ function restoreDurableThreads(
 	entries: readonly unknown[],
 	scope: ThreadRegistryRestoreScope,
 ): readonly ClosedThread[] {
-	const latest = new Map<ThreadId, DurableThreadData>();
-	for (const entry of entries) {
-		const data = durableThreadDataFromEntry(entry);
-		if (data === null) continue;
-		if (!shouldRestoreDurableThread(data, scope)) continue;
-		latest.set(data.snapshot.id, data);
-	}
-
-	return Array.from(latest.values()).map((data) => snapshotToRestoredThread(data, scope));
+	return restoreDurableThreadData(entries, scope).map((data) =>
+		snapshotToRestoredThread(data, scope),
+	);
 }
 
 function threadSnapshotsMatch(left: ManagedThread, right: ManagedThread): boolean {
@@ -1965,23 +1916,6 @@ function preserveRegistryTruncatedText(
 	return { ...restored, lastAssistantText: existing.lastAssistantText };
 }
 
-function registryTruncatedTextMatchesFull(
-	truncatedText: string | null,
-	fullText: string | null,
-): boolean {
-	if (truncatedText === null || fullText === null) return false;
-	const match = /\n\[truncated ([1-9]\d*) chars for registry persistence\]$/u.exec(truncatedText);
-	if (match === null) return false;
-
-	const prefix = truncatedText.slice(0, match.index);
-	const omittedLength = Number(match[1]);
-	return (
-		Number.isSafeInteger(omittedLength) &&
-		fullText.length === prefix.length + omittedLength &&
-		fullText.startsWith(prefix)
-	);
-}
-
 function withThreadRegistryMetadata(thread: ClosedThread, restored: ClosedThread): ClosedThread {
 	return {
 		...thread,
@@ -1995,87 +1929,6 @@ function threadRegistryMetadataMatches(left: ManagedThread, right: ManagedThread
 		left.registryGeneration === right.registryGeneration &&
 		threadRegistrySessionsMatch(left.registrySession, right.registrySession)
 	);
-}
-
-function shouldRestoreDurableThread(
-	data: DurableThreadData,
-	scope: ThreadRegistryRestoreScope,
-): boolean {
-	if (!threadSnapshotIsInCurrentScope(data.snapshot, scope.currentPath)) return false;
-	if (data.scope !== undefined) {
-		return scope.sessionId !== null && data.scope.sessionId === scope.sessionId;
-	}
-
-	if (!scope.isRootSessionFork) return true;
-
-	// Legacy registry entries predate per-session ownership metadata. A root-level
-	// fork has the same /root path, so keep only legacy entries appended after the
-	// fork session header and drop copied source-session registry entries.
-	return (
-		data.entryTimestamp !== null &&
-		scope.sessionStartedAt !== null &&
-		data.entryTimestamp >= scope.sessionStartedAt
-	);
-}
-
-function threadSnapshotIsInCurrentScope(
-	threadSnapshot: ThreadSnapshot,
-	currentPath: ThreadPath,
-): boolean {
-	return threadSnapshot.path.startsWith(`${currentPath}/`);
-}
-
-function durableThreadDataFromEntry(entry: unknown): DurableThreadData | null {
-	if (!isRecord(entry) || entry["type"] !== "custom") return null;
-	if (entry["customType"] !== PI_THREAD_REGISTRY_ENTRY_TYPE) return null;
-	const data = entry["data"];
-	if (!isRecord(data) || data["version"] !== 1 || data["kind"] !== "thread_snapshot") return null;
-	const rawSnapshot = data["snapshot"];
-	if (!isThreadSnapshotLike(rawSnapshot)) return null;
-	const scope = threadRegistryEntryScopeFromValue(data["scope"]);
-	const entryTimestamp = stringField(entry, "timestamp");
-	return {
-		version: 1,
-		kind: "thread_snapshot",
-		snapshot: rawSnapshot,
-		entryTimestamp,
-		...(scope === undefined ? {} : { scope }),
-	};
-}
-
-function threadRegistryEntryScopeFromValue(value: unknown): ThreadRegistryEntryScope | undefined {
-	if (!isRecord(value)) return undefined;
-	const sessionId = stringField(value, "sessionId");
-	if (sessionId === null || sessionId.length === 0) return undefined;
-	return { sessionId };
-}
-
-function restoredThreadRegistrySession(
-	data: DurableThreadData,
-	scope: ThreadRegistryRestoreScope,
-): ThreadRegistrySession | null {
-	if (scope.registrySession !== null) return scope.registrySession;
-	if (data.scope === undefined) return null;
-	return { sessionId: data.scope.sessionId, sessionFile: null, sessionDir: null };
-}
-
-function isThreadSnapshotLike(value: unknown): value is ThreadSnapshot {
-	if (!isRecord(value)) return false;
-	try {
-		asThreadId(stringField(value, "id") ?? "");
-		asThreadPath(stringField(value, "path") ?? "");
-		asThreadPath(stringField(value, "parentPath") ?? "");
-		assertTaskName(stringField(value, "taskName") ?? "");
-		return (
-			(value["state"] === "live" || value["state"] === "closed") &&
-			typeof value["name"] === "string" &&
-			typeof value["cwd"] === "string" &&
-			Array.isArray(value["args"]) &&
-			Array.isArray(value["recentEvents"])
-		);
-	} catch {
-		return false;
-	}
 }
 
 function snapshotToRestoredThread(
@@ -2128,545 +1981,6 @@ function snapshotToRestoredThread(
 	return thread;
 }
 
-export function buildPiArgs(input: {
-	readonly name: string;
-	readonly extraArgs: readonly string[];
-	readonly inheritedArgs?: readonly string[];
-	readonly projectTrusted: boolean;
-	readonly sessionFile?: string | undefined;
-}): readonly string[] {
-	const childArgs = mergeChildArgs(input.inheritedArgs ?? [], input.extraArgs);
-	return [
-		...childArgs,
-		...(input.sessionFile === undefined ? [] : ["--session", input.sessionFile]),
-		"--mode",
-		"rpc",
-		"--name",
-		input.name,
-		input.projectTrusted ? "--approve" : "--no-approve",
-	] as const;
-}
-
-type CliFlagSpec = {
-	readonly canonical: string;
-	readonly takesValue: boolean;
-	readonly allowExtra: boolean;
-	readonly inherit: boolean;
-	readonly valueKind?: "cli-path";
-};
-
-const CLI_FLAG_SPECS = new Map<string, CliFlagSpec>(
-	[
-		flagSpec(["--provider"], { takesValue: true, allowExtra: true, inherit: true }),
-		flagSpec(["--model"], { takesValue: true, allowExtra: true, inherit: true }),
-		flagSpec(["--models"], { takesValue: true, allowExtra: true, inherit: true }),
-		flagSpec(["--thinking"], { takesValue: true, allowExtra: true, inherit: true }),
-		flagSpec(["--exclude-tools", "-xt"], {
-			takesValue: true,
-			allowExtra: true,
-			inherit: true,
-		}),
-		flagSpec(["--no-tools", "-nt"], { takesValue: false, allowExtra: true, inherit: true }),
-		flagSpec(["--no-builtin-tools", "-nbt"], {
-			takesValue: false,
-			allowExtra: true,
-			inherit: true,
-		}),
-		flagSpec(["--offline"], { takesValue: false, allowExtra: true, inherit: true }),
-		flagSpec(["--no-extensions", "-ne"], {
-			takesValue: false,
-			allowExtra: true,
-			inherit: true,
-		}),
-		flagSpec(["--no-skills", "-ns"], { takesValue: false, allowExtra: true, inherit: true }),
-		flagSpec(["--no-prompt-templates", "-np"], {
-			takesValue: false,
-			allowExtra: true,
-			inherit: true,
-		}),
-		flagSpec(["--no-themes"], { takesValue: false, allowExtra: true, inherit: true }),
-		flagSpec(["--no-context-files", "-nc"], {
-			takesValue: false,
-			allowExtra: true,
-			inherit: true,
-		}),
-		flagSpec(["--tools", "-t"], { takesValue: true, allowExtra: false, inherit: true }),
-		flagSpec(["--extension", "-e"], {
-			takesValue: true,
-			allowExtra: false,
-			inherit: true,
-			valueKind: "cli-path",
-		}),
-		flagSpec(["--skill"], {
-			takesValue: true,
-			allowExtra: false,
-			inherit: true,
-			valueKind: "cli-path",
-		}),
-		flagSpec(["--prompt-template"], {
-			takesValue: true,
-			allowExtra: false,
-			inherit: true,
-			valueKind: "cli-path",
-		}),
-		flagSpec(["--theme"], {
-			takesValue: true,
-			allowExtra: false,
-			inherit: true,
-			valueKind: "cli-path",
-		}),
-	].flat(),
-);
-
-const VALUE_FLAGS_TO_SKIP = new Set([
-	"--api-key",
-	"--append-system-prompt",
-	"--export",
-	"--fork",
-	"--mode",
-	"--name",
-	"-n",
-	"--session",
-	"--session-dir",
-	"--session-id",
-	"--system-prompt",
-]);
-
-const OPTIONAL_VALUE_FLAGS_TO_SKIP = new Set(["--list-models"]);
-
-const SENSITIVE_BOOLEAN_FLAGS = new Set([
-	"--approve",
-	"-a",
-	"--continue",
-	"-c",
-	"--help",
-	"-h",
-	"--no-approve",
-	"-na",
-	"--print",
-	"-p",
-	"--resume",
-	"-r",
-	"--verbose",
-	"--version",
-	"-v",
-]);
-
-const PACKAGE_SUBCOMMANDS = new Set(["config", "install", "list", "remove", "uninstall", "update"]);
-
-// Derive alias sets from CLI_FLAG_SPECS so adding an alias cannot silently drift.
-function flagAliases(...canonicals: readonly string[]): ReadonlySet<string> {
-	const aliases = new Set<string>();
-	for (const canonical of canonicals) {
-		let found = false;
-		for (const [alias, spec] of CLI_FLAG_SPECS) {
-			if (spec.canonical !== canonical) continue;
-			aliases.add(alias);
-			found = true;
-		}
-		if (!found) throw new Error(`Unknown CLI flag spec: ${canonical}`);
-	}
-	return aliases;
-}
-
-const NO_TOOLS_FLAGS = flagAliases("--no-tools");
-const NO_BUILTIN_TOOLS_FLAGS = flagAliases("--no-builtin-tools");
-const NO_EXTENSIONS_FLAGS = flagAliases("--no-extensions");
-const NO_SKILLS_FLAGS = flagAliases("--no-skills");
-const NO_PROMPT_TEMPLATES_FLAGS = flagAliases("--no-prompt-templates");
-const NO_THEMES_FLAGS = flagAliases("--no-themes");
-const TOOLS_FLAGS = flagAliases("--tools");
-const EXTENSION_FLAGS = flagAliases("--extension");
-const SKILL_FLAGS = flagAliases("--skill");
-const PROMPT_TEMPLATE_FLAGS = flagAliases("--prompt-template");
-const THEME_FLAGS = flagAliases("--theme");
-const EXCLUDE_TOOLS_FLAGS = flagAliases("--exclude-tools");
-const MODEL_SCOPE_FLAGS = flagAliases("--models");
-const ALLOWED_EXTRA_ARGS_HELP =
-	"allowed start.args are safe narrowing flags such as --provider <value>, --model <value>, --models <value>, --thinking <value>, --exclude-tools <value>, --no-tools, --no-builtin-tools, --offline, --no-extensions, --no-skills, --no-prompt-templates, --no-themes, and --no-context-files";
-// Pi applies --thinking after scoped model thinking, so it can widen an inherited
-// --models scope just like selecting a different model/provider can.
-const MODEL_SCOPE_OVERRIDE_FLAGS = flagAliases("--provider", "--model", "--models", "--thinking");
-const BUILTIN_TOOL_NAMES = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
-const INHERITED_ENABLE_RESTRICTIONS: readonly {
-	readonly restrictionFlags: ReadonlySet<string>;
-	readonly enableFlags: ReadonlySet<string>;
-}[] = [
-	{ restrictionFlags: NO_TOOLS_FLAGS, enableFlags: TOOLS_FLAGS },
-	{ restrictionFlags: NO_EXTENSIONS_FLAGS, enableFlags: EXTENSION_FLAGS },
-	{ restrictionFlags: NO_SKILLS_FLAGS, enableFlags: SKILL_FLAGS },
-	{ restrictionFlags: NO_PROMPT_TEMPLATES_FLAGS, enableFlags: PROMPT_TEMPLATE_FLAGS },
-	{ restrictionFlags: NO_THEMES_FLAGS, enableFlags: THEME_FLAGS },
-];
-
-export function assertAllowedExtraArgs(args: readonly string[]): void {
-	parseAllowedExtraArgs(args);
-}
-
-export function collectInheritedPiArgs(
-	argv: readonly string[] = process.argv,
-	resourceBaseCwd: string = process.cwd(),
-): readonly string[] {
-	const args = processArgvToPiArgs(argv);
-	const inherited: string[] = [];
-	for (let i = 0; i < args.length; i++) {
-		const arg = args[i];
-		if (arg === undefined) continue;
-		if (arg === "--") break;
-
-		// Pi's built-in parser only recognizes value flags in `--flag value` form.
-		// Inline assignments such as `--model=opus` are exposed as extension
-		// unknownFlags instead, so reinterpreting them here would make child Pi
-		// processes inherit settings the parent did not actually apply.
-		if (arg.includes("=")) {
-			continue;
-		}
-
-		const spec = CLI_FLAG_SPECS.get(arg);
-		if (spec?.inherit === true) {
-			if (spec.takesValue) {
-				const value = args[i + 1];
-				if (value !== undefined) {
-					inherited.push(spec.canonical, normalizeInheritedValue(spec, value, resourceBaseCwd));
-					i++;
-				}
-			} else {
-				inherited.push(spec.canonical);
-			}
-			continue;
-		}
-
-		if (VALUE_FLAGS_TO_SKIP.has(arg) && i + 1 < args.length) {
-			i++;
-			continue;
-		}
-
-		if (
-			OPTIONAL_VALUE_FLAGS_TO_SKIP.has(arg) &&
-			i + 1 < args.length &&
-			!isFlagLike(args[i + 1]!) &&
-			!args[i + 1]!.startsWith("@")
-		) {
-			i++;
-			continue;
-		}
-
-		if (SENSITIVE_BOOLEAN_FLAGS.has(arg)) continue;
-
-		if (arg.startsWith("--") && !arg.includes("=")) {
-			const next = args[i + 1];
-			if (next !== undefined && !isFlagLike(next) && !next.startsWith("@")) i++;
-		}
-	}
-
-	return inherited;
-}
-
-function normalizeInheritedValue(
-	spec: CliFlagSpec,
-	value: string,
-	resourceBaseCwd: string,
-): string {
-	if (spec.valueKind !== "cli-path" || !isLocalCliPath(value)) return value;
-	return resolveCliPath(value, resourceBaseCwd);
-}
-
-function isLocalCliPath(value: string): boolean {
-	const trimmed = value.trim();
-	return !(
-		trimmed.startsWith("npm:") ||
-		trimmed.startsWith("git:") ||
-		trimmed.startsWith("github:") ||
-		trimmed.startsWith("http:") ||
-		trimmed.startsWith("https:") ||
-		trimmed.startsWith("ssh:")
-	);
-}
-
-function resolveCliPath(value: string, resourceBaseCwd: string): string {
-	const normalized = normalizeCliPath(value);
-	const normalizedResourceBaseCwd = normalizeCliPath(resourceBaseCwd);
-	return path.isAbsolute(normalized)
-		? path.resolve(normalized)
-		: path.resolve(normalizedResourceBaseCwd, normalized);
-}
-
-function normalizeCliPath(value: string): string {
-	if (value === "~") return os.homedir();
-	if (value.startsWith("~/") || (process.platform === "win32" && value.startsWith("~\\"))) {
-		return path.join(os.homedir(), value.slice(2));
-	}
-	if (value.startsWith("file://")) return fileURLToPath(value);
-	return value;
-}
-
-export function shouldApproveChildCwd(
-	parentProjectTrusted: boolean,
-	parentCwd: string,
-	childCwd: string,
-): boolean {
-	return parentProjectTrusted && isCwdInsideOrEqual(parentCwd, childCwd);
-}
-
-export function isCwdInsideOrEqual(parentCwd: string, childCwd: string): boolean {
-	const parent = realpathOrResolve(parentCwd);
-	const child = realpathOrResolve(childCwd);
-	const relative = path.relative(parent, child);
-	return relative === "" || (!escapesToParent(relative) && !path.isAbsolute(relative));
-}
-
-function escapesToParent(relativePath: string): boolean {
-	return relativePath === ".." || relativePath.startsWith(`..${path.sep}`);
-}
-
-function realpathOrResolve(value: string): string {
-	const resolved = path.resolve(value);
-	try {
-		return fs.realpathSync.native(resolved);
-	} catch {
-		return resolved;
-	}
-}
-
-function flagSpec(
-	aliases: readonly [string, ...string[]],
-	options: Omit<CliFlagSpec, "canonical">,
-): readonly (readonly [string, CliFlagSpec])[] {
-	const canonical = aliases[0];
-	return aliases.map((alias) => [alias, { canonical, ...options }] as const);
-}
-
-function parseAllowedExtraArgs(args: readonly string[]): readonly string[] {
-	const allowed: string[] = [];
-	for (let i = 0; i < args.length; i++) {
-		const arg = args[i];
-		if (arg === undefined) continue;
-		if (arg.includes("=")) {
-			throw new Error(
-				`Unsupported child Pi arg for pi-threads: ${arg}. Repair: inline --flag=value forms are not allowed; pass flag and value as separate array items, e.g. "args": ["--model", "sonnet"].`,
-			);
-		}
-		if (arg === "--" || PACKAGE_SUBCOMMANDS.has(arg) || !isFlagLike(arg)) {
-			throw new Error(
-				`Unsupported child Pi arg for pi-threads: ${arg}. Repair: remove package subcommands, prompts, and positional args; ${ALLOWED_EXTRA_ARGS_HELP}.`,
-			);
-		}
-
-		const spec = CLI_FLAG_SPECS.get(arg);
-		if (spec?.allowExtra !== true) {
-			throw new Error(
-				`Unsupported child Pi arg for pi-threads: ${arg}. Repair: remove this flag or replace it with an allowlisted restriction; ${ALLOWED_EXTRA_ARGS_HELP}. Children always run in RPC mode and cannot set session, approval, extension-loading, or one-shot flags through start.args.`,
-			);
-		}
-
-		allowed.push(arg);
-		if (spec.takesValue) {
-			const value = args[i + 1];
-			if (value === undefined || isFlagLike(value)) {
-				throw new Error(
-					`Unsupported child Pi arg for pi-threads: ${arg} requires a value. Repair: pass the value as the next array item, e.g. "args": ["${arg}", "value"].`,
-				);
-			}
-			allowed.push(value);
-			i++;
-		}
-	}
-
-	return allowed;
-}
-
-function mergeChildArgs(
-	inheritedArgs: readonly string[],
-	extraArgs: readonly string[],
-): readonly string[] {
-	const allowedExtraArgs = parseAllowedExtraArgs(extraArgs);
-	assertNoInheritedModelScopeOverride(inheritedArgs, allowedExtraArgs);
-	const filteredInheritedArgs = stripInheritedEnablesForRestrictions(
-		inheritedArgs,
-		allowedExtraArgs,
-	);
-
-	const childExcludeToolValues = collectFlagValues(allowedExtraArgs, EXCLUDE_TOOLS_FLAGS);
-	if (childExcludeToolValues.length > 0) {
-		const inheritedExcludeToolValue = collectLastFlagValue(
-			filteredInheritedArgs,
-			EXCLUDE_TOOLS_FLAGS,
-		);
-		const mergedExcludeTools = mergeCommaSeparatedValues([
-			...(inheritedExcludeToolValue === undefined ? [] : [inheritedExcludeToolValue]),
-			...childExcludeToolValues,
-		]);
-		const argsWithoutInheritedExcludeTools = removeFlags(
-			filteredInheritedArgs,
-			EXCLUDE_TOOLS_FLAGS,
-		);
-		const argsWithoutChildExcludeTools = removeFlags(allowedExtraArgs, EXCLUDE_TOOLS_FLAGS);
-		return mergedExcludeTools.length === 0
-			? [...argsWithoutInheritedExcludeTools, ...argsWithoutChildExcludeTools]
-			: [
-					...argsWithoutInheritedExcludeTools,
-					...argsWithoutChildExcludeTools,
-					"--exclude-tools",
-					mergedExcludeTools.join(","),
-				];
-	}
-
-	return [...filteredInheritedArgs, ...allowedExtraArgs];
-}
-
-function stripInheritedEnablesForRestrictions(
-	inheritedArgs: readonly string[],
-	restrictionArgs: readonly string[],
-): readonly string[] {
-	let filteredArgs = inheritedArgs;
-	for (const restriction of INHERITED_ENABLE_RESTRICTIONS) {
-		if (hasFlag(restrictionArgs, restriction.restrictionFlags)) {
-			filteredArgs = removeFlags(filteredArgs, restriction.enableFlags);
-		}
-	}
-	if (
-		!hasFlag(restrictionArgs, NO_TOOLS_FLAGS) &&
-		hasFlag(restrictionArgs, NO_BUILTIN_TOOLS_FLAGS)
-	) {
-		filteredArgs = filterInheritedToolAllowlistForNoBuiltinTools(filteredArgs);
-	}
-	return filteredArgs;
-}
-
-function assertNoInheritedModelScopeOverride(
-	inheritedArgs: readonly string[],
-	allowedExtraArgs: readonly string[],
-): void {
-	if (!hasFlag(inheritedArgs, MODEL_SCOPE_FLAGS)) return;
-	if (!hasFlag(allowedExtraArgs, MODEL_SCOPE_OVERRIDE_FLAGS)) return;
-
-	throw new Error(
-		"Unsupported child Pi arg for pi-threads: child model/provider/thinking args cannot override an inherited --models scope. Repair: omit --provider/--model/--models/--thinking from start.args or start the parent with a narrower model scope.",
-	);
-}
-
-function filterInheritedToolAllowlistForNoBuiltinTools(
-	inheritedArgs: readonly string[],
-): readonly string[] {
-	// --tools is an active-tool allowlist and can re-enable built-ins even when
-	// --no-builtin-tools is present. Intersect the effective inherited allowlist
-	// with the child's no-built-ins restriction; if nothing remains, force no
-	// tools rather than dropping --tools and enabling every extension tool.
-	const inheritedToolValue = collectLastFlagValue(inheritedArgs, TOOLS_FLAGS);
-	if (inheritedToolValue === undefined) return inheritedArgs;
-
-	const argsWithoutInheritedTools = removeFlags(inheritedArgs, TOOLS_FLAGS);
-	const nonBuiltinTools = mergeCommaSeparatedValues([inheritedToolValue]).filter(
-		(toolName) => !BUILTIN_TOOL_NAMES.has(toolName),
-	);
-	return nonBuiltinTools.length === 0
-		? [...argsWithoutInheritedTools, "--no-tools"]
-		: [...argsWithoutInheritedTools, "--tools", nonBuiltinTools.join(",")];
-}
-
-function hasFlag(args: readonly string[], flags: ReadonlySet<string>): boolean {
-	for (let i = 0; i < args.length; i++) {
-		const arg = args[i];
-		if (arg === undefined) continue;
-		if (flags.has(arg)) return true;
-
-		const spec = CLI_FLAG_SPECS.get(arg);
-		if (spec?.takesValue === true) i++;
-	}
-	return false;
-}
-
-function collectFlagValues(args: readonly string[], flags: ReadonlySet<string>): readonly string[] {
-	const values: string[] = [];
-	for (let i = 0; i < args.length; i++) {
-		const arg = args[i];
-		if (arg === undefined) continue;
-
-		const spec = CLI_FLAG_SPECS.get(arg);
-		if (flags.has(arg)) {
-			const value = args[i + 1];
-			if (spec?.takesValue === true && value !== undefined) {
-				values.push(value);
-				i++;
-			}
-			continue;
-		}
-
-		if (spec?.takesValue === true) i++;
-	}
-	return values;
-}
-
-function collectLastFlagValue(
-	args: readonly string[],
-	flags: ReadonlySet<string>,
-): string | undefined {
-	let value: string | undefined;
-	for (const nextValue of collectFlagValues(args, flags)) value = nextValue;
-	return value;
-}
-
-function mergeCommaSeparatedValues(values: readonly string[]): readonly string[] {
-	const merged: string[] = [];
-	const seen = new Set<string>();
-	for (const value of values) {
-		for (const item of value.split(",")) {
-			const normalized = item.trim();
-			if (normalized === "" || seen.has(normalized)) continue;
-			seen.add(normalized);
-			merged.push(normalized);
-		}
-	}
-	return merged;
-}
-
-function removeFlags(args: readonly string[], flags: ReadonlySet<string>): readonly string[] {
-	const result: string[] = [];
-	for (let i = 0; i < args.length; i++) {
-		const arg = args[i];
-		if (arg === undefined) continue;
-		const spec = CLI_FLAG_SPECS.get(arg);
-		if (!flags.has(arg)) {
-			result.push(arg);
-			if (spec?.takesValue === true) {
-				const value = args[i + 1];
-				if (value !== undefined) {
-					result.push(value);
-					i++;
-				}
-			}
-			continue;
-		}
-
-		if (spec?.takesValue === true) i++;
-	}
-	return result;
-}
-
-function processArgvToPiArgs(argv: readonly string[]): readonly string[] {
-	if (argv.length <= 1) return [];
-	const invokedScript = argv[1];
-	if (invokedScript !== undefined && looksLikeNodeScript(invokedScript)) return argv.slice(2);
-	const execName = path.basename(argv[0] ?? "").toLowerCase();
-	if (/^(node|bun)(\.exe)?$/u.test(execName)) return argv.slice(2);
-	return argv.slice(1);
-}
-
-function looksLikeNodeScript(value: string): boolean {
-	return (
-		value.endsWith(".js") ||
-		value.endsWith(".mjs") ||
-		value.endsWith(".cjs") ||
-		value.endsWith(".ts") ||
-		value.startsWith("/$bunfs/root/") ||
-		fs.existsSync(value)
-	);
-}
-
-function isFlagLike(value: string): boolean {
-	return value.startsWith("-") && !value.startsWith("---");
-}
-
 function snapshotPair(thread: ManagedThread): {
 	readonly thread: ThreadSnapshot;
 	readonly snapshot: ThreadRuntimeSnapshot;
@@ -2684,54 +1998,6 @@ function normalizeWaitTimeoutMs(timeoutMs: number | undefined): number {
 	throw new Error(
 		`Invalid wait timeoutMs: ${timeoutMs}. Repair: set wait.timeoutMs to an integer from 0 to ${MAX_WAIT_TIMEOUT_MS}, or omit it to use ${DEFAULT_WAIT_TIMEOUT_MS}ms.`,
 	);
-}
-
-function taskNameFromText(value: string | undefined): string | null {
-	if (value === undefined) return null;
-	const normalized = value
-		.normalize("NFKD")
-		.replace(/[\u0300-\u036f]/gu, "")
-		.toLowerCase()
-		.replace(/[^a-z0-9]+/gu, "_")
-		.replace(/_+/gu, "_")
-		.replace(/^_+|_+$/gu, "");
-	if (normalized === "") return null;
-	return assertTaskName(truncateTaskName(normalized));
-}
-
-function taskNameWithNumericSuffix(base: string, attempt: number): string {
-	const suffix = attempt === 1 ? "" : `_${attempt}`;
-	const stemMaxLength = TASK_NAME_MAX_LENGTH - suffix.length;
-	if (stemMaxLength < 1) throw new Error(`Unable to generate taskName suffix: ${suffix}`);
-	const stem = truncateTaskName(base, stemMaxLength);
-	return assertTaskName(`${stem}${suffix}`);
-}
-
-function truncateTaskName(value: string, maxLength = TASK_NAME_MAX_LENGTH): string {
-	const truncated = value.slice(0, maxLength).replace(/_+$/u, "");
-	return truncated === "" ? value.slice(0, maxLength) : truncated;
-}
-
-function generateDisplayName(prompt: string, taskName: string, id: ThreadId): string {
-	return displayNameFromPrompt(prompt) ?? humanizeTaskName(taskName) ?? shortTaskName(id);
-}
-
-function displayNameFromPrompt(prompt: string): string | null {
-	const firstUsefulLine = prompt
-		.split(/\r?\n/u)
-		.map((line) => line.replace(/\s+/gu, " ").trim())
-		.find((line) => line !== "" && /[\p{L}\p{N}]/u.test(line));
-	if (firstUsefulLine === undefined) return null;
-	return truncateDisplayName(firstUsefulLine);
-}
-
-function truncateDisplayName(value: string): string {
-	if (value.length <= DISPLAY_NAME_MAX_LENGTH) return value;
-	return `${value.slice(0, DISPLAY_NAME_MAX_LENGTH - 3).trimEnd()}...`;
-}
-
-function shortTaskName(id: ThreadId): string {
-	return assertTaskName(id.slice(0, "thread_".length + 6));
 }
 
 function snapshot(thread: ManagedThread): ThreadSnapshot {
@@ -3012,6 +2278,65 @@ async function sendMessage(thread: LiveThread, mode: SendMode, message: string) 
 				{ type: "prompt", message, streamingBehavior: "followUp" },
 				RPC_SEND_TIMEOUT_MS,
 			);
+	}
+}
+
+function shouldLaunchDetachedProcessGroup(): boolean {
+	return process.platform !== "win32";
+}
+
+async function signalThreadProcessTree(thread: LiveThread, signal: NodeJS.Signals): Promise<void> {
+	if (process.platform === "win32") {
+		if (signal === "SIGKILL") {
+			if (await taskkillWindowsProcessTree(thread.pid)) return;
+		}
+
+		safeKillChild(thread, signal);
+		return;
+	}
+
+	if (thread.processGroupId !== null) {
+		try {
+			process.kill(-thread.processGroupId, signal);
+			return;
+		} catch {
+			// Fall back to the direct child process. Process groups can already be gone
+			// or unavailable under tests/sandboxes; stopping must remain best-effort.
+		}
+	}
+
+	safeKillChild(thread, signal);
+}
+
+function taskkillWindowsProcessTree(pid: number): Promise<boolean> {
+	return new Promise((resolve) => {
+		let settled = false;
+		const finish = (ok: boolean) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			resolve(ok);
+		};
+		const timeout = setTimeout(() => finish(false), STOP_KILL_WAIT_MS);
+		timeout.unref?.();
+
+		try {
+			const taskkill = execFile("taskkill.exe", ["/PID", String(pid), "/T", "/F"], (error) => {
+				finish(error === null);
+			});
+			taskkill.on?.("error", () => finish(false));
+		} catch {
+			finish(false);
+		}
+	});
+}
+
+function safeKillChild(thread: LiveThread, signal: NodeJS.Signals): void {
+	try {
+		thread.child.kill(signal);
+	} catch {
+		// Process cleanup is best-effort; lifecycle code synthesizes a final stopped
+		// snapshot if no close event arrives after the bounded wait.
 	}
 }
 
