@@ -263,7 +263,21 @@ pi install /path/to/pi-threads
 nix develop
 pnpm install
 pnpm check          # format + lint + typecheck + test
+hk check            # format + lint validation (via hk)
+hk fix              # auto-format + auto-fix (same as pre-commit)
 pnpm dev:pi         # run Pi with the extension loaded locally
+```
+
+### Git hooks
+
+Pre-commit formatting and linting is handled automatically by **hk** via
+global Git hooks (`~/.gitconfig` `hook.*.command`). No local setup required.
+
+If you want to run the same checks without committing:
+
+```bash
+hk check            # read-only validation
+hk fix              # auto-fix (same action as pre-commit hook)
 ```
 
 Quality gates are enforced by GitHub Actions on pushes and pull requests. The

@@ -28,13 +28,12 @@ pnpm test            # run vitest once
 pnpm test:watch      # run vitest in watch mode
 pnpm dev:pi          # run Pi with this extension loaded locally
 pnpm licenses:list   # list dependency license metadata from pnpm
+hk check             # format + lint validation (via hk)
+hk fix               # auto-format + auto-fix
 ```
 
-Install the git hooks if you want local pre-commit formatting and linting:
-
-```bash
-pnpm hooks:install
-```
+Pre-commit formatting and linting is provided by **hk** via global Git hooks.
+No local hook installation needed.
 
 ## Pull request checklist
 

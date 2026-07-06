@@ -1,0 +1,42 @@
+amends "package://github.com/jdx/hk/releases/download/v1.49.0/hk@1.49.0#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v1.49.0/hk@1.49.0#/Builtins.pkl"
+
+/// oxfmt formats all project sources (TS, JSON, Markdown, YAML).
+/// oxlint lints and auto-fixes TypeScript sources.
+///
+/// Tools are resolved via pnpm exec so the versions pinned in
+/// package.json are used.
+///
+/// Steps are split so the "check" profile (hk check / CI) runs only
+/// validation commands, while "fix" mode (pre-commit, hk fix) auto-formats
+/// and auto-fixes.
+local linters = new Mapping<String, Step> {
+    ["oxfmt"] {
+        glob = "*.{ts,tsx,mts,cts,json,jsonc,md,yml,yaml}"
+        fix = "pnpm exec oxfmt --write {{ files }}"
+        check = "pnpm exec oxfmt --check {{ files }}"
+    }
+    ["oxlint"] {
+        glob = "*.{ts,tsx,mts,cts}"
+        fix = "pnpm exec oxlint --fix --deny-warnings --tsconfig tsconfig.json {{ files }}"
+        check = "pnpm exec oxlint --deny-warnings --tsconfig tsconfig.json {{ files }}"
+    }
+}
+
+hooks {
+    /// pre-commit: auto-fix staged files, stash unstaged changes.
+    ["pre-commit"] {
+        fix = true
+        stash = "git"
+        steps = linters
+    }
+    /// hk fix: manual fix command using the same steps.
+    ["fix"] {
+        fix = true
+        steps = linters
+    }
+    /// hk check: read-only validation (format + lint) for CI or manual use.
+    ["check"] {
+        steps = linters
+    }
+}

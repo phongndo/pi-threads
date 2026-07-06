@@ -39,7 +39,12 @@
 
             shellHook = ''
               export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+              # Provide hk + pkl via mise.toml if mise is available
+              if command -v mise &>/dev/null; then
+                mise trust --yes 2>/dev/null || true
+              fi
               echo "pi-threads: pnpm, oxlint, oxfmt, and LSPs are available."
+              echo "  hk hooks: managed via mise.toml + global Git hooks"
             '';
           };
         }

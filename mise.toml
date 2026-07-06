@@ -1,0 +1,15 @@
+[tools]
+hk = "1"
+pkl = "0.31"
+
+[tasks.pre-commit]
+run = "hk run pre-commit"
+description = "Run hk pre-commit hook manually"
+
+[tasks.hooks]
+run = "hk run pre-commit"
+description = "Alias for hk pre-commit hook"
+
+[tasks.hk-check]
+run = "hk check"
+description = "Run hk check (format + lint validation)"
