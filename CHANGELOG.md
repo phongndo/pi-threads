@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+No changes yet.
+
+## [0.3.1] - 2026-07-07
+
 ### Added
 
 - Tool contract and workflow-authoring documentation, including example
@@ -24,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - POSIX child Pi processes now launch in their own process group so stop/force
   cleanup can target descendant processes; Windows force-stop uses
   `taskkill /T /F` best-effort process-tree cleanup.
+
+### Fixed
+
+- Fixed a `wait` timeout race where a child closing exactly at the deadline
+  could be reported with stale timing/state.
 
 ## [0.3.0] - 2026-07-05
 
