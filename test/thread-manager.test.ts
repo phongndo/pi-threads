@@ -3030,42 +3030,90 @@ describe("ThreadManager session metadata", () => {
 		}
 	});
 
-	it("forces a closed stopped snapshot when a live child ignores shutdown signals", async () => {
-		const child = new FakeChildProcess();
-		child.kill.mockImplementation(() => true);
-		spawnMock.mockReturnValue(child);
-		attachRpc(child, (request) => {
-			if (request["type"] === "get_state") {
-				respond(child, request, {
-					sessionFile: "/tmp/stubborn.jsonl",
-					sessionId: "session-stubborn",
-					pendingMessageCount: 0,
-					isStreaming: false,
-				});
-				return;
+	it("forces a closed stopped snapshot when a POSIX live child ignores shutdown signals", async () => {
+		await withPlatform("linux", async () => {
+			const child = new FakeChildProcess();
+			child.kill.mockImplementation(() => true);
+			spawnMock.mockReturnValue(child);
+			attachRpc(child, (request) => {
+				if (request["type"] === "get_state") {
+					respond(child, request, {
+						sessionFile: "/tmp/stubborn.jsonl",
+						sessionId: "session-stubborn",
+						pendingMessageCount: 0,
+						isStreaming: false,
+					});
+					return;
+				}
+
+				if (request["type"] === "prompt" || request["type"] === "abort") respond(child, request);
+			});
+
+			const manager = new ThreadManager(managerEnvironment());
+			await manager.start({ action: "start", prompt: "stubborn", taskName: "stubborn" }, context());
+
+			vi.useFakeTimers();
+			try {
+				const shutdown = manager.shutdown();
+				await vi.advanceTimersByTimeAsync(2_000);
+				await shutdown;
+			} finally {
+				vi.useRealTimers();
 			}
 
-			if (request["type"] === "prompt" || request["type"] === "abort") respond(child, request);
+			expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+			expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+			expect(manager.list({ action: "list", state: "live" })).toEqual([]);
+			expect(manager.list({ action: "list", state: "closed" })[0]).toMatchObject({
+				state: "closed",
+				exit: { kind: "stopped", signal: "SIGKILL" },
+			});
 		});
+	});
 
-		const manager = new ThreadManager(managerEnvironment());
-		await manager.start({ action: "start", prompt: "stubborn", taskName: "stubborn" }, context());
+	it("forces a closed stopped snapshot when a Windows live child ignores shutdown signals", async () => {
+		await withPlatform("win32", async () => {
+			const child = new FakeChildProcess();
+			child.kill.mockImplementation(() => true);
+			spawnMock.mockReturnValue(child);
+			attachRpc(child, (request) => {
+				if (request["type"] === "get_state") {
+					respond(child, request, {
+						sessionFile: "/tmp/stubborn.jsonl",
+						sessionId: "session-stubborn",
+						pendingMessageCount: 0,
+						isStreaming: false,
+					});
+					return;
+				}
 
-		vi.useFakeTimers();
-		try {
-			const shutdown = manager.shutdown();
-			await vi.advanceTimersByTimeAsync(2_000);
-			await shutdown;
-		} finally {
-			vi.useRealTimers();
-		}
+				if (request["type"] === "prompt" || request["type"] === "abort") respond(child, request);
+			});
 
-		expect(child.kill).toHaveBeenCalledWith("SIGTERM");
-		expect(child.kill).toHaveBeenCalledWith("SIGKILL");
-		expect(manager.list({ action: "list", state: "live" })).toEqual([]);
-		expect(manager.list({ action: "list", state: "closed" })[0]).toMatchObject({
-			state: "closed",
-			exit: { kind: "stopped", signal: "SIGKILL" },
+			const manager = new ThreadManager(managerEnvironment());
+			await manager.start({ action: "start", prompt: "stubborn", taskName: "stubborn" }, context());
+
+			vi.useFakeTimers();
+			try {
+				const shutdown = manager.shutdown();
+				await vi.advanceTimersByTimeAsync(2_000);
+				await shutdown;
+			} finally {
+				vi.useRealTimers();
+			}
+
+			expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+			expect(execFileMock).toHaveBeenCalledWith(
+				"taskkill.exe",
+				["/PID", String(child.pid), "/T", "/F"],
+				expect.any(Function),
+			);
+			expect(child.kill).not.toHaveBeenCalledWith("SIGKILL");
+			expect(manager.list({ action: "list", state: "live" })).toEqual([]);
+			expect(manager.list({ action: "list", state: "closed" })[0]).toMatchObject({
+				state: "closed",
+				exit: { kind: "stopped", signal: "SIGKILL" },
+			});
 		});
 	});
 
