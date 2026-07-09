@@ -1,6 +1,6 @@
 {
   "name": "@phongndo/pi-threads",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "A minimal Pi extension for managing background Pi child sessions.",
   "keywords": [
     "agents",

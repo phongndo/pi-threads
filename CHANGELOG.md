@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 No changes yet.
 
+## [0.4.0] - 2026-07-09
+
+### Added
+
+- Added a typed awaiting-send state machine and focused thread lifecycle modules
+  for process management, state transitions, and persistence.
+- Added a Pi session adapter that centralizes registry materialization,
+  cross-session appends, safe session reads, and persistence-failure reporting.
+- Added runtime and regression coverage for Pi RPC stdin shutdown, concurrent
+  session writers, awaiting-send transitions, persistence fallbacks, timeout
+  handling, hydration, and lifecycle edge cases.
+- Added Windows typecheck/test coverage to CI.
+
+### Changed
+
+- Refactored `ThreadManager` into smaller lifecycle, state, process, and
+  persistence helpers while preserving the public tool surface.
+- Reduced registry persistence to meaningful lifecycle transitions instead of
+  streaming text deltas, and added cheap hydration caching for unchanged
+  session state.
+- `send` results now report `accepted: null` / `Accepted: unknown` when an RPC
+  acceptance check times out after the request was written; callers should poll
+  or wait before retrying because the child may still process the message.
+- `detail: full` now returns bounded retained assistant output with an explicit
+  truncation marker for very large messages instead of keeping unbounded text in
+  memory.
+- `/threads` live-thread stop now requires a second `ctrl+x` confirmation.
+
+### Fixed
+
+- Fixed registry restore after cross-session or concurrent session writes by
+  hydrating registry entries from the full session file instead of only the
+  current leaf branch.
+- Fixed first-sync hydration after changing thread scope so the new scope is
+  bound before restore.
+- Fixed timed-out sends so written-but-unconfirmed requests remain protected
+  from idle cleanup until a later poll or wait confirms child state.
+- Fixed persistence errors being silently swallowed by surfacing a throttled
+  degraded-persistence warning/event.
+- Fixed persistence-error bookkeeping when closed threads are dropped during
+  scope/session cleanup.
+- Fixed RPC timeout labels and messaging for initial prompts and send modes.
+
 ## [0.3.1] - 2026-07-07
 
 ### Added
