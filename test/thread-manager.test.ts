@@ -5,7 +5,12 @@ import * as path from "node:path";
 import { PassThrough } from "node:stream";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { asThreadId, asThreadPath, type ThreadSnapshot } from "../src/domain.ts";
+import {
+	asThreadId,
+	asThreadPath,
+	toThreadRuntimeSnapshot,
+	type ThreadSnapshot,
+} from "../src/domain.ts";
 
 const { execFileMock, spawnMock } = vi.hoisted(() => ({
 	execFileMock: vi.fn(
@@ -254,6 +259,49 @@ describe("ThreadManager session metadata", () => {
 		).rejects.toThrow(
 			/Thread path already exists: \/root\/alpha.*choose a unique start\.taskName/u,
 		);
+	});
+
+	it("marks stop of a closed thread as alreadyClosed", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+		mockResponsiveChild("session-alpha");
+
+		await manager.start({ action: "start", prompt: "work", taskName: "alpha" }, context());
+		const first = await manager.stop({ action: "stop", id: "/root/alpha" });
+		const second = await manager.stop({ action: "stop", id: "/root/alpha" });
+
+		expect(first).toMatchObject({
+			kind: "stopped",
+			alreadyClosed: false,
+			thread: { state: "closed" },
+		});
+		expect(second).toMatchObject({
+			kind: "stopped",
+			alreadyClosed: true,
+			thread: { state: "closed" },
+		});
+	});
+
+	it("warns once for invalid PI_THREADS integer env values", () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			const first = new ThreadManager({
+				...managerEnvironment(),
+				PI_THREADS_MAX_THREADS: "not-a-number",
+			});
+			const second = new ThreadManager({
+				...managerEnvironment(),
+				PI_THREADS_MAX_THREADS: "also-bad",
+			});
+
+			expect(first.list({ action: "list" })).toEqual([]);
+			expect(second.list({ action: "list" })).toEqual([]);
+			expect(warn).toHaveBeenCalledTimes(1);
+			expect(warn).toHaveBeenCalledWith(
+				expect.stringContaining('Ignoring invalid PI_THREADS_MAX_THREADS="not-a-number"'),
+			);
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	it("starts POSIX children detached so process-tree cleanup can signal the group", async () => {
@@ -742,6 +790,102 @@ describe("ThreadManager session metadata", () => {
 		expect(refreshSnapshot.recentEvents.map((event) => event.type)).toContain("turn_completed");
 	});
 
+	it("does not persist partial-text deltas across streaming wait/poll refreshes", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+		const snapshots: ThreadSnapshot[] = [];
+		manager.setPersistence({ appendSnapshot: (snapshot) => snapshots.push(snapshot) });
+
+		let streaming = true;
+		const child = new FakeChildProcess();
+		spawnMock.mockReturnValueOnce(child);
+		attachRpc(child, (request) => {
+			if (request["type"] === "get_state") {
+				respond(child, request, {
+					sessionFile: "/tmp/session-stream.jsonl",
+					sessionId: "session-stream",
+					pendingMessageCount: 0,
+					isStreaming: streaming,
+				});
+				return;
+			}
+			if (request["type"] === "prompt") respond(child, request);
+			if (request["type"] === "abort") respond(child, request);
+		});
+
+		await manager.start({ action: "start", prompt: "stream", taskName: "stream" }, context());
+
+		emitRpcEvent(child, { type: "agent_start" });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		snapshots.length = 0;
+
+		const refreshCount = 24;
+		for (let i = 1; i <= refreshCount; i++) {
+			emitRpcEvent(child, {
+				type: "message_update",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: `partial-${"x".repeat(i * 50)}` }],
+				},
+			});
+			// eslint-disable-next-line no-await-in-loop -- each refresh intentionally follows a new partial update.
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			// eslint-disable-next-line no-await-in-loop -- poll sequentially to reproduce wait/refresh amplification.
+			await manager.poll("stream");
+		}
+
+		// Streaming partials + get_state refreshes must not append per poll.
+		expect(snapshots).toHaveLength(0);
+		const streamingThread = manager.list({ action: "list", state: "all" })[0];
+		expect(streamingThread?.state).toBe("live");
+		if (streamingThread?.state !== "live") throw new Error("expected live streaming thread");
+		expect(streamingThread.lastPartialText).toContain("partial-");
+
+		emitRpcEvent(child, {
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "final durable answer" }],
+			},
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(snapshots.at(-1)).toEqual(
+			expect.objectContaining({
+				state: "live",
+				lastAssistantText: "final durable answer",
+			}),
+		);
+
+		streaming = false;
+		emitRpcEvent(child, { type: "agent_end" });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		// Durable transitions only: message_end + agent_end (phase/turn_completed).
+		expect(snapshots.length).toBeLessThanOrEqual(4);
+		expect(snapshots.length).toBeGreaterThanOrEqual(2);
+		expect(snapshots.at(-1)).toEqual(
+			expect.objectContaining({
+				state: "live",
+				phase: "idle",
+				lastAssistantText: "final durable answer",
+			}),
+		);
+
+		// Restore still works from the durable snapshot.
+		const latest = snapshots.at(-1);
+		if (latest === undefined) throw new Error("expected a durable snapshot");
+		const restoredManager = new ThreadManager(managerEnvironment());
+		restoredManager.hydrateFromSession({
+			sessionManager: { getBranch: () => [registryEntry(latest)] },
+		} as unknown as ExtensionContext);
+		expect(restoredManager.list({ action: "list", visibility: "all" })[0]).toEqual(
+			expect.objectContaining({
+				state: "closed",
+				lastAssistantText: "final durable answer",
+				exit: expect.objectContaining({ kind: "stale" }),
+			}),
+		);
+	});
+
 	it("truncates oversized assistant output in persisted registry snapshots only", async () => {
 		const manager = new ThreadManager(managerEnvironment());
 		const snapshots: ThreadSnapshot[] = [];
@@ -797,6 +941,58 @@ describe("ThreadManager session metadata", () => {
 		expect(manager.list({ action: "list", state: "all" })[0]?.lastAssistantText).toBe(longText);
 	});
 
+	it("caps oversized message_end assistant text retained in memory", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+		const child = mockResponsiveChild("session-alpha");
+
+		await manager.start({ action: "start", prompt: "work", taskName: "alpha" }, context());
+
+		const longText = "x".repeat(120_000);
+		emitRpcEvent(child, {
+			type: "message_end",
+			message: { role: "assistant", content: [{ type: "text", text: longText }] },
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		const inMemory = manager.list({ action: "list", state: "all" })[0];
+		expect(inMemory?.lastAssistantText).not.toBeNull();
+		expect(inMemory?.lastAssistantText?.length).toBeLessThan(longText.length);
+		expect(inMemory?.lastAssistantText).toContain("[truncated");
+		expect(inMemory?.lastAssistantText).toContain("chars for memory retention");
+		expect(inMemory?.lastAssistantText?.startsWith("x".repeat(100_000))).toBe(true);
+
+		const full = toThreadRuntimeSnapshot(inMemory!, { detail: "full" });
+		expect(full.lastAssistantText).toBe(inMemory?.lastAssistantText);
+		expect(full.lastAssistantText?.length).toBeLessThan(longText.length);
+	});
+
+	it("caps oversized message_update partial text retained in memory", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+		const child = mockResponsiveChild("session-alpha");
+
+		await manager.start({ action: "start", prompt: "work", taskName: "alpha" }, context());
+
+		const longText = "p".repeat(110_000);
+		emitRpcEvent(child, {
+			type: "message_update",
+			message: { role: "assistant", content: [{ type: "text", text: longText }] },
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		const inMemory = manager.list({ action: "list", state: "all" })[0];
+		expect(inMemory?.state).toBe("live");
+		if (inMemory?.state !== "live") throw new Error("expected live thread");
+		expect(inMemory.lastPartialText).not.toBeNull();
+		expect(inMemory.lastPartialText?.length).toBeLessThan(longText.length);
+		expect(inMemory.lastPartialText).toContain("[truncated");
+		expect(inMemory.lastPartialText).toContain("chars for memory retention");
+		expect(inMemory.lastPartialText?.startsWith("p".repeat(100_000))).toBe(true);
+
+		const full = toThreadRuntimeSnapshot(inMemory, { detail: "full" });
+		expect(full.lastPartialText).toBe(inMemory.lastPartialText);
+		expect(full.lastPartialText?.length).toBeLessThan(longText.length);
+	});
+
 	it("forgets closed threads on clearThreads so a later session starts clean", async () => {
 		const manager = new ThreadManager(managerEnvironment());
 		const child = mockResponsiveChild("session-alpha");
@@ -809,6 +1005,118 @@ describe("ThreadManager session metadata", () => {
 		manager.clearThreads();
 
 		expect(manager.list({ action: "list", state: "all", visibility: "all" })).toHaveLength(0);
+	});
+
+	it("clears persistence degradation bookkeeping for closed threads dropped by clearThreads", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+		const degraded: string[] = [];
+		manager.setPersistence({
+			appendSnapshot: () => {
+				throw new Error("registry offline");
+			},
+			onPersistenceFailure: (message) => {
+				degraded.push(message);
+			},
+		});
+
+		const firstChild = mockResponsiveChild("session-alpha");
+		await manager.start({ action: "start", prompt: "alpha", taskName: "alpha" }, context());
+		expect(degraded).toHaveLength(1);
+
+		firstChild.emit("close", 0, null);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		manager.clearThreads();
+
+		mockResponsiveChild("session-beta");
+		await manager.start({ action: "start", prompt: "beta", taskName: "beta" }, context());
+
+		expect(degraded).toHaveLength(2);
+		expect(degraded[1]).toContain("registry offline");
+	});
+
+	it("keeps lifecycle running when registry persistence throws and records thread_error", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+		const degraded: string[] = [];
+		manager.setPersistence({
+			appendSnapshot: () => {
+				throw new Error("disk full");
+			},
+			onPersistenceFailure: (message) => {
+				degraded.push(message);
+			},
+		});
+		const child = mockResponsiveChild("session-alpha");
+
+		const outcome = await manager.start(
+			{ action: "start", prompt: "work", taskName: "alpha" },
+			context(),
+		);
+		expect(outcome.thread.state).toBe("live");
+		expect(outcome.thread.recentEvents).toContainEqual(
+			expect.objectContaining({
+				type: "thread_error",
+				message: expect.stringContaining("disk full"),
+			}),
+		);
+		expect(degraded).toHaveLength(1);
+		expect(degraded[0]).toContain("degraded");
+		expect(degraded[0]).toContain("disk full");
+
+		// Further persistence failures must not re-notify or break stop/close.
+		emitRpcEvent(child, {
+			type: "message_end",
+			message: { role: "assistant", content: [{ type: "text", text: "still running" }] },
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(degraded).toHaveLength(1);
+
+		const stopped = await manager.stop({ action: "stop", id: outcome.thread.id });
+		expect(stopped.thread.state).toBe("closed");
+		const persistenceErrors = stopped.thread.recentEvents.filter(
+			(event) =>
+				event.type === "thread_error" && event.message.includes("Registry persistence failed"),
+		);
+		expect(persistenceErrors).toHaveLength(1);
+	});
+
+	it("allows a new degraded notify after persistence recovers then fails again", async () => {
+		const manager = new ThreadManager(managerEnvironment());
+		let failMessage: string | null = "first outage";
+		const degraded: string[] = [];
+		manager.setPersistence({
+			appendSnapshot: () => {
+				if (failMessage !== null) throw new Error(failMessage);
+			},
+			onPersistenceFailure: (message) => {
+				degraded.push(message);
+			},
+		});
+		const child = mockResponsiveChild("session-alpha");
+
+		const outcome = await manager.start(
+			{ action: "start", prompt: "work", taskName: "alpha" },
+			context(),
+		);
+		expect(degraded).toHaveLength(1);
+		expect(degraded[0]).toContain("first outage");
+
+		failMessage = null;
+		emitRpcEvent(child, {
+			type: "message_end",
+			message: { role: "assistant", content: [{ type: "text", text: "recovered" }] },
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		failMessage = "second outage";
+		emitRpcEvent(child, {
+			type: "message_end",
+			message: { role: "assistant", content: [{ type: "text", text: "outage again" }] },
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		expect(degraded).toHaveLength(2);
+		expect(degraded[1]).toContain("second outage");
+		expect(manager.list({ action: "list", state: "all" })[0]?.id).toBe(outcome.thread.id);
 	});
 
 	it("keeps background persistence bound to the thread owner's session after switches", async () => {
@@ -1051,6 +1359,203 @@ describe("ThreadManager session metadata", () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+
+	it("skips registry parsing on second hydrate when branch identity is unchanged", () => {
+		const closedSnapshot: ThreadSnapshot = {
+			state: "closed",
+			id: asThreadId("thread_abcdef012345"),
+			name: "alpha",
+			taskName: "alpha",
+			path: asThreadPath("/root/alpha"),
+			parentPath: asThreadPath("/root"),
+			parentThreadId: null,
+			depth: 1,
+			archived: false,
+			cwd: process.cwd(),
+			args: [],
+			createdAt: "2026-01-01T00:00:00.000Z",
+			lastEventAt: "2026-01-01T00:00:00.000Z",
+			exit: { kind: "exited", code: 0, signal: null },
+			session: { kind: "unknown" },
+			lastAssistantText: null,
+			recentEvents: [],
+			stderrTail: "",
+		};
+		let registryDataReads = 0;
+		const rawEntry = registryEntry(closedSnapshot, { sessionId: "session-a" }) as Record<
+			string,
+			unknown
+		>;
+		const trackedEntry = new Proxy(rawEntry, {
+			get(target, property, receiver) {
+				if (property === "data" || property === "customType") registryDataReads += 1;
+				return Reflect.get(target, property, receiver);
+			},
+		});
+		const entries = [trackedEntry];
+		const sessionManager = {
+			getEntries: () => entries,
+			getBranch: () => {
+				throw new Error("hydrate should prefer getEntries");
+			},
+			getLeafId: () => "leaf-1",
+			getSessionId: () => "session-a",
+			getSessionFile: () => "/tmp/session-a.jsonl",
+			getHeader: () => ({ type: "session", timestamp: "2026-01-01T00:00:00.000Z" }),
+		};
+		const manager = new ThreadManager(managerEnvironment());
+
+		manager.hydrateFromSession({ sessionManager } as unknown as ExtensionContext);
+		expect(manager.list({ action: "list", visibility: "all" })).toHaveLength(1);
+		const readsAfterFirst = registryDataReads;
+		expect(readsAfterFirst).toBeGreaterThan(0);
+
+		const onChange = vi.fn();
+		manager.onChange(onChange);
+		manager.hydrateFromSession({ sessionManager } as unknown as ExtensionContext);
+
+		expect(registryDataReads).toBe(readsAfterFirst);
+		expect(onChange).not.toHaveBeenCalled();
+		expect(manager.list({ action: "list", visibility: "all" })).toHaveLength(1);
+	});
+
+	it("invalidates hydration cache when closed threads are cleared", () => {
+		const closedSnapshot: ThreadSnapshot = {
+			state: "closed",
+			id: asThreadId("thread_abcdef012345"),
+			name: "alpha",
+			taskName: "alpha",
+			path: asThreadPath("/root/alpha"),
+			parentPath: asThreadPath("/root"),
+			parentThreadId: null,
+			depth: 1,
+			archived: false,
+			cwd: process.cwd(),
+			args: [],
+			createdAt: "2026-01-01T00:00:00.000Z",
+			lastEventAt: "2026-01-01T00:00:00.000Z",
+			exit: { kind: "exited", code: 0, signal: null },
+			session: { kind: "unknown" },
+			lastAssistantText: null,
+			recentEvents: [],
+			stderrTail: "",
+		};
+		const entries = [registryEntry(closedSnapshot, { sessionId: "session-a" })];
+		const sessionManager = {
+			getEntries: () => entries,
+			getLeafId: () => "leaf-1",
+			getSessionId: () => "session-a",
+			getSessionFile: () => "/tmp/session-a.jsonl",
+			getHeader: () => ({ type: "session", timestamp: "2026-01-01T00:00:00.000Z" }),
+		};
+		const manager = new ThreadManager(managerEnvironment());
+
+		manager.hydrateFromSession({ sessionManager } as unknown as ExtensionContext);
+		expect(manager.list({ action: "list", visibility: "all" })).toHaveLength(1);
+
+		manager.clearThreads();
+		expect(manager.list({ action: "list", visibility: "all" })).toHaveLength(0);
+		manager.hydrateFromSession({ sessionManager } as unknown as ExtensionContext);
+
+		expect(manager.list({ action: "list", visibility: "all" }).map((t) => t.taskName)).toEqual([
+			"alpha",
+		]);
+	});
+
+	it("invalidates hydration cache when a new registry entry appears", () => {
+		const alpha: ThreadSnapshot = {
+			state: "closed",
+			id: asThreadId("thread_a1b2c3d4e5f6"),
+			name: "alpha",
+			taskName: "alpha",
+			path: asThreadPath("/root/alpha"),
+			parentPath: asThreadPath("/root"),
+			parentThreadId: null,
+			depth: 1,
+			archived: false,
+			cwd: process.cwd(),
+			args: [],
+			createdAt: "2026-01-01T00:00:00.000Z",
+			lastEventAt: "2026-01-01T00:00:00.000Z",
+			exit: { kind: "exited", code: 0, signal: null },
+			session: { kind: "unknown" },
+			lastAssistantText: null,
+			recentEvents: [],
+			stderrTail: "",
+		};
+		const beta: ThreadSnapshot = {
+			...alpha,
+			id: asThreadId("thread_b1b2c3d4e5f6"),
+			name: "beta",
+			taskName: "beta",
+			path: asThreadPath("/root/beta"),
+		};
+		let entries: unknown[] = [registryEntry(alpha, { sessionId: "session-a" })];
+		let leafId = "leaf-1";
+		const sessionManager = {
+			getEntries: () => entries,
+			getLeafId: () => leafId,
+			getSessionId: () => "session-a",
+			getSessionFile: () => "/tmp/session-a.jsonl",
+			getHeader: () => ({ type: "session", timestamp: "2026-01-01T00:00:00.000Z" }),
+		};
+		const manager = new ThreadManager(managerEnvironment());
+
+		manager.hydrateFromSession({ sessionManager } as unknown as ExtensionContext);
+		expect(manager.list({ action: "list", visibility: "all" }).map((t) => t.taskName)).toEqual([
+			"alpha",
+		]);
+
+		entries = [...entries, registryEntry(beta, { sessionId: "session-a" })];
+		leafId = "leaf-2";
+		manager.hydrateFromSession({ sessionManager } as unknown as ExtensionContext);
+
+		expect(
+			manager
+				.list({ action: "list", visibility: "all" })
+				.map((t) => t.taskName)
+				.toSorted(),
+		).toEqual(["alpha", "beta"]);
+	});
+
+	it("hydrates scoped registry entries from getEntries even when getBranch omits them", () => {
+		const snapshot: ThreadSnapshot = {
+			state: "closed",
+			id: asThreadId("thread_c1b2c3d4e5f6"),
+			name: "side",
+			taskName: "side",
+			path: asThreadPath("/root/side"),
+			parentPath: asThreadPath("/root"),
+			parentThreadId: null,
+			depth: 1,
+			archived: false,
+			cwd: process.cwd(),
+			args: [],
+			createdAt: "2026-01-01T00:00:00.000Z",
+			lastEventAt: "2026-01-01T00:00:00.000Z",
+			exit: { kind: "exited", code: 0, signal: null },
+			session: { kind: "unknown" },
+			lastAssistantText: null,
+			recentEvents: [],
+			stderrTail: "",
+		};
+		const manager = new ThreadManager(managerEnvironment());
+
+		manager.hydrateFromSession({
+			sessionManager: {
+				// Side-branch custom entry invisible to the leaf branch (H5 dual-writer).
+				getBranch: () => [],
+				getEntries: () => [registryEntry(snapshot, { sessionId: "session-a" })],
+				getLeafId: () => "leaf-main",
+				getSessionId: () => "session-a",
+				getHeader: () => ({ type: "session", timestamp: "2026-01-01T00:00:00.000Z" }),
+			},
+		} as unknown as ExtensionContext);
+
+		expect(manager.list({ action: "list", visibility: "all" })).toEqual([
+			expect.objectContaining({ id: snapshot.id, taskName: "side", state: "closed" }),
+		]);
 	});
 
 	it("does not hydrate registry snapshots copied from fork source sessions", () => {
@@ -2189,6 +2694,79 @@ describe("ThreadManager session metadata", () => {
 		}
 	});
 
+	it("does not idle-cleanup a child after a written send times out", async () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			const child = new FakeChildProcess();
+			let promptCount = 0;
+			let resolveSendPromptSeen!: () => void;
+			const sendPromptSeen = new Promise<void>((resolve) => {
+				resolveSendPromptSeen = resolve;
+			});
+			spawnMock.mockReturnValue(child);
+			attachRpc(child, (request) => {
+				if (request["type"] === "get_state") {
+					respond(child, request, {
+						sessionFile: "/tmp/session-idle-cleanup-timeout-send.jsonl",
+						sessionId: "session-idle-cleanup-timeout-send",
+						pendingMessageCount: 0,
+						isStreaming: false,
+						isCompacting: false,
+					});
+					return;
+				}
+
+				if (request["type"] === "prompt") {
+					promptCount++;
+					if (promptCount === 1) {
+						respond(child, request);
+						return;
+					}
+
+					resolveSendPromptSeen();
+					return;
+				}
+
+				if (request["type"] === "abort") respond(child, request);
+			});
+			const manager = new ThreadManager({
+				...managerEnvironment(),
+				PI_THREADS_IDLE_CLEANUP_MS: "1000",
+			});
+
+			await manager.start(
+				{
+					action: "start",
+					prompt: "idle cleanup timed-out send",
+					taskName: "idle_cleanup_timeout_send",
+				},
+				context(),
+			);
+			emitRpcEvent(child, { type: "agent_end" });
+
+			await vi.advanceTimersByTimeAsync(999);
+			const sent = manager.send({
+				action: "send",
+				id: "idle_cleanup_timeout_send",
+				mode: "prompt",
+				message: "queued",
+			});
+			await sendPromptSeen;
+
+			await vi.advanceTimersByTimeAsync(5000);
+			await expect(sent).resolves.toMatchObject({ accepted: null });
+
+			expect(child.kill).not.toHaveBeenCalled();
+			expect(manager.list({ action: "list", state: "live" })).toHaveLength(1);
+			expect(manager.list({ action: "list", state: "live" })[0]).toMatchObject({
+				phase: "busy",
+			});
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("does not extend idle cleanup when an idle child is polled", async () => {
 		vi.useFakeTimers();
 		try {
@@ -3067,7 +3645,9 @@ describe("ThreadManager session metadata", () => {
 			await vi.advanceTimersByTimeAsync(4_000);
 			const startOutcome = await startPromise;
 
-			expect(startOutcome.note).toMatch(/Timed out waiting for RPC response to prompt/u);
+			expect(startOutcome.note).toMatch(
+				/Timed out waiting for RPC response to initial prompt.*may still be processed.*poll or wait before retrying/u,
+			);
 			if (startOutcome.thread.state !== "live") return;
 			expect(startOutcome.thread.phase).toBe("starting");
 
@@ -3091,6 +3671,146 @@ describe("ThreadManager session metadata", () => {
 					streamingBehavior: "followUp",
 				}),
 			);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("returns unknown acceptance when send times out instead of throwing", async () => {
+		vi.useFakeTimers();
+		try {
+			const child = new FakeChildProcess();
+			const promptRequests: Record<string, unknown>[] = [];
+			spawnMock.mockReturnValue(child);
+			attachRpc(child, (request) => {
+				if (request["type"] === "get_state") {
+					respond(child, request, {
+						sessionFile: "/tmp/slow-send.jsonl",
+						sessionId: "session-slow-send",
+						pendingMessageCount: 0,
+						isStreaming: false,
+						isCompacting: false,
+					});
+					return;
+				}
+
+				if (request["type"] === "prompt") {
+					promptRequests.push(request);
+					// Accept only the initial start prompt; leave send unanswered.
+					if (promptRequests.length === 1) respond(child, request);
+				}
+			});
+
+			const manager = new ThreadManager({
+				PI_THREADS_DEPTH: "0",
+				PI_THREADS_MAX_DEPTH: "2",
+				PI_THREADS_MAX_THREADS: "8",
+				PI_THREADS_PATH: "/root",
+				PI_THREADS_ROOT_SESSION_ID: "test-root",
+			} as NodeJS.ProcessEnv);
+
+			await manager.start({ action: "start", prompt: "initial", taskName: "slow_send" }, context());
+			emitRpcEvent(child, { type: "agent_start" });
+			emitRpcEvent(child, { type: "agent_end" });
+			await vi.advanceTimersByTimeAsync(0);
+
+			const sendPromise = manager.send({
+				action: "send",
+				id: "slow_send",
+				message: "maybe delivered",
+				mode: "prompt",
+			});
+			await vi.advanceTimersByTimeAsync(0);
+			await vi.advanceTimersByTimeAsync(5_000);
+			const sendOutcome = await sendPromise;
+
+			expect(sendOutcome.accepted).toBeNull();
+			expect(sendOutcome.mode).toBe("prompt");
+			expect(sendOutcome.error).toMatch(
+				/Timed out waiting for RPC response to send prompt.*may still be processed.*poll or wait before retrying/u,
+			);
+			expect(promptRequests).toHaveLength(2);
+			expect(promptRequests[1]).toEqual(
+				expect.objectContaining({
+					type: "prompt",
+					message: "maybe delivered",
+				}),
+			);
+
+			// Late child activity still transitions the thread after acceptance timed out.
+			emitRpcEvent(child, { type: "agent_start" });
+			await vi.advanceTimersByTimeAsync(0);
+			const listed = manager.list({ action: "list", state: "live" });
+			const live = listed.find((thread) => thread.taskName === "slow_send");
+			if (live?.state !== "live") throw new Error("expected live slow_send thread");
+			expect(live.phase).toBe("busy");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("labels send steer and follow-up timeouts distinctly", async () => {
+		vi.useFakeTimers();
+		try {
+			const child = new FakeChildProcess();
+			let promptCount = 0;
+			spawnMock.mockReturnValue(child);
+			attachRpc(child, (request) => {
+				if (request["type"] === "get_state") {
+					respond(child, request, {
+						sessionFile: "/tmp/send-label-timeout.jsonl",
+						sessionId: "session-send-label-timeout",
+						pendingMessageCount: 0,
+						isStreaming: promptCount >= 1,
+						isCompacting: false,
+					});
+					return;
+				}
+
+				if (request["type"] === "prompt") {
+					promptCount++;
+					if (promptCount === 1) respond(child, request);
+				}
+			});
+
+			const manager = new ThreadManager({
+				PI_THREADS_DEPTH: "0",
+				PI_THREADS_MAX_DEPTH: "2",
+				PI_THREADS_MAX_THREADS: "8",
+				PI_THREADS_PATH: "/root",
+				PI_THREADS_ROOT_SESSION_ID: "test-root",
+			} as NodeJS.ProcessEnv);
+
+			await manager.start(
+				{ action: "start", prompt: "initial", taskName: "send_label_timeout" },
+				context(),
+			);
+			emitRpcEvent(child, { type: "agent_start" });
+			await vi.advanceTimersByTimeAsync(0);
+
+			const steerPromise = manager.send({
+				action: "send",
+				id: "send_label_timeout",
+				message: "steer me",
+				mode: "steer",
+			});
+			await vi.advanceTimersByTimeAsync(0);
+			await vi.advanceTimersByTimeAsync(5_000);
+			const steerOutcome = await steerPromise;
+			expect(steerOutcome.accepted).toBeNull();
+			expect(steerOutcome.error).toMatch(/send steer/u);
+
+			const followUpPromise = manager.send({
+				action: "send",
+				id: "send_label_timeout",
+				message: "follow later",
+				mode: "follow_up",
+			});
+			await vi.advanceTimersByTimeAsync(0);
+			await vi.advanceTimersByTimeAsync(5_000);
+			const followUpOutcome = await followUpPromise;
+			expect(followUpOutcome.accepted).toBeNull();
+			expect(followUpOutcome.error).toMatch(/send follow-up/u);
 		} finally {
 			vi.useRealTimers();
 		}

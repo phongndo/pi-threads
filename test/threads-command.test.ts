@@ -208,6 +208,76 @@ describe("/threads command", () => {
 		expect(list).toHaveBeenCalledWith({ action: "list", state: "all", visibility: "all" });
 		expect(custom).toHaveBeenCalledWith(expect.any(Function));
 	});
+
+	it("prints formatList output in non-interactive mode", async () => {
+		let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
+		const list = vi.fn(() => [thread()]);
+		const notify = vi.fn();
+		const pi = {
+			registerCommand: (name: string, options: Parameters<ExtensionAPI["registerCommand"]>[1]) => {
+				if (name === "threads") handler = options.handler;
+			},
+		} as unknown as ExtensionAPI;
+
+		registerThreadsCommand(pi, { list } as unknown as ThreadManager);
+		if (handler === undefined) throw new Error("/threads command was not registered");
+
+		await handler("", {
+			mode: "print",
+			hasUI: false,
+			ui: { notify },
+		} as unknown as ExtensionCommandContext);
+
+		expect(list).toHaveBeenCalledWith({ action: "list", state: "all", visibility: "active" });
+		expect(notify).toHaveBeenCalledWith(expect.stringContaining("/root/alpha"), "info");
+		expect(notify).toHaveBeenCalledWith(
+			expect.stringContaining("[id: thread_012345abcdef]"),
+			"info",
+		);
+		expect(notify).not.toHaveBeenCalledWith(expect.stringMatching(/^Found \d+ thread/u), "info");
+	});
+
+	it("includes archived threads in RPC command-mode selection", async () => {
+		let handler: ((args: string, ctx: ExtensionCommandContext) => Promise<void>) | undefined;
+		const archived = closedThread({
+			id: asThreadId("thread_111111111111"),
+			name: "beta",
+			taskName: "beta",
+			path: asThreadPath("/root/beta"),
+			archived: true,
+		});
+		const list = vi.fn(() => [thread(), archived]);
+		const poll = vi.fn().mockResolvedValue(archived);
+		const select = vi.fn().mockResolvedValue(undefined);
+		const pi = {
+			registerCommand: (name: string, options: Parameters<ExtensionAPI["registerCommand"]>[1]) => {
+				if (name === "threads") handler = options.handler;
+			},
+		} as unknown as ExtensionAPI;
+
+		registerThreadsCommand(pi, { list, poll } as unknown as ThreadManager);
+		if (handler === undefined) throw new Error("/threads command was not registered");
+
+		await handler("", {
+			mode: "rpc",
+			hasUI: true,
+			ui: {
+				select,
+				notify: vi.fn(),
+				theme,
+			},
+		} as unknown as ExtensionCommandContext);
+
+		expect(list).toHaveBeenCalledWith({ action: "list", state: "all", visibility: "all" });
+		expect(select).toHaveBeenCalledWith(
+			"Select a thread to inspect:",
+			expect.arrayContaining([
+				expect.stringContaining("/root/alpha"),
+				expect.stringContaining("archived"),
+				expect.stringContaining("/root/beta"),
+			]),
+		);
+	});
 });
 
 describe("ThreadsTreeComponent input", () => {
@@ -221,14 +291,44 @@ describe("ThreadsTreeComponent input", () => {
 		expect(tree.render(120).join("\n")).toContain("Type to search: s");
 	});
 
-	it("uses a non-printable modified key for stopping the selected row", async () => {
-		const stop = vi.fn().mockResolvedValue({ kind: "stopped", thread: thread() });
-		const tree = component({ stop, list: () => [thread()] }, [thread()]);
+	it("requires a second ctrl+x to confirm stopping the selected live row", async () => {
+		const stop = vi.fn().mockResolvedValue({
+			kind: "stopped",
+			alreadyClosed: false,
+			thread: thread(),
+		});
+		const notify = vi.fn();
+		const tree = component({ stop, list: () => [thread()] }, [thread()], {
+			ui: { notify },
+		} as unknown as ExtensionCommandContext);
 
 		tree.handleInput("\x18");
 		await Promise.resolve();
+		expect(stop).not.toHaveBeenCalled();
+		expect(notify).toHaveBeenCalledWith(
+			expect.stringContaining("Press ctrl+x again to stop"),
+			"warning",
+		);
 
+		tree.handleInput("\x18");
+		await Promise.resolve();
 		expect(stop).toHaveBeenCalledWith({ action: "stop", id: "/root/alpha", force: false });
+	});
+
+	it("cancels a pending stop confirmation with esc", async () => {
+		const stop = vi.fn();
+		const notify = vi.fn();
+		const tree = component({ stop, list: () => [thread()] }, [thread()], {
+			ui: { notify },
+		} as unknown as ExtensionCommandContext);
+
+		tree.handleInput("\x18");
+		await Promise.resolve();
+		tree.handleInput("\x1b");
+		await Promise.resolve();
+
+		expect(stop).not.toHaveBeenCalled();
+		expect(notify).toHaveBeenCalledWith("Stop cancelled.", "info");
 	});
 
 	it("does not enter or switch sessions from the browser", () => {
@@ -326,6 +426,7 @@ describe("ThreadsTreeComponent input", () => {
 		const notify = vi.fn();
 		let resolveStop!: (outcome: {
 			readonly kind: "stopped";
+			readonly alreadyClosed: boolean;
 			readonly thread: ThreadSnapshot;
 			readonly snapshot: ReturnType<typeof toThreadRuntimeSnapshot>;
 		}) => void;
@@ -333,6 +434,7 @@ describe("ThreadsTreeComponent input", () => {
 			() =>
 				new Promise<{
 					readonly kind: "stopped";
+					readonly alreadyClosed: boolean;
 					readonly thread: ThreadSnapshot;
 					readonly snapshot: ReturnType<typeof toThreadRuntimeSnapshot>;
 				}>((resolve) => {
@@ -362,6 +464,7 @@ describe("ThreadsTreeComponent input", () => {
 		const stoppedThread = thread();
 		resolveStop({
 			kind: "stopped",
+			alreadyClosed: false,
 			thread: stoppedThread,
 			snapshot: toThreadRuntimeSnapshot(stoppedThread),
 		});

@@ -1,6 +1,5 @@
 import * as fs from "node:fs";
 import {
-	SessionManager,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type SessionShutdownEvent,
@@ -28,6 +27,7 @@ import {
 	formatWaitProgress,
 	formatWait,
 } from "./format.ts";
+import { appendCustomEntryToSessionFile } from "./pi-session-adapter.ts";
 import { assertPiThreadParams, PiThreadParamsSchema } from "./schema.ts";
 import { registerThreadsCommand } from "./threads-command.ts";
 import {
@@ -187,20 +187,26 @@ function scopeForThread(thread: ThreadSnapshot): ThreadManagerScope {
 }
 
 export function syncThreadManagerScope(ctx: ExtensionContext, manager: ThreadManager): void {
-	// The manager lives on globalThis, so after an in-place extension upgrade this
-	// can be an instance built by an older module version; feature-check methods
-	// that newer versions added before calling them.
-	if (typeof manager.hydrateFromSession === "function") manager.hydrateFromSession(ctx);
+	// Resolve the target scope before hydration. The manager is captured by extension
+	// closures and can retain a child path after clearThreads/session switch; hydrating
+	// first would filter the registry against the stale path and miss root siblings on
+	// the first list/sync after returning to root.
 	const sessionFile = ctx.sessionManager.getSessionFile();
 	if (sessionFile !== undefined) {
 		const managedThread = manager.findBySessionFile(sessionFile);
 		if (managedThread !== undefined) {
 			manager.rebindScope(scopeForThread(managedThread));
-			return;
+		} else {
+			manager.resetScope();
 		}
+	} else {
+		manager.resetScope();
 	}
 
-	manager.resetScope();
+	// The manager lives on globalThis, so after an in-place extension upgrade this
+	// can be an instance built by an older module version; feature-check methods
+	// that newer versions added before calling them.
+	if (typeof manager.hydrateFromSession === "function") manager.hydrateFromSession(ctx);
 }
 
 export function getThreadsSessionShutdownAction(
@@ -279,7 +285,9 @@ function appendThreadRegistrySnapshot(
 	}
 
 	if (target.sessionFile === null || !fs.existsSync(target.sessionFile)) return;
-	SessionManager.open(target.sessionFile, target.sessionDir ?? undefined).appendCustomEntry(
+	appendCustomEntryToSessionFile(
+		target.sessionFile,
+		target.sessionDir,
 		PI_THREAD_REGISTRY_ENTRY_TYPE,
 		data,
 	);
@@ -287,18 +295,37 @@ function appendThreadRegistrySnapshot(
 
 export default function (pi: ExtensionAPI) {
 	const manager = getProcessManager();
+	// Latest UI notify from a tool/command context, if any — used for degraded persistence.
+	let notifyPersistenceDegraded: ((message: string) => void) | null = null;
+	const bindUiNotify = (ctx: ExtensionContext): void => {
+		if (typeof ctx.ui?.notify !== "function") return;
+		notifyPersistenceDegraded = (message) => {
+			try {
+				ctx.ui.notify(message, "warning");
+			} catch {
+				// UI notify is best-effort.
+			}
+		};
+	};
 	if (typeof manager.setPersistence === "function") {
 		manager.setPersistence({
 			appendSnapshot: (snapshot, scope, target) =>
 				appendThreadRegistrySnapshot(pi, snapshot, scope, target),
+			onPersistenceFailure: (message) => {
+				notifyPersistenceDegraded?.(message);
+			},
 		});
 	}
 
 	registerThreadsCommand(pi, manager, {
-		beforeUse: (ctx) => syncThreadManagerScope(ctx, manager),
+		beforeUse: (ctx) => {
+			bindUiNotify(ctx);
+			syncThreadManagerScope(ctx, manager);
+		},
 	});
 
 	pi.on("session_start", (_event, ctx) => {
+		bindUiNotify(ctx);
 		syncThreadManagerScope(ctx, manager);
 	});
 
@@ -319,6 +346,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: PiThreadParamsSchema,
 
 		async execute(_toolCallId, rawParams, signal, onUpdate, ctx) {
+			bindUiNotify(ctx);
 			syncThreadManagerScope(ctx, manager);
 			throwIfAborted(signal);
 			assertPiThreadParams(rawParams);

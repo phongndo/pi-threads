@@ -3,9 +3,18 @@ import { Value } from "typebox/value";
 import { describe, expect, it } from "vitest";
 import { ROOT_THREAD_PATH, asThreadId, asThreadPath, joinThreadPath } from "../src/domain.ts";
 import {
+	ArchiveCommandSchema,
 	assertPiThreadParams,
+	ForkCommandSchema,
+	ListCommandSchema,
 	PiThreadParamsSchema,
+	PollCommandSchema,
+	ResumeCommandSchema,
+	SendCommandSchema,
+	StartCommandSchema,
+	StopCommandSchema,
 	StrictPiThreadParamsSchema,
+	WaitCommandSchema,
 	type PiThreadParams,
 } from "../src/schema.ts";
 import { assertAllowedExtraArgs, buildPiArgs, collectInheritedPiArgs } from "../src/arg-policy.ts";
@@ -101,7 +110,43 @@ describe("thread schemas", () => {
 			/detail must be one of "summary", "tail", or "full"/u,
 		);
 	});
+
+	it("keeps loose and strict schema field sets aligned", () => {
+		const looseFields = schemaFieldNames(PiThreadParamsSchema);
+		const strictFields = new Set<string>();
+		for (const schema of [
+			StartCommandSchema,
+			ListCommandSchema,
+			PollCommandSchema,
+			SendCommandSchema,
+			StopCommandSchema,
+			WaitCommandSchema,
+			ResumeCommandSchema,
+			ForkCommandSchema,
+			ArchiveCommandSchema,
+		] as const) {
+			for (const field of schemaFieldNames(schema)) strictFields.add(field);
+		}
+
+		expect([...looseFields].toSorted()).toEqual([...strictFields].toSorted());
+	});
 });
+
+function schemaFieldNames(schema: unknown): Set<string> {
+	const record = schema as {
+		readonly properties?: Record<string, unknown>;
+		readonly anyOf?: readonly unknown[];
+	};
+	if (record.properties !== undefined) return new Set(Object.keys(record.properties));
+	if (Array.isArray(record.anyOf)) {
+		const fields = new Set<string>();
+		for (const branch of record.anyOf) {
+			for (const field of schemaFieldNames(branch)) fields.add(field);
+		}
+		return fields;
+	}
+	return new Set();
+}
 
 describe("ThreadId", () => {
 	it("brands valid ids and rejects invalid ids", () => {

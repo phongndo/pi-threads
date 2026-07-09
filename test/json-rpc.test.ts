@@ -1,9 +1,9 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter, once } from "node:events";
 import { PassThrough } from "node:stream";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { attachJsonlReader } from "../src/json.ts";
-import { RpcClient, type RpcClientEvent } from "../src/rpc.ts";
+import { RpcClient, RpcTimeoutError, type RpcClientEvent } from "../src/rpc.ts";
 
 describe("attachJsonlReader", () => {
 	it("handles partial chunks", async () => {
@@ -147,6 +147,48 @@ describe("RpcClient", () => {
 		expect(() => client.requestWithHandle({ type: "get_state" }, 1_000)).toThrow(
 			/RPC process is closed/u,
 		);
+	});
+
+	it("rejects timed-out requests with operation labels and may-still-process guidance", async () => {
+		vi.useFakeTimers();
+		try {
+			const fake = createRpcProcess();
+			const client = new RpcClient(fake.process, () => undefined);
+
+			const responsePromise = client.request({ type: "prompt", message: "hi" }, 50, "send steer");
+			const rejection = expect(responsePromise).rejects.toSatisfy((error: unknown) => {
+				expect(error).toBeInstanceOf(RpcTimeoutError);
+				if (!(error instanceof RpcTimeoutError)) return false;
+				expect(error.operationLabel).toBe("send steer");
+				expect(error.message).toMatch(/send steer/u);
+				expect(error.message).toMatch(/was written and may still be processed/u);
+				expect(error.message).toMatch(/poll or wait before retrying/u);
+				return true;
+			});
+
+			await vi.advanceTimersByTimeAsync(50);
+			await rejection;
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("defaults timeout labels to the command type", async () => {
+		vi.useFakeTimers();
+		try {
+			const fake = createRpcProcess();
+			const client = new RpcClient(fake.process, () => undefined);
+
+			const responsePromise = client.request({ type: "get_state" }, 25);
+			const rejection = expect(responsePromise).rejects.toThrow(
+				/Timed out waiting for RPC response to get_state.*may still be processed/u,
+			);
+
+			await vi.advanceTimersByTimeAsync(25);
+			await rejection;
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
 

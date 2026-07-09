@@ -191,14 +191,15 @@ Use `{ "archived": false }` to unarchive.
 
 `poll` and `wait` accept `detail`:
 
-| Detail    | Result summary                         | Events              | Output fields                                                          |
-| --------- | -------------------------------------- | ------------------- | ---------------------------------------------------------------------- |
-| `summary` | Compact result up to about 700 chars   | last 5 events       | no output/stderr tails                                                 |
-| `tail`    | Compact result up to about 1200 chars  | last 12 events      | assistant and stderr tails up to about 4000 chars                      |
-| `full`    | Full compact retained assistant result | all retained events | full retained `lastAssistantText`, live `lastPartialText`, full stderr |
+| Detail    | Result summary                         | Events              | Output fields                                                             |
+| --------- | -------------------------------------- | ------------------- | ------------------------------------------------------------------------- |
+| `summary` | Compact result up to about 700 chars   | last 5 events       | no output/stderr tails                                                    |
+| `tail`    | Compact result up to about 1200 chars  | last 12 events      | assistant and stderr tails up to about 4000 chars                         |
+| `full`    | Full compact retained assistant result | all retained events | bounded retained `lastAssistantText`, live `lastPartialText`, full stderr |
 
 `full` is still the retained latest assistant output, not a complete transcript
-dump.
+dump; very large assistant outputs are capped in memory with an explicit
+truncation marker.
 
 ## Structured results
 
@@ -222,8 +223,9 @@ Single-thread actions (`start`, `poll`, `send`, `stop`, `wait`, `resume`,
 Action-specific detail fields are:
 
 - `start`: `promptAccepted`, `note`;
-- `send`: `mode`, `accepted`, `error`;
+- `send`: `mode`, `accepted`, `error` (`accepted` is `true`, `false`, or `null` when delivery acceptance is unknown after an RPC timeout; poll/wait before retrying);
 - `wait`: `timedOut`, `waitedMs`;
+- `stop`: `alreadyClosed`;
 - `resume`: `alreadyLive`;
 - `fork`: `sourceSessionFile`, `sourceEntryId`;
 - `archive`: `archived`.

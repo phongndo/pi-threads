@@ -52,3 +52,29 @@ jobs:
 
       - name: Pack npm tarball
         run: pnpm pack --dry-run
+
+  windows-tests:
+    name: Windows TypeCheck & Test
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check (tsc)
+        run: pnpm typecheck
+
+      - name: Run tests (vitest)
+        run: pnpm test

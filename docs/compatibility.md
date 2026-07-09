@@ -6,12 +6,12 @@ release.
 
 ## Supported toolchain
 
-| Component       | Supported range / version | CI and release baseline | Notes                                                                                  |
-| --------------- | ------------------------- | ----------------------- | -------------------------------------------------------------------------------------- |
-| Node.js         | `>=22.19.0`               | `22.19`                 | Matches `engines.node` and the GitHub Actions `NODE_VERSION`.                          |
-| pnpm            | `11.9.0`                  | `11.9.0`                | Matches `packageManager` and the GitHub Actions `PNPM_VERSION`.                        |
-| Pi CLI/packages | `>=0.80.3 <1.0.0`         | `0.80.3` line           | Validated against the `@earendil-works/pi-*` dev dependencies used by this repository. |
-| OS              | Linux and macOS           | Ubuntu latest           | CI runs on Linux. macOS is expected to work where the same Node and Pi versions run.   |
+| Component       | Supported range / version | CI and release baseline                    | Notes                                                                                                                                         |
+| --------------- | ------------------------- | ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Node.js         | `>=22.19.0`               | `22.19`                                    | Matches `engines.node` and the GitHub Actions `NODE_VERSION`.                                                                                 |
+| pnpm            | `11.9.0`                  | `11.9.0`                                   | Matches `packageManager` and the GitHub Actions `PNPM_VERSION`.                                                                               |
+| Pi CLI/packages | `>=0.80.3 <1.0.0`         | `0.80.3` line                              | Validated against the `@earendil-works/pi-*` dev dependencies used by this repository.                                                        |
+| OS              | Linux, macOS, Windows     | Ubuntu latest + Windows latest unit checks | Linux is the primary release baseline; Windows runs typecheck/tests in CI; macOS is expected to work where the same Node and Pi versions run. |
 
 ## Pi package policy
 

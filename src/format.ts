@@ -117,10 +117,11 @@ export function formatPoll(
 }
 
 export function formatSend(outcome: SendOutcome): string {
+	const acceptedLabel = outcome.accepted === null ? "unknown" : outcome.accepted ? "yes" : "no";
 	const lines = [
 		`Sent message to "${formatThreadTitle(outcome.thread)}" with mode ${outcome.mode}.`,
 		`Path: ${outcome.thread.path}`,
-		`Accepted: ${outcome.accepted ? "yes" : "no"}`,
+		`Accepted: ${acceptedLabel}`,
 		`Status: ${formatStatus(outcome.thread)}`,
 	];
 	if (outcome.error !== null) lines.push(`Error: ${outcome.error}`);
@@ -128,7 +129,8 @@ export function formatSend(outcome: SendOutcome): string {
 }
 
 export function formatStop(outcome: StopOutcome): string {
-	return `Stopped "${formatThreadTitle(outcome.thread)}".\nPath: ${outcome.thread.path}\nStatus: ${formatStatus(outcome.thread)}`;
+	const verb = outcome.alreadyClosed ? "Already closed" : "Stopped";
+	return `${verb} "${formatThreadTitle(outcome.thread)}".\nPath: ${outcome.thread.path}\nStatus: ${formatStatus(outcome.thread)}`;
 }
 
 export function formatWait(

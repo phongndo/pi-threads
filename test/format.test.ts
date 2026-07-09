@@ -10,6 +10,8 @@ import {
 } from "../src/domain.ts";
 import {
 	formatPoll,
+	formatSend,
+	formatStop,
 	formatThreadStateText,
 	formatThreadTitle,
 	formatWait,
@@ -178,6 +180,39 @@ describe("thread display formatting", () => {
 		expect(idleOutput).toContain("Next: send prompt, poll, or stop");
 		expect(closedOutput).toContain("Running: no");
 		expect(closedOutput).toContain("Next: archive, or list");
+	});
+
+	it("renders unknown send acceptance and timeout guidance", () => {
+		const output = formatSend({
+			kind: "sent",
+			mode: "prompt",
+			accepted: null,
+			error:
+				"Timed out waiting for RPC response to send prompt. The request was written and may still be processed; poll or wait before retrying.",
+			...snapshotPair(liveThread({ phase: "busy" })),
+		});
+
+		expect(output).toContain("Accepted: unknown");
+		expect(output).toContain("send prompt");
+		expect(output).toContain("may still be processed");
+		expect(output).toContain("poll or wait before retrying");
+	});
+
+	it("reports already closed vs newly stopped threads", () => {
+		const closed = formatStop({
+			kind: "stopped",
+			alreadyClosed: true,
+			...snapshotPair(closedThread()),
+		});
+		const stopped = formatStop({
+			kind: "stopped",
+			alreadyClosed: false,
+			...snapshotPair(closedThread({ exit: { kind: "stopped", code: null, signal: "SIGTERM" } })),
+		});
+
+		expect(closed).toContain('Already closed "inspect repo"');
+		expect(stopped).toContain('Stopped "inspect repo"');
+		expect(stopped).toContain("closed/stopped");
 	});
 });
 

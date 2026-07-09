@@ -34,6 +34,8 @@ export type ThreadRegistryPersistence = {
 		scope: ThreadRegistryEntryScope | null,
 		target: ThreadRegistryPersistenceTarget | null,
 	) => void;
+	/** Optional one-shot/throttled user-visible degraded signal (e.g. ctx.ui.notify). */
+	readonly onPersistenceFailure?: (message: string) => void;
 };
 
 export type ThreadRegistryRestoreScope = {

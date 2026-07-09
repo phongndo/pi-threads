@@ -39,6 +39,18 @@ export type RpcRequestHandle = {
 	readonly response: Promise<RpcResponse>;
 };
 
+export class RpcTimeoutError extends Error {
+	readonly operationLabel: string;
+
+	constructor(operationLabel: string) {
+		super(
+			`Timed out waiting for RPC response to ${operationLabel}. The request was written and may still be processed; poll or wait before retrying.`,
+		);
+		this.name = "RpcTimeoutError";
+		this.operationLabel = operationLabel;
+	}
+}
+
 export class RpcClient {
 	readonly #child: ChildProcessWithoutNullStreams;
 	readonly #pending = new Map<string, PendingResponse>();
@@ -80,13 +92,15 @@ export class RpcClient {
 	async request(
 		command: Exclude<RpcCommand, { readonly type: "extension_ui_response" }>,
 		timeoutMs: number,
+		operationLabel: string = command.type,
 	): Promise<RpcResponse> {
-		return this.requestWithHandle(command, timeoutMs).response;
+		return this.requestWithHandle(command, timeoutMs, operationLabel).response;
 	}
 
 	requestWithHandle(
 		command: Exclude<RpcCommand, { readonly type: "extension_ui_response" }>,
 		timeoutMs: number,
+		operationLabel: string = command.type,
 	): RpcRequestHandle {
 		if (!this.#writable()) throw new Error("Pi RPC process is closed");
 
@@ -96,7 +110,7 @@ export class RpcClient {
 		const responsePromise = new Promise<RpcResponse>((resolve, reject) => {
 			const timeout = setTimeout(() => {
 				this.#pending.delete(id);
-				reject(new Error(`Timed out waiting for RPC response to ${command.type}`));
+				reject(new RpcTimeoutError(operationLabel));
 			}, timeoutMs);
 
 			this.#pending.set(id, { resolve, reject, timeout });

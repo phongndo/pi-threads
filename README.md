@@ -125,17 +125,21 @@ If `start.cwd` is provided, it must resolve to an existing directory. Omit it to
 use the parent session's current working directory.
 
 Tool results include concise text plus structured `details`. Single-thread
-actions (`start`, `poll`, `send`, `wait`, `stop`, `resume`, `fork`, and `archive`) include a normalized
-`snapshot` with `id`, `path`, `status`, `phase`, `running`, `detail`,
+actions (`start`, `poll`, `send`, `wait`, `stop`, `resume`, `fork`, and
+`archive`) include a normalized `snapshot` with `id`, `path`, `status`, `phase`, `running`, `detail`,
 `resultSummary`, recent events, and `nextSuggestedActions`; `list` returns the
 same shape in `snapshots`. Recent events use compact canonical lifecycle names
 such as `thread_started`, `turn_started`, `tool_started`, `tool_completed`,
 `assistant_message`, `turn_completed`, and `thread_closed`.
 
+If a `send` RPC acceptance check times out, the tool reports
+`accepted: null`/`Accepted: unknown`: the request was written and may still be
+processed, so poll or wait before retrying instead of sending a duplicate prompt.
+
 `poll` and `wait` accept `detail: "summary" | "tail" | "full"`. The default is
 `summary`, which returns a compact child-result summary and a small event tail.
 `tail` adds bounded output/stderr tails. `full` is explicit opt-in and returns
-the full retained last assistant output in the structured snapshot.
+the bounded retained last assistant output in the structured snapshot.
 
 `start.args` is intentionally allowlisted. Children always run in RPC mode;
 one-shot modes, session selection, approval flags, package subcommands, bare
@@ -174,7 +178,7 @@ panel with result summary, session metadata, parent/child info, and recent event
 timeline. Use `↑`/`↓` to navigate, `←`/`→` to jump to visible parent/child
 threads, type to search, `tab` to cycle status filters, `ctrl+v` to cycle
 visibility (`active` → `archived` → `all`), `ctrl+p` to poll/refresh that row,
-`ctrl+r` to refresh the list, `ctrl+x` to stop it, and `esc` to clear search or
+`ctrl+r` to refresh the list, `ctrl+x` twice to confirm-stop a live thread, and `esc` to clear search or
 close. The control legend is shown below the browser title.
 
 The browser intentionally does not expose start, resume, fork, archive, or send

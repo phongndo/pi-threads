@@ -15,6 +15,7 @@ import {
 	type ThreadSnapshot,
 } from "./domain.ts";
 import {
+	formatList,
 	formatPoll,
 	formatThreadEvent,
 	formatThreadStateBadge,
@@ -44,7 +45,7 @@ const THREAD_HELP_ITEMS = [
 	"ctrl+v visibility",
 	"ctrl+p poll",
 	"ctrl+r refresh",
-	"ctrl+x stop",
+	"ctrl+x stop (confirm)",
 	"type search",
 	"esc close",
 ];
@@ -82,7 +83,8 @@ export function registerThreadsCommand(
 					"all",
 				);
 			} else if (ctx.hasUI) {
-				const threads = manager.list({ action: "list", state: "all", visibility: "active" });
+				// Include archived so command-mode select can reach them (labeled with "archived").
+				const threads = manager.list({ action: "list", state: "all", visibility: "all" });
 				if (threads.length === 0) {
 					ctx.ui.notify("No threads found", "info");
 					return;
@@ -90,7 +92,7 @@ export function registerThreadsCommand(
 				await showThreadsRpc(ctx, manager, threads);
 			} else {
 				const threads = manager.list({ action: "list", state: "all", visibility: "active" });
-				ctx.ui.notify(`Found ${threads.length} thread(s)`, "info");
+				ctx.ui.notify(formatList(threads), "info");
 			}
 		},
 	});
@@ -139,6 +141,8 @@ export class ThreadsTreeComponent implements Component {
 	private selectedIndex = 0;
 	private searchQuery = "";
 	private closed = false;
+	/** Selected live thread id awaiting a second ctrl+x confirmation. */
+	private pendingStopId: string | null = null;
 	private cachedWidth: number | undefined;
 	private cachedLines: string[] | undefined;
 	private cachedBrowserView: BrowserView | undefined;
@@ -175,6 +179,12 @@ export class ThreadsTreeComponent implements Component {
 			selectedIndex >= 0
 				? selectedIndex
 				: Math.min(this.selectedIndex, Math.max(0, filtered.length - 1));
+		if (
+			this.pendingStopId !== null &&
+			!filtered.some((thread) => thread.id === this.pendingStopId)
+		) {
+			this.pendingStopId = null;
+		}
 		this.rerender();
 	}
 
@@ -237,6 +247,7 @@ export class ThreadsTreeComponent implements Component {
 		if (matchesKey(data, Key.up)) {
 			const filtered = this.filteredThreads();
 			if (filtered.length === 0) return;
+			this.clearPendingStop();
 			this.selectedIndex = this.selectedIndex === 0 ? filtered.length - 1 : this.selectedIndex - 1;
 			this.rerender();
 			return;
@@ -245,6 +256,7 @@ export class ThreadsTreeComponent implements Component {
 		if (matchesKey(data, Key.down)) {
 			const filtered = this.filteredThreads();
 			if (filtered.length === 0) return;
+			this.clearPendingStop();
 			this.selectedIndex = this.selectedIndex === filtered.length - 1 ? 0 : this.selectedIndex + 1;
 			this.rerender();
 			return;
@@ -271,6 +283,12 @@ export class ThreadsTreeComponent implements Component {
 		}
 
 		if (matchesKey(data, Key.escape)) {
+			if (this.pendingStopId !== null) {
+				this.clearPendingStop();
+				this.notify("Stop cancelled.", "info");
+				this.rerender();
+				return;
+			}
 			if (this.searchQuery !== "") {
 				this.searchQuery = "";
 				this.selectedIndex = 0;
@@ -305,11 +323,12 @@ export class ThreadsTreeComponent implements Component {
 		}
 
 		if (matchesKey(data, Key.ctrl("x"))) {
-			void this.handleStop();
+			void this.requestStop();
 			return;
 		}
 
 		if (isPrintable(data)) {
+			this.clearPendingStop();
 			this.searchQuery += data;
 			this.selectedIndex = 0;
 			this.invalidateBrowserView();
@@ -503,6 +522,7 @@ export class ThreadsTreeComponent implements Component {
 	private selectParentThread(): void {
 		const thread = this.selectedThread();
 		if (thread === undefined || thread.parentPath === "/root") return;
+		this.clearPendingStop();
 		if (!this.selectVisiblePath(thread.parentPath)) {
 			this.notify("Parent thread is hidden by the current filters or search.", "info");
 		}
@@ -518,6 +538,7 @@ export class ThreadsTreeComponent implements Component {
 			this.notify("No visible child thread for the selected row.", "info");
 			return;
 		}
+		this.clearPendingStop();
 		this.selectVisiblePath(child.path);
 	}
 
@@ -536,13 +557,37 @@ export class ThreadsTreeComponent implements Component {
 		try {
 			const updated = await this.manager.poll(thread.path);
 			if (this.closed) return;
+			// manager.poll emits onChange, which already refreshes this.threads via updateThreads.
 			this.notify(`Polled ${formatThreadTitle(updated)} — ${browserStatus(updated)}`, "info");
-			this.replaceThread(updated);
-			this.rerender();
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
 			this.notify(`Poll failed: ${message}`, "error");
 		}
+	}
+
+	private async requestStop(): Promise<void> {
+		const thread = this.selectedThread();
+		if (!thread) return;
+
+		// Closed threads are a no-op stop; skip confirmation and report already closed.
+		if (thread.state !== "live") {
+			this.clearPendingStop();
+			await this.handleStop();
+			return;
+		}
+
+		if (this.pendingStopId !== thread.id) {
+			this.pendingStopId = thread.id;
+			this.notify(
+				`Press ctrl+x again to stop "${formatThreadTitle(thread)}", or esc to cancel.`,
+				"warning",
+			);
+			this.rerender();
+			return;
+		}
+
+		this.clearPendingStop();
+		await this.handleStop();
 	}
 
 	private async handleStop(): Promise<void> {
@@ -552,7 +597,8 @@ export class ThreadsTreeComponent implements Component {
 		try {
 			const outcome = await this.manager.stop({ action: "stop", id: thread.path, force: false });
 			if (this.closed) return;
-			this.notify(`Stopped ${formatThreadTitle(outcome.thread)}`, "info");
+			const title = formatThreadTitle(outcome.thread);
+			this.notify(outcome.alreadyClosed ? `Already closed ${title}` : `Stopped ${title}`, "info");
 			this.refreshList();
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : String(err);
@@ -560,11 +606,8 @@ export class ThreadsTreeComponent implements Component {
 		}
 	}
 
-	private replaceThread(thread: ThreadSnapshot): void {
-		const index = this.threads.findIndex((candidate) => candidate.id === thread.id);
-		if (index >= 0) this.threads[index] = thread;
-		else this.threads.push(thread);
-		this.invalidateBrowserView();
+	private clearPendingStop(): void {
+		this.pendingStopId = null;
 	}
 
 	private refreshList(): void {
@@ -579,6 +622,7 @@ export class ThreadsTreeComponent implements Component {
 	}
 
 	private cycleStatusFilter(): void {
+		this.clearPendingStop();
 		const currentIndex = STATUS_FILTER_CYCLE.indexOf(this.statusFilter);
 		this.statusFilter = STATUS_FILTER_CYCLE[(currentIndex + 1) % STATUS_FILTER_CYCLE.length]!;
 		this.invalidateBrowserView();
@@ -590,6 +634,7 @@ export class ThreadsTreeComponent implements Component {
 	}
 
 	private cycleVisibilityFilter(): void {
+		this.clearPendingStop();
 		const currentIndex = VISIBILITY_FILTER_CYCLE.indexOf(this.visibilityFilter);
 		this.visibilityFilter =
 			VISIBILITY_FILTER_CYCLE[(currentIndex + 1) % VISIBILITY_FILTER_CYCLE.length]!;

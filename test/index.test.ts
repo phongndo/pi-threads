@@ -23,7 +23,7 @@ import {
 	shouldShutdownThreadsOnSessionShutdown,
 	syncThreadManagerScope,
 } from "../src/index.ts";
-import { PI_THREAD_REGISTRY_ENTRY_TYPE, type ThreadManager } from "../src/thread-manager.ts";
+import { PI_THREAD_REGISTRY_ENTRY_TYPE, ThreadManager } from "../src/thread-manager.ts";
 
 const theme = {
 	fg: (_color: string, text: string) => text,
@@ -70,6 +70,7 @@ function threadSnapshot(overrides: Partial<ThreadSnapshot> = {}): ThreadSnapshot
 		parentPath: asThreadPath("/root"),
 		parentThreadId: null,
 		depth: 1,
+		archived: false,
 		cwd: "/tmp/project",
 		args: [],
 		createdAt: "2026-01-01T00:00:00.000Z",
@@ -215,6 +216,7 @@ describe("thread tool structured details", () => {
 			},
 			stop: async () => ({
 				kind: "stopped" as const,
+				alreadyClosed: false,
 				thread: closedThread,
 				snapshot: closedSnapshot,
 			}),
@@ -545,25 +547,105 @@ describe("session shutdown thread lifecycle", () => {
 	});
 
 	it("rebinds the process manager for a managed child session", () => {
+		const calls: string[] = [];
 		const manager = {
 			findBySessionFile: () => threadSnapshot(),
-			rebindScope: () => undefined,
-			resetScope: () => undefined,
+			rebindScope: (scope: unknown) => {
+				calls.push(`rebind:${JSON.stringify(scope)}`);
+			},
+			resetScope: () => {
+				calls.push("reset");
+			},
+			hydrateFromSession: () => {
+				calls.push("hydrate");
+			},
 		} as unknown as ThreadManager;
-		const calls: unknown[] = [];
-		manager.rebindScope = (scope) => {
-			calls.push(scope);
-		};
 
 		syncThreadManagerScope(ctx([], "/tmp/child.jsonl"), manager);
 
 		expect(calls).toEqual([
-			{
+			`rebind:${JSON.stringify({
 				currentPath: "/root/alpha",
 				depth: 1,
 				selfThreadId: "thread_012345abcdef",
-			},
+			})}`,
+			"hydrate",
 		]);
+	});
+
+	it("restores root sibling registry entries on the first sync after leaving a child scope", () => {
+		const alpha = threadSnapshot({
+			id: asThreadId("thread_aaaa1111aaaa"),
+			name: "alpha",
+			taskName: "alpha",
+			path: asThreadPath("/root/alpha"),
+			session: {
+				kind: "known",
+				file: "/tmp/alpha.jsonl",
+				id: "session-alpha",
+				name: null,
+				pendingMessageCount: null,
+			},
+		});
+		const beta = threadSnapshot({
+			id: asThreadId("thread_bbbb2222bbbb"),
+			name: "beta",
+			taskName: "beta",
+			path: asThreadPath("/root/beta"),
+			session: {
+				kind: "known",
+				file: "/tmp/beta.jsonl",
+				id: "session-beta",
+				name: null,
+				pendingMessageCount: null,
+			},
+		});
+		const branch = [
+			{
+				type: "custom",
+				customType: PI_THREAD_REGISTRY_ENTRY_TYPE,
+				data: { version: 1, kind: "thread_snapshot", snapshot: alpha },
+			},
+			{
+				type: "custom",
+				customType: PI_THREAD_REGISTRY_ENTRY_TYPE,
+				data: { version: 1, kind: "thread_snapshot", snapshot: beta },
+			},
+		];
+
+		// Simulate the process-global manager retained by extension closures after a
+		// child-session switch: still bound to the child path, then cleared on the way
+		// back to root before the first list/sync of the root session.
+		const manager = new ThreadManager({
+			PI_THREADS_DEPTH: "0",
+			PI_THREADS_MAX_DEPTH: "2",
+			PI_THREADS_MAX_THREADS: "8",
+			PI_THREADS_PATH: "/root",
+			PI_THREADS_ROOT_SESSION_ID: "session-root",
+		} as NodeJS.ProcessEnv);
+		manager.rebindScope({
+			currentPath: alpha.path,
+			depth: alpha.depth,
+			selfThreadId: alpha.id,
+		});
+		manager.clearThreads();
+
+		syncThreadManagerScope(
+			{
+				ui: { notify: () => undefined },
+				sessionManager: {
+					getBranch: () => branch,
+					getSessionFile: () => "/tmp/root.jsonl",
+					getSessionId: () => "session-root",
+				},
+			} as unknown as ExtensionContext,
+			manager,
+		);
+
+		expect(manager.getScope().currentPath).toBe("/root");
+		expect(
+			manager.list({ action: "list", visibility: "all" }).map((thread) => thread.path),
+		).toEqual(["/root/alpha", "/root/beta"]);
 	});
 
 	it("still shuts down threads for quits and unrelated session resumes", () => {

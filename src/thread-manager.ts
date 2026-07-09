@@ -1,7 +1,7 @@
-import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	ROOT_THREAD_PATH,
 	asThreadPath,
@@ -10,18 +10,11 @@ import {
 	joinThreadPath,
 	newThreadId,
 	nowIso,
-	type ClosedThreadSnapshot,
-	type KnownThreadSession,
-	type LiveThreadSnapshot,
-	type ThreadEvent,
 	type ThreadExit,
 	type ThreadId,
 	type ThreadPath,
 	type ThreadSnapshot,
 	type ThreadRuntimeSnapshot,
-	type ThreadPhase,
-	type ThreadSession,
-	toThreadRuntimeSnapshot,
 } from "./domain.ts";
 import {
 	assertAllowedExtraArgs,
@@ -31,20 +24,25 @@ import {
 } from "./arg-policy.ts";
 import { isRecord, numberField, stringField } from "./json.ts";
 import {
+	materializeSessionManagerFile,
+	safeGetLeafId,
+	safeGetSessionDir,
+	safeGetSessionFile,
+	safeSessionRegistryEntries,
+	safeSessionTimestamp,
+	sessionHasParentSession,
+} from "./pi-session-adapter.ts";
+import {
 	generateDisplayName,
 	shortTaskName,
 	taskNameFromText,
 	taskNameWithNumericSuffix,
 } from "./naming.ts";
-import { RpcClient, type RpcClientEvent, type RpcResponse } from "./rpc.ts";
+import { RpcClient, RpcTimeoutError, type RpcClientEvent, type RpcResponse } from "./rpc.ts";
 import {
 	registryScope,
-	registryTruncatedTextMatchesFull,
-	restoreDurableThreadData,
-	restoredThreadRegistrySession,
 	threadRegistrySessionsMatch,
 	truncateSnapshotForRegistry,
-	type DurableThreadData,
 	type ThreadRegistryPersistence,
 	type ThreadRegistryRestoreScope,
 	type ThreadRegistrySession,
@@ -66,6 +64,59 @@ import {
 	resolveThreadTarget,
 	unknownThreadReferenceError,
 } from "./thread-references.ts";
+import {
+	classifyProcessExit,
+	getPiInvocation,
+	shouldLaunchDetachedProcessGroup,
+	signalThreadProcessTree,
+	STOP_KILL_WAIT_MS,
+} from "./thread-process.ts";
+import {
+	allowAwaitingSendRunActivity,
+	appendLaunchThreadEvent,
+	appendThreadEvent,
+	applyAwaitingSend,
+	capRetainedText,
+	captureSendAcceptanceBaseline,
+	clearObservedSendIfIdle,
+	clearPendingInitialPrompt,
+	defaultSendMode,
+	extractAssistantText,
+	hasNoPendingMessages,
+	isUserMessage,
+	recordAcceptedInitialPrompt,
+	recordAcceptedSend,
+	recordPendingMessageActivity,
+	recordPromptRunActivity,
+	recordSendActivity,
+	recordTimedOutSend,
+	recordThreadTurnCompleted,
+	recordThreadTurnStarted,
+	setThreadPhase,
+	snapshot,
+	snapshotPair,
+	tail,
+	type ClosedThread,
+	type LaunchThreadInput,
+	type LiveThread,
+	type ManagedThread,
+} from "./thread-state.ts";
+import {
+	assertSessionFileExists,
+	captureSession,
+	createForkedManagedSession,
+	hydrationCacheKeysMatch,
+	preserveRegistryTruncatedText,
+	prepareManagedChildSession,
+	restoreDurableThreads,
+	sameSessionFile,
+	threadRegistryMetadataMatches,
+	threadRegistrySessionFromContext,
+	threadSnapshotsMatch,
+	withThreadRegistryMetadata,
+	type ForkSource,
+	type HydrationCacheKey,
+} from "./thread-persistence.ts";
 
 export {
 	assertAllowedExtraArgs,
@@ -84,99 +135,22 @@ export {
 
 const DEFAULT_MAX_DEPTH = 2;
 const DEFAULT_MAX_THREADS = 8;
-const RECENT_EVENT_LIMIT = 40;
 const STDERR_TAIL_LIMIT = 12_000;
 const PROMPT_ACCEPT_TIMEOUT_MS = 4_000;
 const RPC_QUICK_TIMEOUT_MS = 1_500;
 const RPC_SEND_TIMEOUT_MS = 5_000;
 const STOP_GRACE_MS = 1_500;
-const STOP_KILL_WAIT_MS = 300;
 const DEFAULT_IDLE_CLEANUP_MS = 0;
 const DEFAULT_LIVE_TIMEOUT_MS = 0;
 const MAX_SET_TIMEOUT_DELAY_MS = 2_147_483_647;
 const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
 const MAX_WAIT_TIMEOUT_MS = 600_000;
 const WAIT_POLL_INTERVAL_MS = 250;
-const BUSY_SEND_IDLE_SETTLE_REFRESHES = 2;
 const MESSAGE_UPDATE_EMIT_THROTTLE_MS = 250;
 const PERSIST_FLUSH_DELAY_MS = 500;
 // Pi resolves CLI resource flags from the process startup cwd, while ctx.cwd can
 // later point at a resumed or switched session in another project.
 const PROCESS_START_CWD = process.cwd();
-
-type ThreadBase = {
-	readonly id: ThreadId;
-	readonly name: string;
-	readonly taskName: string;
-	readonly path: ThreadPath;
-	readonly parentPath: ThreadPath;
-	readonly parentThreadId: ThreadId | null;
-	readonly depth: number;
-	readonly registrySession: ThreadRegistrySession | null;
-	readonly registryGeneration: number;
-	archived: boolean;
-	readonly cwd: string;
-	readonly args: readonly string[];
-	readonly createdAt: string;
-	lastEventAt: string;
-	session: ThreadSession;
-	lastAssistantText: string | null;
-	recentEvents: ThreadEvent[];
-	nextEventSeq: number;
-	stderrTail: string;
-};
-
-type LiveThread = ThreadBase & {
-	readonly state: "live";
-	readonly processLaunchToken: symbol;
-	readonly liveStartedAt: string;
-	idleStartedAt: string | null;
-	phase: ThreadPhase;
-	readonly pid: number;
-	readonly processGroupId: number | null;
-	readonly child: ChildProcessWithoutNullStreams;
-	readonly rpc: RpcClient;
-	lastPartialText: string | null;
-	stopRequested: boolean;
-	hasRun: boolean;
-	activityGeneration: number;
-	userMessageStartGeneration: number;
-	inFlightSendCount: number;
-	awaitingSend: AwaitingSend | null;
-	pendingInitialPrompt: PendingInitialPrompt | null;
-	turnOpen: boolean;
-	readonly closed: Promise<void>;
-	readonly resolveClosed: () => void;
-};
-
-type AwaitingSend = {
-	observedActivity: boolean;
-	requireObservedActivity: boolean;
-	ignoreRunActivityUntilIdle: boolean;
-	idleRefreshCount: number;
-	readonly idleRefreshesToSettle: number;
-	readonly pendingMessageBaseline: number | null;
-};
-
-type SendAcceptanceBaseline = {
-	readonly phase: ThreadPhase;
-	readonly activityGeneration: number;
-	readonly userMessageStartGeneration: number;
-	readonly pendingMessageCount: number | null;
-	readonly allowActivityFastPath: boolean;
-};
-
-type PendingInitialPrompt = {
-	readonly requestId: string;
-};
-
-type ClosedThread = ThreadBase & {
-	readonly state: "closed";
-	readonly exit: ThreadExit;
-	readonly processLaunchToken?: symbol;
-};
-
-type ManagedThread = LiveThread | ClosedThread;
 
 export type ThreadChangeListener = (threads: readonly ThreadSnapshot[]) => void;
 
@@ -199,11 +173,13 @@ export type StartOutcome = ThreadOutcomeBase<"started"> & {
 
 export type SendOutcome = ThreadOutcomeBase<"sent"> & {
 	readonly mode: SendMode;
-	readonly accepted: boolean;
+	readonly accepted: boolean | null;
 	readonly error: string | null;
 };
 
-export type StopOutcome = ThreadOutcomeBase<"stopped">;
+export type StopOutcome = ThreadOutcomeBase<"stopped"> & {
+	readonly alreadyClosed: boolean;
+};
 
 export type ResumeOutcome = ThreadOutcomeBase<"resumed"> & {
 	readonly alreadyLive: boolean;
@@ -239,44 +215,6 @@ type ThreadRegistryOwnership = {
 	readonly registryGeneration: number;
 };
 
-type LaunchThreadInput = {
-	readonly id: ThreadId;
-	readonly name: string;
-	readonly taskName: string;
-	readonly path: ThreadPath;
-	readonly parentPath: ThreadPath;
-	readonly parentThreadId: ThreadId | null;
-	readonly depth: number;
-	readonly registrySession: ThreadRegistrySession | null;
-	readonly registryGeneration: number;
-	readonly cwd: string;
-	readonly args: readonly string[];
-	readonly createdAt?: string;
-	readonly archived?: boolean;
-	readonly session?: ThreadSession | undefined;
-	readonly sessionFile?: string | undefined;
-	readonly lastAssistantText?: string | null | undefined;
-	readonly recentEvents?: readonly ThreadEvent[] | undefined;
-	readonly stderrTail?: string | undefined;
-	readonly startEvent: "thread_started" | "thread_resumed" | "thread_forked";
-	readonly sourceSessionFile?: string | undefined;
-	readonly sourceEntryId?: string | null;
-	readonly prompt?: string;
-};
-
-type ForkSource = {
-	readonly sessionFile: string;
-	readonly sessionDir: string | undefined;
-	readonly cwd: string;
-	readonly displayName: string;
-};
-
-type ForkedManagedSession = {
-	readonly cwd: string;
-	readonly session: KnownThreadSession;
-	readonly sourceEntryId: string | null;
-};
-
 export class ThreadManager {
 	readonly #threads = new Map<ThreadId, ManagedThread>();
 	readonly #listeners = new Set<ThreadChangeListener>();
@@ -292,31 +230,51 @@ export class ThreadManager {
 	readonly #rootSessionId: string;
 	#registrySession: ThreadRegistrySession | null = null;
 	#registryGeneration = 0;
+	#lastHydrationKey: HydrationCacheKey | null = null;
 	#persistence: ThreadRegistryPersistence = {};
 	readonly #dirtyPersistThreadIds = new Set<ThreadId>();
+	readonly #threadsWithPersistenceError = new Set<ThreadId>();
+	#persistenceDegradedNotified = false;
 	#persistFlushTimer: ReturnType<typeof setTimeout> | null = null;
 	#cleanupTimer: ReturnType<typeof setTimeout> | null = null;
 	#cleanupInFlight: Promise<void> | null = null;
 
 	constructor(environment: NodeJS.ProcessEnv = process.env) {
-		const baseDepth = readInteger(environment["PI_THREADS_DEPTH"], 0);
-		const baseSelfThreadId = readOptionalThreadId(environment["PI_THREADS_SELF_ID"]);
-		const baseCurrentPath = readThreadPath(environment["PI_THREADS_PATH"], ROOT_THREAD_PATH);
+		const baseDepth = readInteger(environment["PI_THREADS_DEPTH"], 0, "PI_THREADS_DEPTH");
+		const baseSelfThreadId = readOptionalThreadId(
+			environment["PI_THREADS_SELF_ID"],
+			"PI_THREADS_SELF_ID",
+		);
+		const baseCurrentPath = readThreadPath(
+			environment["PI_THREADS_PATH"],
+			ROOT_THREAD_PATH,
+			"PI_THREADS_PATH",
+		);
 		this.#baseScope = {
 			currentPath: baseCurrentPath,
 			depth: baseDepth,
 			selfThreadId: baseSelfThreadId,
 		};
 		this.#depth = baseDepth;
-		this.#maxDepth = readInteger(environment["PI_THREADS_MAX_DEPTH"], DEFAULT_MAX_DEPTH);
-		this.#maxThreads = readInteger(environment["PI_THREADS_MAX_THREADS"], DEFAULT_MAX_THREADS);
+		this.#maxDepth = readInteger(
+			environment["PI_THREADS_MAX_DEPTH"],
+			DEFAULT_MAX_DEPTH,
+			"PI_THREADS_MAX_DEPTH",
+		);
+		this.#maxThreads = readInteger(
+			environment["PI_THREADS_MAX_THREADS"],
+			DEFAULT_MAX_THREADS,
+			"PI_THREADS_MAX_THREADS",
+		);
 		this.#idleCleanupMs = readInteger(
 			environment["PI_THREADS_IDLE_CLEANUP_MS"],
 			DEFAULT_IDLE_CLEANUP_MS,
+			"PI_THREADS_IDLE_CLEANUP_MS",
 		);
 		this.#liveTimeoutMs = readInteger(
 			environment["PI_THREADS_LIVE_TIMEOUT_MS"],
 			DEFAULT_LIVE_TIMEOUT_MS,
+			"PI_THREADS_LIVE_TIMEOUT_MS",
 		);
 		this.#selfThreadId = baseSelfThreadId;
 		this.#currentPath = baseCurrentPath;
@@ -341,16 +299,34 @@ export class ThreadManager {
 
 	hydrateFromSession(ctx: Pick<ExtensionContext, "sessionManager">): void {
 		this.#setRegistrySession(threadRegistrySessionFromContext(ctx));
+		const sessionStartedAt = safeSessionTimestamp(ctx);
+		const isRootSessionFork =
+			sessionHasParentSession(ctx) && this.#currentPath === ROOT_THREAD_PATH;
+		// Prefer getEntries so side-branch registry customs remain visible (H5).
+		const entries = safeSessionRegistryEntries(ctx);
+		const hydrationKey: HydrationCacheKey = {
+			currentPath: this.#currentPath,
+			sessionId: this.#registrySession?.sessionId ?? null,
+			sessionFile: this.#registrySession?.sessionFile ?? null,
+			registryGeneration: this.#registryGeneration,
+			sessionStartedAt,
+			isRootSessionFork,
+			entryCount: entries.length,
+			leafId: safeGetLeafId(ctx),
+		};
+		if (hydrationCacheKeysMatch(this.#lastHydrationKey, hydrationKey)) return;
+		this.#lastHydrationKey = hydrationKey;
+
+		if (entries.length === 0) return;
+
 		const restoreScope: ThreadRegistryRestoreScope = {
 			sessionId: this.#registrySession?.sessionId ?? null,
-			sessionStartedAt: safeSessionTimestamp(ctx),
+			sessionStartedAt,
 			currentPath: this.#currentPath,
-			isRootSessionFork: sessionHasParentSession(ctx) && this.#currentPath === ROOT_THREAD_PATH,
+			isRootSessionFork,
 			registrySession: this.#registrySession,
 			registryGeneration: this.#registryGeneration,
 		};
-		const entries = safeSessionBranch(ctx);
-		if (entries.length === 0) return;
 
 		let changed = false;
 		for (const restored of restoreDurableThreads(entries, restoreScope)) {
@@ -516,25 +492,49 @@ export class ThreadManager {
 			const sendAcceptanceBaseline = captureSendAcceptanceBaseline(thread, {
 				allowActivityFastPath: refreshed,
 			});
-			const response = await sendMessage(thread, mode, command.message);
-			if (response.success) {
-				const current = this.#threads.get(id);
-				if (current?.state === "live") {
-					recordAcceptedSend(current, sendAcceptanceBaseline);
-					this.#persistThreadSnapshot(current);
+			try {
+				const response = await sendMessage(thread, mode, command.message);
+				if (response.success) {
+					const current = this.#threads.get(id);
+					if (current?.state === "live") {
+						recordAcceptedSend(current, sendAcceptanceBaseline);
+						this.#persistThreadSnapshot(current);
+					}
 				}
-			}
-			this.#finishInFlightSend(id);
-			sendTracked = false;
-			this.#emitChange();
+				this.#finishInFlightSend(id);
+				sendTracked = false;
+				this.#emitChange();
 
-			return {
-				kind: "sent",
-				mode,
-				accepted: response.success,
-				error: response.success ? null : (response.error ?? "Message was rejected by child Pi."),
-				...snapshotPair(this.#required(id)),
-			};
+				return {
+					kind: "sent",
+					mode,
+					accepted: response.success,
+					error: response.success ? null : (response.error ?? "Message was rejected by child Pi."),
+					...snapshotPair(this.#required(id)),
+				};
+			} catch (error) {
+				if (error instanceof RpcTimeoutError) {
+					const current = this.#threads.get(id);
+					if (current?.state === "live") {
+						recordTimedOutSend(current, sendAcceptanceBaseline);
+						this.#persistThreadSnapshot(current);
+					}
+				}
+				this.#finishInFlightSend(id);
+				sendTracked = false;
+				this.#emitChange();
+				if (error instanceof RpcTimeoutError) {
+					// Request was written; acceptance is unknown until poll/wait observes work.
+					return {
+						kind: "sent",
+						mode,
+						accepted: null,
+						error: error.message,
+						...snapshotPair(this.#required(id)),
+					};
+				}
+				throw error;
+			}
 		} finally {
 			if (sendTracked) this.#finishInFlightSend(id);
 		}
@@ -544,14 +544,18 @@ export class ThreadManager {
 		let thread = this.#requiredByTarget(command.id);
 		const id = thread.id;
 
-		if (thread.state === "closed") return { kind: "stopped", ...snapshotPair(thread) };
+		if (thread.state === "closed") {
+			return { kind: "stopped", alreadyClosed: true, ...snapshotPair(thread) };
+		}
 		if (thread.session.kind !== "known") await this.#refreshSession(thread);
 
 		thread = this.#required(id);
-		if (thread.state === "closed") return { kind: "stopped", ...snapshotPair(thread) };
+		if (thread.state === "closed") {
+			return { kind: "stopped", alreadyClosed: true, ...snapshotPair(thread) };
+		}
 
 		await this.#stopLiveThread(thread, { force: command.force === true });
-		return { kind: "stopped", ...snapshotPair(this.#required(id)) };
+		return { kind: "stopped", alreadyClosed: false, ...snapshotPair(this.#required(id)) };
 	}
 
 	async resume(command: ResumeCommand, ctx: ExtensionContext): Promise<ResumeOutcome> {
@@ -805,8 +809,10 @@ export class ThreadManager {
 		for (const [id, thread] of this.#threads) {
 			if (thread.state !== "closed") continue;
 			this.#threads.delete(id);
+			this.#clearPersistenceFailure(id);
 			changed = true;
 		}
+		if (changed) this.#lastHydrationKey = null;
 		if (changed) this.#emitChange();
 	}
 
@@ -868,7 +874,9 @@ export class ThreadManager {
 			PI_THREADS_IDLE_CLEANUP_MS: String(this.#idleCleanupMs),
 			PI_THREADS_LIVE_TIMEOUT_MS: String(this.#liveTimeoutMs),
 			PI_THREADS_SELF_ID: input.id,
+			// Canonical parent id for child processes.
 			PI_THREADS_PARENT_ID: input.parentThreadId ?? "",
+			// Compatibility alias of PI_THREADS_PARENT_ID (same value). Prefer PARENT_ID for new readers.
 			PI_THREADS_PARENT_THREAD_ID: input.parentThreadId ?? "",
 			PI_THREADS_PARENT_PATH: input.parentPath,
 			PI_THREADS_PATH: input.path,
@@ -1010,6 +1018,7 @@ export class ThreadManager {
 				const request = thread.rpc.requestWithHandle(
 					{ type: "prompt", message: input.prompt },
 					PROMPT_ACCEPT_TIMEOUT_MS,
+					"initial prompt",
 				);
 				thread.pendingInitialPrompt = { requestId: request.id };
 
@@ -1048,8 +1057,39 @@ export class ThreadManager {
 				registryScope(target),
 				target,
 			);
-		} catch {
+			this.#clearPersistenceFailure(thread.id);
+		} catch (error) {
 			// Persistence should never affect process lifecycle management.
+			this.#recordPersistenceFailure(thread, error);
+		}
+	}
+
+	#recordPersistenceFailure(thread: ManagedThread, error: unknown): void {
+		const detail = error instanceof Error ? error.message : String(error);
+		if (!this.#threadsWithPersistenceError.has(thread.id)) {
+			this.#threadsWithPersistenceError.add(thread.id);
+			appendThreadEvent(thread, {
+				type: "thread_error",
+				message: `Registry persistence failed: ${detail}`,
+			});
+			this.#emitChange();
+		}
+
+		if (this.#persistenceDegradedNotified) return;
+		this.#persistenceDegradedNotified = true;
+		try {
+			this.#persistence.onPersistenceFailure?.(
+				`Thread registry persistence is degraded: ${detail}. Thread lifecycle continues; registry history may be incomplete until writes succeed again.`,
+			);
+		} catch {
+			// Notify failures must not affect lifecycle either.
+		}
+	}
+
+	#clearPersistenceFailure(threadId: ThreadId): void {
+		this.#threadsWithPersistenceError.delete(threadId);
+		if (this.#threadsWithPersistenceError.size === 0) {
+			this.#persistenceDegradedNotified = false;
 		}
 	}
 
@@ -1371,9 +1411,12 @@ export class ThreadManager {
 			case "message_update": {
 				recordPromptRunActivity(thread);
 				const text = extractAssistantText(event["message"]);
-				if (text !== null && text !== thread.lastPartialText) {
-					thread.lastPartialText = text;
-					this.#scheduleMessageUpdateChange();
+				if (text !== null) {
+					const retained = capRetainedText(text);
+					if (retained !== thread.lastPartialText) {
+						thread.lastPartialText = retained;
+						this.#scheduleMessageUpdateChange();
+					}
 				}
 				return;
 			}
@@ -1381,10 +1424,11 @@ export class ThreadManager {
 				recordPromptRunActivity(thread);
 				const text = extractAssistantText(event["message"]);
 				if (text !== null) {
-					thread.lastAssistantText = text;
+					const retained = capRetainedText(text);
+					thread.lastAssistantText = retained;
 					thread.lastPartialText = null;
 					clearObservedSendIfIdle(thread);
-					appendThreadEvent(thread, { type: "assistant_message", text: tail(text, 2_000) });
+					appendThreadEvent(thread, { type: "assistant_message", text: tail(retained, 2_000) });
 					this.#persistThreadSnapshotAndEmitChange(thread);
 				}
 				return;
@@ -1474,15 +1518,16 @@ export class ThreadManager {
 			options.timeoutMs === undefined
 				? { recordErrors: true }
 				: { recordErrors: true, timeoutMs: options.timeoutMs };
-		const before = liveThreadDurabilitySignature(thread);
+		// Persist only durable transitions made by this refresh. Concurrent RPC events
+		// (message_end, agent_end, tools, etc.) already persist themselves. Partial-text
+		// deltas must not trigger registry appends during wait/poll get_state round-trips.
 		const data = await this.#requestState(thread, requestOptions);
 		if (this.#threads.get(thread.id) !== thread) return false;
-		if (data === null) {
-			if (liveThreadDurabilitySignature(thread) !== before) this.#persistThreadSnapshot(thread);
-			return false;
-		}
+		if (data === null) return false;
 
-		captureSession(thread, data);
+		const phaseBefore = thread.phase;
+		const eventSeqBefore = thread.nextEventSeq;
+		const sessionIdentityChanged = captureSession(thread, data);
 
 		const isStreaming = data["isStreaming"] === true;
 		const isCompacting = data["isCompacting"] === true;
@@ -1511,21 +1556,9 @@ export class ThreadManager {
 				// read, so it must stay busy until activity is observed. Sends accepted
 				// while another turn was already busy require one extra idle confirmation so
 				// a previous turn ending is not mistaken for new-send work.
-				allowAwaitingSendRunActivity(thread);
-				if (thread.awaitingSend.observedActivity) {
-					setThreadPhase(thread, "idle");
-					clearObservedSendIfIdle(thread);
-				} else if (thread.awaitingSend.requireObservedActivity) {
-					setThreadPhase(thread, "busy");
-				} else {
-					thread.awaitingSend.idleRefreshCount++;
-					if (thread.awaitingSend.idleRefreshCount >= thread.awaitingSend.idleRefreshesToSettle) {
-						thread.awaitingSend = null;
-						setThreadPhase(thread, "idle");
-					} else {
-						setThreadPhase(thread, "busy");
-					}
-				}
+				applyAwaitingSend(thread, { type: "allow_run_activity" });
+				const idleTransition = applyAwaitingSend(thread, { type: "child_appears_idle" });
+				if (idleTransition.phase !== undefined) setThreadPhase(thread, idleTransition.phase);
 			} else if (
 				thread.phase !== "starting" ||
 				thread.hasRun ||
@@ -1535,7 +1568,11 @@ export class ThreadManager {
 			}
 		}
 		if (childAppearsIdle && thread.phase !== "stopping") recordThreadTurnCompleted(thread);
-		if (liveThreadDurabilitySignature(thread) !== before) this.#persistThreadSnapshot(thread);
+		const durableChanged =
+			sessionIdentityChanged ||
+			thread.phase !== phaseBefore ||
+			thread.nextEventSeq !== eventSeqBefore;
+		if (durableChanged) this.#persistThreadSnapshot(thread);
 		if (options.emitChange ?? true) this.#emitChange();
 		return true;
 	}
@@ -1676,450 +1713,6 @@ export class ThreadManager {
 	}
 }
 
-function captureSession(thread: LiveThread, data: Record<string, unknown>): boolean {
-	const file = stringField(data, "sessionFile");
-	const id = stringField(data, "sessionId");
-	if (file !== null && id !== null) {
-		const nextSession = {
-			kind: "known",
-			file,
-			id,
-			name: stringField(data, "sessionName"),
-			pendingMessageCount: numberField(data, "pendingMessageCount"),
-		} satisfies ThreadSession;
-
-		const changed =
-			thread.session.kind !== "known" ||
-			thread.session.file !== nextSession.file ||
-			thread.session.id !== nextSession.id ||
-			thread.session.name !== nextSession.name ||
-			thread.session.pendingMessageCount !== nextSession.pendingMessageCount;
-		thread.session = nextSession;
-		return changed;
-	}
-
-	return false;
-}
-
-function threadRegistrySessionFromContext(
-	ctx: Pick<ExtensionContext, "sessionManager">,
-): ThreadRegistrySession | null {
-	const sessionId = safeGetSessionId(ctx);
-	const sessionFile = safeGetSessionFile(ctx) ?? null;
-	const sessionDir = safeGetSessionDir(ctx) ?? null;
-	if (sessionId === null && sessionFile === null && sessionDir === null) return null;
-	return { sessionId, sessionFile, sessionDir };
-}
-
-function liveThreadDurabilitySignature(thread: LiveThread): string {
-	return JSON.stringify({
-		archived: thread.archived,
-		lastAssistantText: thread.lastAssistantText,
-		lastPartialText: thread.lastPartialText,
-		phase: thread.phase,
-		recentEvents: thread.recentEvents,
-		session: thread.session,
-		stderrTail: thread.stderrTail,
-	});
-}
-
-function prepareManagedChildSession(
-	ctx: ExtensionContext,
-	cwd: string,
-): { readonly session: KnownThreadSession } | null {
-	const parentSessionFile = safeGetSessionFile(ctx);
-	if (parentSessionFile === undefined) return null;
-
-	const sessionManager = SessionManager.create(cwd, safeGetSessionDir(ctx), {
-		parentSession: parentSessionFile,
-	});
-	materializeSessionManagerFile(sessionManager);
-	const sessionFile = sessionManager.getSessionFile();
-	if (sessionFile === undefined) return null;
-
-	return {
-		session: {
-			kind: "known",
-			file: sessionFile,
-			id: sessionManager.getSessionId(),
-			name: sessionManager.getSessionName() ?? null,
-			pendingMessageCount: null,
-		},
-	};
-}
-
-function createForkedManagedSession(
-	source: ForkSource,
-	command: ForkCommand,
-): ForkedManagedSession {
-	const sourceManager = SessionManager.open(source.sessionFile, source.sessionDir);
-	const position = command.position ?? "at";
-	const requestedEntryId = command.entryId ?? sourceManager.getLeafId();
-	let sourceEntryId: string | null = requestedEntryId ?? null;
-
-	let forkManager: SessionManager;
-	if (requestedEntryId === null) {
-		forkManager = SessionManager.create(sourceManager.getCwd(), sourceManager.getSessionDir(), {
-			parentSession: source.sessionFile,
-		});
-	} else {
-		let targetLeafId: string | null = requestedEntryId;
-		if (position === "before") {
-			const selectedEntry = sourceManager.getEntry(requestedEntryId);
-			if (selectedEntry === undefined)
-				throw new Error(`Cannot fork: entry not found: ${requestedEntryId}`);
-			if (selectedEntry.type !== "message" || selectedEntry.message.role !== "user") {
-				throw new Error(
-					`Cannot fork before entry ${requestedEntryId}: the selected entry is not a user message. Repair: use position "at" or choose a user message entry id.`,
-				);
-			}
-			targetLeafId = selectedEntry.parentId;
-		}
-
-		if (targetLeafId === null) {
-			forkManager = SessionManager.create(sourceManager.getCwd(), sourceManager.getSessionDir(), {
-				parentSession: source.sessionFile,
-			});
-		} else {
-			const forkedPath = sourceManager.createBranchedSession(targetLeafId);
-			if (forkedPath === undefined)
-				throw new Error("Cannot fork: source session is not persisted.");
-			forkManager = sourceManager;
-		}
-	}
-
-	materializeSessionManagerFile(forkManager);
-	const file = forkManager.getSessionFile();
-	if (file === undefined) throw new Error("Cannot fork: forked session has no session file.");
-
-	return {
-		cwd: forkManager.getCwd(),
-		session: {
-			kind: "known",
-			file,
-			id: forkManager.getSessionId(),
-			name: forkManager.getSessionName() ?? null,
-			pendingMessageCount: null,
-		},
-		sourceEntryId,
-	};
-}
-
-type MaterializableSessionManager = {
-	readonly getSessionFile: () => string | undefined;
-	readonly getHeader: () => unknown;
-	readonly getEntries: () => readonly unknown[];
-};
-
-function materializeSessionManagerFile(sessionManager: MaterializableSessionManager): void {
-	const sessionFile = sessionManager.getSessionFile();
-	if (sessionFile === undefined || fs.existsSync(sessionFile)) return;
-	if (rewriteSessionManagerFile(sessionManager, sessionFile)) return;
-
-	const header = sessionManager.getHeader();
-	if (header === null) throw new Error("Cannot materialize Pi session: missing session header.");
-	fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
-	const lines = [header, ...sessionManager.getEntries()].map((entry) => JSON.stringify(entry));
-	fs.writeFileSync(sessionFile, `${lines.join("\n")}\n`, { flag: "wx" });
-	markSessionManagerFileFlushed(sessionManager);
-}
-
-function rewriteSessionManagerFile(
-	sessionManager: MaterializableSessionManager,
-	sessionFile: string,
-): boolean {
-	const internals = sessionManager as MaterializableSessionManager & {
-		readonly isPersisted?: () => boolean;
-		flushed?: boolean;
-	} & Record<string, unknown>;
-	if (typeof internals.isPersisted === "function" && !internals.isPersisted.call(sessionManager)) {
-		return false;
-	}
-	const rewriteFile = internals["_rewriteFile"];
-	if (typeof rewriteFile !== "function") return false;
-
-	try {
-		rewriteFile.call(sessionManager);
-	} catch {
-		return false;
-	}
-
-	if (!fs.existsSync(sessionFile)) return false;
-	markSessionManagerFileFlushed(sessionManager);
-	return true;
-}
-
-function markSessionManagerFileFlushed(sessionManager: MaterializableSessionManager): void {
-	(sessionManager as { flushed?: boolean }).flushed = true;
-}
-
-function safeGetSessionFile(ctx: Pick<ExtensionContext, "sessionManager">): string | undefined {
-	try {
-		return ctx.sessionManager.getSessionFile?.();
-	} catch {
-		return undefined;
-	}
-}
-
-function safeGetSessionId(ctx: Pick<ExtensionContext, "sessionManager">): string | null {
-	try {
-		return ctx.sessionManager.getSessionId?.() ?? null;
-	} catch {
-		return null;
-	}
-}
-
-function sessionHasParentSession(ctx: Pick<ExtensionContext, "sessionManager">): boolean {
-	try {
-		const header = ctx.sessionManager.getHeader?.();
-		return (
-			isRecord(header) &&
-			typeof header["parentSession"] === "string" &&
-			header["parentSession"].length > 0
-		);
-	} catch {
-		return false;
-	}
-}
-
-function safeSessionTimestamp(ctx: Pick<ExtensionContext, "sessionManager">): string | null {
-	try {
-		const header = ctx.sessionManager.getHeader?.();
-		return isRecord(header) ? stringField(header, "timestamp") : null;
-	} catch {
-		return null;
-	}
-}
-
-function safeGetSessionDir(ctx: Pick<ExtensionContext, "sessionManager">): string | undefined {
-	try {
-		return ctx.sessionManager.getSessionDir?.();
-	} catch {
-		return undefined;
-	}
-}
-
-function assertSessionFileExists(sessionFile: string, action: "resume" | "fork"): void {
-	if (fs.existsSync(sessionFile)) return;
-	throw new Error(
-		`Cannot ${action} managed thread: saved Pi session file does not exist: ${sessionFile}. Repair: choose a thread with an existing session file, or start/fork a new thread.`,
-	);
-}
-
-function safeSessionBranch(ctx: Pick<ExtensionContext, "sessionManager">): readonly unknown[] {
-	try {
-		return ctx.sessionManager.getBranch?.() ?? [];
-	} catch {
-		return [];
-	}
-}
-
-function restoreDurableThreads(
-	entries: readonly unknown[],
-	scope: ThreadRegistryRestoreScope,
-): readonly ClosedThread[] {
-	return restoreDurableThreadData(entries, scope).map((data) =>
-		snapshotToRestoredThread(data, scope),
-	);
-}
-
-function threadSnapshotsMatch(left: ManagedThread, right: ManagedThread): boolean {
-	return JSON.stringify(snapshot(left)) === JSON.stringify(snapshot(right));
-}
-
-function preserveRegistryTruncatedText(
-	existing: ClosedThread,
-	restored: ClosedThread,
-): ClosedThread {
-	if (!registryTruncatedTextMatchesFull(restored.lastAssistantText, existing.lastAssistantText)) {
-		return restored;
-	}
-
-	return { ...restored, lastAssistantText: existing.lastAssistantText };
-}
-
-function withThreadRegistryMetadata(thread: ClosedThread, restored: ClosedThread): ClosedThread {
-	return {
-		...thread,
-		registrySession: restored.registrySession,
-		registryGeneration: restored.registryGeneration,
-	};
-}
-
-function threadRegistryMetadataMatches(left: ManagedThread, right: ManagedThread): boolean {
-	return (
-		left.registryGeneration === right.registryGeneration &&
-		threadRegistrySessionsMatch(left.registrySession, right.registrySession)
-	);
-}
-
-function snapshotToRestoredThread(
-	data: DurableThreadData,
-	scope: ThreadRegistryRestoreScope,
-): ClosedThread {
-	const restored = data.snapshot;
-	const recentEvents = [...restored.recentEvents];
-	const nextEventSeq = Math.max(0, ...recentEvents.map((event) => event.seq)) + 1;
-	const exit =
-		restored.state === "closed"
-			? restored.exit
-			: {
-					kind: "stale" as const,
-					message:
-						"Thread was restored from the parent Pi session registry without a live process connection.",
-				};
-
-	const thread: ClosedThread = {
-		state: "closed",
-		id: restored.id,
-		name: restored.name,
-		taskName: restored.taskName,
-		path: restored.path,
-		parentPath: restored.parentPath,
-		parentThreadId: restored.parentThreadId,
-		depth: restored.depth,
-		registrySession: restoredThreadRegistrySession(data, scope),
-		registryGeneration: scope.registryGeneration,
-		archived: restored.archived === true,
-		cwd: restored.cwd,
-		args: [...restored.args],
-		createdAt: restored.createdAt,
-		lastEventAt: restored.lastEventAt,
-		session: restored.session,
-		lastAssistantText: restored.lastAssistantText,
-		recentEvents,
-		nextEventSeq,
-		stderrTail: restored.stderrTail,
-		exit,
-	};
-
-	if (restored.state === "live") {
-		appendThreadEventAt(
-			thread,
-			{ type: "thread_closed", exit },
-			data.entryTimestamp ?? restored.lastEventAt,
-		);
-	}
-	return thread;
-}
-
-function snapshotPair(thread: ManagedThread): {
-	readonly thread: ThreadSnapshot;
-	readonly snapshot: ThreadRuntimeSnapshot;
-} {
-	const threadSnapshot = snapshot(thread);
-	return { thread: threadSnapshot, snapshot: toThreadRuntimeSnapshot(threadSnapshot) };
-}
-
-function normalizeWaitTimeoutMs(timeoutMs: number | undefined): number {
-	if (timeoutMs === undefined) return DEFAULT_WAIT_TIMEOUT_MS;
-	if (Number.isInteger(timeoutMs) && timeoutMs >= 0 && timeoutMs <= MAX_WAIT_TIMEOUT_MS) {
-		return timeoutMs;
-	}
-
-	throw new Error(
-		`Invalid wait timeoutMs: ${timeoutMs}. Repair: set wait.timeoutMs to an integer from 0 to ${MAX_WAIT_TIMEOUT_MS}, or omit it to use ${DEFAULT_WAIT_TIMEOUT_MS}ms.`,
-	);
-}
-
-function snapshot(thread: ManagedThread): ThreadSnapshot {
-	if (thread.state === "closed") {
-		return {
-			state: "closed",
-			id: thread.id,
-			name: thread.name,
-			taskName: thread.taskName,
-			path: thread.path,
-			parentPath: thread.parentPath,
-			parentThreadId: thread.parentThreadId,
-			depth: thread.depth,
-			archived: thread.archived,
-			cwd: thread.cwd,
-			args: [...thread.args],
-			createdAt: thread.createdAt,
-			lastEventAt: thread.lastEventAt,
-			exit: thread.exit,
-			session: thread.session,
-			lastAssistantText: thread.lastAssistantText,
-			recentEvents: [...thread.recentEvents],
-			stderrTail: thread.stderrTail,
-		} satisfies ClosedThreadSnapshot;
-	}
-
-	return {
-		state: "live",
-		id: thread.id,
-		name: thread.name,
-		taskName: thread.taskName,
-		path: thread.path,
-		parentPath: thread.parentPath,
-		parentThreadId: thread.parentThreadId,
-		depth: thread.depth,
-		archived: thread.archived,
-		cwd: thread.cwd,
-		args: [...thread.args],
-		createdAt: thread.createdAt,
-		lastEventAt: thread.lastEventAt,
-		pid: thread.pid,
-		phase: thread.phase,
-		session: thread.session,
-		lastAssistantText: thread.lastAssistantText,
-		lastPartialText: thread.lastPartialText,
-		recentEvents: [...thread.recentEvents],
-		stderrTail: thread.stderrTail,
-	} satisfies LiveThreadSnapshot;
-}
-
-type ThreadEventInput = ThreadEvent extends infer Event
-	? Event extends ThreadEvent
-		? Omit<Event, "seq" | "at">
-		: never
-	: never;
-
-function appendThreadEvent(thread: ThreadBase, event: ThreadEventInput): void {
-	appendThreadEventAt(thread, event, nowIso());
-}
-
-function appendThreadEventAt(thread: ThreadBase, event: ThreadEventInput, at: string): void {
-	const nextEvent = { ...event, seq: thread.nextEventSeq, at } as ThreadEvent;
-	thread.nextEventSeq++;
-	thread.lastEventAt = at;
-	thread.recentEvents.push(nextEvent);
-	if (thread.recentEvents.length > RECENT_EVENT_LIMIT)
-		thread.recentEvents.splice(0, thread.recentEvents.length - RECENT_EVENT_LIMIT);
-}
-
-function appendLaunchThreadEvent(thread: LiveThread, input: LaunchThreadInput, pid: number): void {
-	switch (input.startEvent) {
-		case "thread_started":
-			appendThreadEvent(thread, { type: "thread_started", pid });
-			return;
-		case "thread_resumed":
-			appendThreadEvent(thread, { type: "thread_resumed", pid });
-			return;
-		case "thread_forked":
-			appendThreadEvent(thread, {
-				type: "thread_forked",
-				pid,
-				sourceSessionFile: input.sourceSessionFile ?? "unknown",
-				sourceEntryId: input.sourceEntryId ?? null,
-			});
-			return;
-	}
-}
-
-function recordThreadTurnStarted(thread: LiveThread): void {
-	if (thread.turnOpen) return;
-	thread.turnOpen = true;
-	appendThreadEvent(thread, { type: "turn_started" });
-}
-
-function recordThreadTurnCompleted(thread: LiveThread): void {
-	if (!thread.turnOpen) return;
-	thread.turnOpen = false;
-	appendThreadEvent(thread, { type: "turn_completed" });
-}
-
 function resolveCwd(parentCwd: string, childCwd: string | undefined): string {
 	const cwd = childCwd === undefined ? path.resolve(parentCwd) : path.resolve(parentCwd, childCwd);
 	let stats: fs.Stats;
@@ -2142,277 +1735,67 @@ function resolveCwd(parentCwd: string, childCwd: string | undefined): string {
 	return cwd;
 }
 
-function sameSessionFile(left: string, right: string): boolean {
-	return path.resolve(left) === path.resolve(right);
-}
-
-function setThreadPhase(thread: LiveThread, phase: ThreadPhase): void {
-	if (thread.phase === phase) {
-		if (phase === "idle" && thread.idleStartedAt === null) thread.idleStartedAt = nowIso();
-		return;
+function normalizeWaitTimeoutMs(timeoutMs: number | undefined): number {
+	if (timeoutMs === undefined) return DEFAULT_WAIT_TIMEOUT_MS;
+	if (Number.isInteger(timeoutMs) && timeoutMs >= 0 && timeoutMs <= MAX_WAIT_TIMEOUT_MS) {
+		return timeoutMs;
 	}
 
-	thread.phase = phase;
-	thread.idleStartedAt = phase === "idle" ? nowIso() : null;
-}
-
-function defaultSendMode(phase: ThreadPhase): SendMode {
-	return phase === "idle" ? "prompt" : "follow_up";
-}
-
-function captureSendAcceptanceBaseline(
-	thread: LiveThread,
-	options: { readonly allowActivityFastPath?: boolean } = {},
-): SendAcceptanceBaseline {
-	const pendingMessageCount = getPendingMessageCount(thread);
-	const allowActivityFastPath = options.allowActivityFastPath ?? true;
-	return {
-		phase: thread.phase,
-		activityGeneration: thread.activityGeneration,
-		userMessageStartGeneration: thread.userMessageStartGeneration,
-		pendingMessageCount,
-		allowActivityFastPath:
-			allowActivityFastPath &&
-			thread.phase === "idle" &&
-			thread.awaitingSend === null &&
-			(pendingMessageCount === null || pendingMessageCount === 0),
-	};
-}
-
-function recordAcceptedSend(thread: LiveThread, baseline: SendAcceptanceBaseline): void {
-	const observedUserMessageStart =
-		thread.userMessageStartGeneration > baseline.userMessageStartGeneration;
-	const observedActivity =
-		observedUserMessageStart ||
-		(baseline.allowActivityFastPath && thread.activityGeneration !== baseline.activityGeneration);
-	thread.awaitingSend = {
-		observedActivity,
-		requireObservedActivity: false,
-		ignoreRunActivityUntilIdle: !baseline.allowActivityFastPath && thread.phase !== "idle",
-		idleRefreshCount: 0,
-		idleRefreshesToSettle: baseline.phase === "idle" ? 1 : BUSY_SEND_IDLE_SETTLE_REFRESHES,
-		pendingMessageBaseline: baseline.pendingMessageCount,
-	};
-	if (thread.phase !== "stopping") {
-		if (observedActivity && thread.phase === "idle") {
-			clearObservedSendIfIdle(thread);
-		} else {
-			setThreadPhase(thread, "busy");
-		}
-	}
-}
-
-function recordAcceptedInitialPrompt(thread: LiveThread): void {
-	thread.awaitingSend ??= {
-		observedActivity: false,
-		requireObservedActivity: true,
-		ignoreRunActivityUntilIdle: false,
-		idleRefreshCount: 0,
-		idleRefreshesToSettle: 1,
-		pendingMessageBaseline: getPendingMessageCount(thread),
-	};
-	if (thread.phase !== "stopping") setThreadPhase(thread, "busy");
-}
-
-function recordPromptRunActivity(thread: LiveThread): void {
-	clearPendingInitialPrompt(thread);
-	recordSendActivity(thread);
-}
-
-function clearPendingInitialPrompt(thread: LiveThread): void {
-	thread.pendingInitialPrompt = null;
-}
-
-function recordSendActivity(thread: LiveThread): void {
-	thread.activityGeneration++;
-	// Child-side activity while the thread remains idle should start a fresh
-	// idle-cleanup window without letting parent-side polls extend it.
-	if (thread.phase === "idle") thread.idleStartedAt = nowIso();
-	if (thread.awaitingSend !== null && !thread.awaitingSend.ignoreRunActivityUntilIdle) {
-		thread.awaitingSend.observedActivity = true;
-	}
-}
-
-function allowAwaitingSendRunActivity(thread: LiveThread): void {
-	if (thread.awaitingSend !== null) thread.awaitingSend.ignoreRunActivityUntilIdle = false;
-}
-
-function recordPendingMessageActivity(thread: LiveThread, pendingMessageCount: number): void {
-	const awaitingSend = thread.awaitingSend;
-	if (awaitingSend === null || awaitingSend.observedActivity) return;
-	const baseline = awaitingSend.pendingMessageBaseline;
-	if (baseline === null || pendingMessageCount > baseline) {
-		thread.activityGeneration++;
-		awaitingSend.observedActivity = true;
-		awaitingSend.ignoreRunActivityUntilIdle = false;
-	}
-}
-
-function clearObservedSendIfIdle(thread: LiveThread): void {
-	if (thread.awaitingSend?.observedActivity === true && thread.phase === "idle") {
-		thread.awaitingSend = null;
-	}
-}
-
-function getPendingMessageCount(thread: ManagedThread): number | null {
-	return thread.session.kind === "known" ? thread.session.pendingMessageCount : null;
-}
-
-function hasNoPendingMessages(thread: ManagedThread): boolean {
-	const pendingMessageCount = getPendingMessageCount(thread);
-	return pendingMessageCount === null || pendingMessageCount === 0;
+	throw new Error(
+		`Invalid wait timeoutMs: ${timeoutMs}. Repair: set wait.timeoutMs to an integer from 0 to ${MAX_WAIT_TIMEOUT_MS}, or omit it to use ${DEFAULT_WAIT_TIMEOUT_MS}ms.`,
+	);
 }
 
 function emitWaitProgress(options: WaitOptions, startedAt: number, thread: ManagedThread): void {
 	options.onProgress?.({ waitedMs: Date.now() - startedAt, ...snapshotPair(thread) });
 }
 
-function classifyProcessExit(input: {
-	readonly code: number | null;
-	readonly signal: string | null;
-	readonly stopped: boolean;
-}): ThreadExit {
-	if (input.stopped) return { kind: "stopped", code: input.code, signal: input.signal };
-	if (input.code === 0 && input.signal === null) {
-		return { kind: "exited", code: input.code, signal: input.signal };
-	}
-
-	const details = [
-		input.code === null ? null : `code ${input.code}`,
-		input.signal === null ? null : `signal ${input.signal}`,
-	]
-		.filter((part): part is string => part !== null)
-		.join(", ");
-	return { kind: "failed", message: `Child Pi process exited with ${details || "unknown status"}` };
-}
-
 async function sendMessage(thread: LiveThread, mode: SendMode, message: string) {
 	switch (mode) {
 		case "prompt":
-			return thread.rpc.request({ type: "prompt", message }, RPC_SEND_TIMEOUT_MS);
+			return thread.rpc.request({ type: "prompt", message }, RPC_SEND_TIMEOUT_MS, "send prompt");
 		case "steer":
 			return thread.rpc.request(
 				{ type: "prompt", message, streamingBehavior: "steer" },
 				RPC_SEND_TIMEOUT_MS,
+				"send steer",
 			);
 		case "follow_up":
 			return thread.rpc.request(
 				{ type: "prompt", message, streamingBehavior: "followUp" },
 				RPC_SEND_TIMEOUT_MS,
+				"send follow-up",
 			);
 	}
 }
 
-function shouldLaunchDetachedProcessGroup(): boolean {
-	return process.platform !== "win32";
+const warnedInvalidEnvKeys = new Set<string>();
+
+function warnInvalidEnvOnce(name: string, value: string, reason: string): void {
+	if (warnedInvalidEnvKeys.has(name)) return;
+	warnedInvalidEnvKeys.add(name);
+	console.warn(
+		`[pi-threads] Ignoring invalid ${name}=${JSON.stringify(value)} (${reason}); using default.`,
+	);
 }
 
-async function signalThreadProcessTree(thread: LiveThread, signal: NodeJS.Signals): Promise<void> {
-	if (process.platform === "win32") {
-		if (signal === "SIGKILL") {
-			if (await taskkillWindowsProcessTree(thread.pid)) return;
-		}
-
-		safeKillChild(thread, signal);
-		return;
-	}
-
-	if (thread.processGroupId !== null) {
-		try {
-			process.kill(-thread.processGroupId, signal);
-			return;
-		} catch {
-			// Fall back to the direct child process. Process groups can already be gone
-			// or unavailable under tests/sandboxes; stopping must remain best-effort.
-		}
-	}
-
-	safeKillChild(thread, signal);
-}
-
-function taskkillWindowsProcessTree(pid: number): Promise<boolean> {
-	return new Promise((resolve) => {
-		let settled = false;
-		const finish = (ok: boolean) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			resolve(ok);
-		};
-		const timeout = setTimeout(() => finish(false), STOP_KILL_WAIT_MS);
-		timeout.unref?.();
-
-		try {
-			const taskkill = execFile("taskkill.exe", ["/PID", String(pid), "/T", "/F"], (error) => {
-				finish(error === null);
-			});
-			taskkill.on?.("error", () => finish(false));
-		} catch {
-			finish(false);
-		}
-	});
-}
-
-function safeKillChild(thread: LiveThread, signal: NodeJS.Signals): void {
-	try {
-		thread.child.kill(signal);
-	} catch {
-		// Process cleanup is best-effort; lifecycle code synthesizes a final stopped
-		// snapshot if no close event arrives after the bounded wait.
-	}
-}
-
-function getPiInvocation(args: readonly string[]): {
-	readonly command: string;
-	readonly args: readonly string[];
-} {
-	const currentScript = process.argv[1];
-	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/") ?? false;
-	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
-	}
-
-	const execName = path.basename(process.execPath).toLowerCase();
-	const isGenericRuntime = /^(node|bun)(\.exe)?$/u.test(execName);
-	if (!isGenericRuntime) return { command: process.execPath, args };
-
-	return { command: "pi", args };
-}
-
-function extractAssistantText(message: unknown): string | null {
-	if (!isRecord(message) || message["role"] !== "assistant") return null;
-	const content = message["content"];
-	if (!Array.isArray(content)) return null;
-
-	const parts: string[] = [];
-	for (const part of content) {
-		if (!isRecord(part) || part["type"] !== "text") continue;
-		const text = stringField(part, "text");
-		if (text !== null) parts.push(text);
-	}
-
-	return parts.length === 0 ? null : parts.join("\n");
-}
-
-function isUserMessage(message: unknown): boolean {
-	return isRecord(message) && message["role"] === "user";
-}
-
-function tail(text: string, maxBytes: number): string {
-	const bytes = Buffer.byteLength(text, "utf8");
-	if (bytes <= maxBytes) return text;
-
-	let result = text.slice(-maxBytes);
-	while (Buffer.byteLength(result, "utf8") > maxBytes) result = result.slice(1);
-	return `[truncated ${bytes - Buffer.byteLength(result, "utf8")} bytes]\n${result}`;
-}
-
-function readInteger(value: string | undefined, fallback: number): number {
+function readInteger(value: string | undefined, fallback: number, name?: string): number {
 	if (value === undefined) return fallback;
 	// Reject partial parses such as "5x" instead of silently reading them as 5.
-	if (!/^\d+$/u.test(value.trim())) return fallback;
+	if (!/^\d+$/u.test(value.trim())) {
+		if (name !== undefined) {
+			warnInvalidEnvOnce(name, value, "expected a non-negative integer");
+		}
+		return fallback;
+	}
 	const parsed = Number.parseInt(value, 10);
-	return Number.isSafeInteger(parsed) ? parsed : fallback;
+	if (!Number.isSafeInteger(parsed)) {
+		if (name !== undefined) {
+			warnInvalidEnvOnce(name, value, "expected a safe integer");
+		}
+		return fallback;
+	}
+	return parsed;
 }
 
 function isoTimeMs(value: string): number {
@@ -2420,20 +1803,30 @@ function isoTimeMs(value: string): number {
 	return Number.isFinite(parsed) ? parsed : Date.now();
 }
 
-function readOptionalThreadId(value: string | undefined): ThreadId | null {
+function readOptionalThreadId(value: string | undefined, name?: string): ThreadId | null {
 	if (value === undefined || value === "") return null;
 	try {
 		return asThreadId(value);
 	} catch {
+		if (name !== undefined) {
+			warnInvalidEnvOnce(name, value, "expected a thread id like thread_<12 hex chars>");
+		}
 		return null;
 	}
 }
 
-function readThreadPath(value: string | undefined, fallback: ThreadPath): ThreadPath {
+function readThreadPath(
+	value: string | undefined,
+	fallback: ThreadPath,
+	name?: string,
+): ThreadPath {
 	if (value === undefined || value === "") return fallback;
 	try {
 		return asThreadPath(value);
 	} catch {
+		if (name !== undefined) {
+			warnInvalidEnvOnce(name, value, "expected a canonical thread path like /root/task");
+		}
 		return fallback;
 	}
 }
