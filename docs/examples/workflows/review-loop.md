@@ -1,6 +1,6 @@
 # Example workflow: review loop
 
-This is a user-authored pattern, not a built-in `pi-threads` role or preset.
+This is a user-authored pattern, not a built-in `pi-dispatch` role or preset.
 
 Use it when the parent has a draft, patch, or plan and wants an isolated second
 pass before finalizing.

@@ -1,7 +1,7 @@
-# pi-threads
+# pi-dispatch
 
-[![CI](https://github.com/phongndo/pi-threads/actions/workflows/ci.yml/badge.svg)](https://github.com/phongndo/pi-threads/actions/workflows/ci.yml)
-[![npm](https://img.shields.io/npm/v/%40phongndo%2Fpi-threads)](https://www.npmjs.com/package/@phongndo/pi-threads)
+[![CI](https://github.com/phongndo/pi-dispatch/actions/workflows/ci.yml/badge.svg)](https://github.com/phongndo/pi-dispatch/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/%40phongndo%2Fpi-dispatch)](https://www.npmjs.com/package/@phongndo/pi-dispatch)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Let your Pi agent create **dynamic workflows on its own** — delegating, reviewing, or parallelizing work as it sees fit, with no hard-coded workflow graph.
@@ -23,7 +23,7 @@ templates, or extension policy when they want Pi to use threads more
 aggressively.
 
 There is no fixed planner/reviewer/worker graph and no built-in agent profile
-system. `pi-threads` exposes thread capability; orchestration style belongs to
+system. `pi-dispatch` exposes thread capability; orchestration style belongs to
 the user.
 
 ## What Pi can do with threads
@@ -205,7 +205,7 @@ session file whose header records Pi's native `parentSession` metadata. `resume`
 reopens that saved session without sending a hidden prompt. `fork` uses Pi's
 session tree APIs and starts the forked session without an implicit kickoff
 message; send an explicit `send` action if the fork should continue with a new
-instruction. `archive` is only a pi-threads visibility state and never deletes
+instruction. `archive` is only a pi-dispatch visibility state and never deletes
 the underlying Pi session file.
 
 ## Installation
@@ -218,40 +218,40 @@ Requirements:
 From npm:
 
 ```bash
-pi install npm:@phongndo/pi-threads
+pi install npm:@phongndo/pi-dispatch
 ```
 
 To try it for one Pi run without installing:
 
 ```bash
-pi -e npm:@phongndo/pi-threads
+pi -e npm:@phongndo/pi-dispatch
 ```
 
 For a project-local/team install, run from the project root:
 
 ```bash
-pi install -l npm:@phongndo/pi-threads
+pi install -l npm:@phongndo/pi-dispatch
 ```
 
 From a local checkout during development:
 
 ```bash
-pi install /path/to/pi-threads
+pi install /path/to/pi-dispatch
 ```
 
 ## Configuration
 
-| Variable                     | Default | Purpose                                                   |
-| ---------------------------- | ------- | --------------------------------------------------------- |
-| `PI_THREADS_MAX_DEPTH`       | `2`     | How deep threads can spawn threads.                       |
-| `PI_THREADS_MAX_THREADS`     | `8`     | Max concurrent live threads per parent.                   |
-| `PI_THREADS_IDLE_CLEANUP_MS` | `0`     | Stop idle live children after this many ms; 0 disables.   |
-| `PI_THREADS_LIVE_TIMEOUT_MS` | `0`     | Stop live children after this total lifetime; 0 disables. |
+| Variable                      | Default | Purpose                                                   |
+| ----------------------------- | ------- | --------------------------------------------------------- |
+| `PI_DISPATCH_MAX_DEPTH`       | `2`     | How deep threads can spawn threads.                       |
+| `PI_DISPATCH_MAX_THREADS`     | `8`     | Max concurrent live threads per parent.                   |
+| `PI_DISPATCH_IDLE_CLEANUP_MS` | `0`     | Stop idle live children after this many ms; 0 disables.   |
+| `PI_DISPATCH_LIVE_TIMEOUT_MS` | `0`     | Stop live children after this total lifetime; 0 disables. |
 
 ## Safety
 
 - Threads are stopped when the parent Pi session exits; on POSIX systems
-  `pi-threads` launches children in their own process group so normal stop and
+  `pi-dispatch` launches children in their own process group so normal stop and
   force-stop can clean up descendant processes too. Windows force-stop uses
   `taskkill /T /F` as a best-effort process-tree cleanup.
 - Interactive prompts (dialogs, confirmations) in headless threads are auto-cancelled.

@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible problem in pi-threads.
+description: Report a reproducible problem in pi-dispatch.
 title: "bug: "
 labels: [bug]
 body:
@@ -10,7 +10,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: pi-threads version
+      label: pi-dispatch version
       description: npm version or commit SHA.
       placeholder: "0.2.2"
     validations:
@@ -39,7 +39,7 @@ body:
       label: Reproduction steps
       description: Include the command, tool call, prompt, or minimal repository setup that triggers the problem.
       placeholder: |
-        1. Run `pi -e npm:@phongndo/pi-threads`
+        1. Run `pi -e npm:@phongndo/pi-dispatch`
         2. Ask Pi to start a thread with ...
         3. Observe ...
     validations:

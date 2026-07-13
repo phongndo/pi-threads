@@ -424,7 +424,7 @@ describe("thread tool structured details", () => {
 
 describe("thread registry persistence", () => {
 	it("writes non-current snapshots to their owning session file", () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-index-registry-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-index-registry-"));
 		try {
 			const ownerSessionFile = path.join(root, "owner.jsonl");
 			writeSessionHeader(ownerSessionFile, "session-root", root);
@@ -617,11 +617,11 @@ describe("session shutdown thread lifecycle", () => {
 		// child-session switch: still bound to the child path, then cleared on the way
 		// back to root before the first list/sync of the root session.
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "session-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "session-root",
 		} as NodeJS.ProcessEnv);
 		manager.rebindScope({
 			currentPath: alpha.path,

@@ -9,7 +9,7 @@ Security fixes are handled for the latest published npm version and the current
 
 Please report vulnerabilities privately through GitHub Security Advisories:
 
-<https://github.com/phongndo/pi-threads/security/advisories/new>
+<https://github.com/phongndo/pi-dispatch/security/advisories/new>
 
 If the advisory form is unavailable, contact the maintainer through
 <https://github.com/phongndo> and avoid posting exploit details in a public

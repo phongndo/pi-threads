@@ -84,7 +84,7 @@ No changes yet.
 - Repository community health documentation: contributing guide, security policy,
   code of conduct, issue templates, and pull request template.
 - README links for project quality, support, security, and license information.
-- Optional `PI_THREADS_IDLE_CLEANUP_MS` and `PI_THREADS_LIVE_TIMEOUT_MS` safety
+- Optional `PI_DISPATCH_IDLE_CLEANUP_MS` and `PI_DISPATCH_LIVE_TIMEOUT_MS` safety
   controls for stale live children.
 
 ### Changed

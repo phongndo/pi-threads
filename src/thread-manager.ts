@@ -240,15 +240,15 @@ export class ThreadManager {
 	#cleanupInFlight: Promise<void> | null = null;
 
 	constructor(environment: NodeJS.ProcessEnv = process.env) {
-		const baseDepth = readInteger(environment["PI_THREADS_DEPTH"], 0, "PI_THREADS_DEPTH");
+		const baseDepth = readInteger(environment["PI_DISPATCH_DEPTH"], 0, "PI_DISPATCH_DEPTH");
 		const baseSelfThreadId = readOptionalThreadId(
-			environment["PI_THREADS_SELF_ID"],
-			"PI_THREADS_SELF_ID",
+			environment["PI_DISPATCH_SELF_ID"],
+			"PI_DISPATCH_SELF_ID",
 		);
 		const baseCurrentPath = readThreadPath(
-			environment["PI_THREADS_PATH"],
+			environment["PI_DISPATCH_PATH"],
 			ROOT_THREAD_PATH,
-			"PI_THREADS_PATH",
+			"PI_DISPATCH_PATH",
 		);
 		this.#baseScope = {
 			currentPath: baseCurrentPath,
@@ -257,28 +257,28 @@ export class ThreadManager {
 		};
 		this.#depth = baseDepth;
 		this.#maxDepth = readInteger(
-			environment["PI_THREADS_MAX_DEPTH"],
+			environment["PI_DISPATCH_MAX_DEPTH"],
 			DEFAULT_MAX_DEPTH,
-			"PI_THREADS_MAX_DEPTH",
+			"PI_DISPATCH_MAX_DEPTH",
 		);
 		this.#maxThreads = readInteger(
-			environment["PI_THREADS_MAX_THREADS"],
+			environment["PI_DISPATCH_MAX_THREADS"],
 			DEFAULT_MAX_THREADS,
-			"PI_THREADS_MAX_THREADS",
+			"PI_DISPATCH_MAX_THREADS",
 		);
 		this.#idleCleanupMs = readInteger(
-			environment["PI_THREADS_IDLE_CLEANUP_MS"],
+			environment["PI_DISPATCH_IDLE_CLEANUP_MS"],
 			DEFAULT_IDLE_CLEANUP_MS,
-			"PI_THREADS_IDLE_CLEANUP_MS",
+			"PI_DISPATCH_IDLE_CLEANUP_MS",
 		);
 		this.#liveTimeoutMs = readInteger(
-			environment["PI_THREADS_LIVE_TIMEOUT_MS"],
+			environment["PI_DISPATCH_LIVE_TIMEOUT_MS"],
 			DEFAULT_LIVE_TIMEOUT_MS,
-			"PI_THREADS_LIVE_TIMEOUT_MS",
+			"PI_DISPATCH_LIVE_TIMEOUT_MS",
 		);
 		this.#selfThreadId = baseSelfThreadId;
 		this.#currentPath = baseCurrentPath;
-		this.#rootSessionId = environment["PI_THREADS_ROOT_SESSION_ID"] ?? `root_${process.pid}`;
+		this.#rootSessionId = environment["PI_DISPATCH_ROOT_SESSION_ID"] ?? `root_${process.pid}`;
 	}
 
 	setPersistence(persistence: ThreadRegistryPersistence): void {
@@ -868,19 +868,19 @@ export class ThreadManager {
 		const invocation = getPiInvocation(argv);
 		const childEnvironment = {
 			...process.env,
-			PI_THREADS_DEPTH: String(input.depth),
-			PI_THREADS_MAX_DEPTH: String(this.#maxDepth),
-			PI_THREADS_MAX_THREADS: String(this.#maxThreads),
-			PI_THREADS_IDLE_CLEANUP_MS: String(this.#idleCleanupMs),
-			PI_THREADS_LIVE_TIMEOUT_MS: String(this.#liveTimeoutMs),
-			PI_THREADS_SELF_ID: input.id,
+			PI_DISPATCH_DEPTH: String(input.depth),
+			PI_DISPATCH_MAX_DEPTH: String(this.#maxDepth),
+			PI_DISPATCH_MAX_THREADS: String(this.#maxThreads),
+			PI_DISPATCH_IDLE_CLEANUP_MS: String(this.#idleCleanupMs),
+			PI_DISPATCH_LIVE_TIMEOUT_MS: String(this.#liveTimeoutMs),
+			PI_DISPATCH_SELF_ID: input.id,
 			// Canonical parent id for child processes.
-			PI_THREADS_PARENT_ID: input.parentThreadId ?? "",
-			// Compatibility alias of PI_THREADS_PARENT_ID (same value). Prefer PARENT_ID for new readers.
-			PI_THREADS_PARENT_THREAD_ID: input.parentThreadId ?? "",
-			PI_THREADS_PARENT_PATH: input.parentPath,
-			PI_THREADS_PATH: input.path,
-			PI_THREADS_ROOT_SESSION_ID: this.#rootSessionId,
+			PI_DISPATCH_PARENT_ID: input.parentThreadId ?? "",
+			// Compatibility alias of PI_DISPATCH_PARENT_ID (same value). Prefer PARENT_ID for new readers.
+			PI_DISPATCH_PARENT_THREAD_ID: input.parentThreadId ?? "",
+			PI_DISPATCH_PARENT_PATH: input.parentPath,
+			PI_DISPATCH_PATH: input.path,
+			PI_DISPATCH_ROOT_SESSION_ID: this.#rootSessionId,
 		};
 
 		let child: ChildProcessWithoutNullStreams;
@@ -1146,7 +1146,7 @@ export class ThreadManager {
 	#assertStartAllowed(scope: ThreadManagerScope): void {
 		if (scope.depth >= this.#maxDepth) {
 			throw new Error(
-				`pi-threads recursion depth ${scope.depth} has reached PI_THREADS_MAX_DEPTH=${this.#maxDepth}`,
+				`pi-dispatch recursion depth ${scope.depth} has reached PI_DISPATCH_MAX_DEPTH=${this.#maxDepth}`,
 			);
 		}
 
@@ -1154,7 +1154,7 @@ export class ThreadManager {
 			(thread) => thread.state === "live",
 		).length;
 		if (liveCount >= this.#maxThreads) {
-			throw new Error(`pi-threads live thread limit reached: ${liveCount}/${this.#maxThreads}`);
+			throw new Error(`pi-dispatch live thread limit reached: ${liveCount}/${this.#maxThreads}`);
 		}
 	}
 
@@ -1251,7 +1251,7 @@ export class ThreadManager {
 		const existing = this.#findByPath(threadPath);
 		if (existing) {
 			throw new Error(
-				`Thread path already exists: ${threadPath} (id: ${existing.id}). Repair: choose a unique start.taskName for this parent, or omit taskName so pi-threads generates a unique lower_snake_case path segment.`,
+				`Thread path already exists: ${threadPath} (id: ${existing.id}). Repair: choose a unique start.taskName for this parent, or omit taskName so pi-dispatch generates a unique lower_snake_case path segment.`,
 			);
 		}
 	}
@@ -1775,7 +1775,7 @@ function warnInvalidEnvOnce(name: string, value: string, reason: string): void {
 	if (warnedInvalidEnvKeys.has(name)) return;
 	warnedInvalidEnvKeys.add(name);
 	console.warn(
-		`[pi-threads] Ignoring invalid ${name}=${JSON.stringify(value)} (${reason}); using default.`,
+		`[pi-dispatch] Ignoring invalid ${name}=${JSON.stringify(value)} (${reason}); using default.`,
 	);
 }
 

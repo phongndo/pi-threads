@@ -83,7 +83,7 @@ function waitForExit(
 
 describe("H5 SessionManager dual-writer registry visibility", () => {
 	it("makes concurrent open()+appendCustomEntry writers invisible to each other's getBranch()", () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-h5-dual-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-h5-dual-"));
 		try {
 			const sessionDir = path.join(root, "sessions");
 			const writerA = flushSessionWithAssistant(root, sessionDir);
@@ -122,10 +122,10 @@ describe("H5 SessionManager dual-writer registry visibility", () => {
 	});
 
 	it("hides a cross-open appendCustomEntry behind a later live-session append on getBranch()", () => {
-		// Mirrors pi-threads cross-session persistence:
+		// Mirrors pi-dispatch cross-session persistence:
 		// SessionManager.open(target.sessionFile).appendCustomEntry(...) while the live
 		// SessionManager continues appending on its own leaf pointer.
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-h5-cross-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-h5-cross-"));
 		try {
 			const sessionDir = path.join(root, "sessions");
 			const live = flushSessionWithAssistant(root, sessionDir);
@@ -170,7 +170,7 @@ describe("H5 Pi RPC orphan / stdin EOF", () => {
 		"exits a Pi RPC child after the parent is SIGKILL'd (pipe EOF)",
 		async () => {
 			const statusPath = path.join(
-				fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-h5-sigkill-")),
+				fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-h5-sigkill-")),
 				"status.json",
 			);
 			const parentScript = `

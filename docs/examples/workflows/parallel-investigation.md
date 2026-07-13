@@ -1,6 +1,6 @@
 # Example workflow: parallel investigation
 
-This is a user-authored pattern, not a built-in `pi-threads` role or preset.
+This is a user-authored pattern, not a built-in `pi-dispatch` role or preset.
 
 Use it when several independent questions can be answered in parallel and the
 parent can merge the findings.

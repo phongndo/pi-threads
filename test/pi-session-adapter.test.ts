@@ -14,7 +14,7 @@ import { PI_THREAD_REGISTRY_ENTRY_TYPE } from "../src/thread-registry.ts";
 
 describe("pi-session-adapter materialization", () => {
 	it("falls back to manual file write when SessionManager has no _rewriteFile", () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-materialize-fallback-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-materialize-fallback-"));
 		try {
 			const sessionFile = path.join(root, "sessions", "manual.jsonl");
 			const header = {
@@ -58,7 +58,7 @@ describe("pi-session-adapter materialization", () => {
 	});
 
 	it("is a no-op when the session file already exists", () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-materialize-exists-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-materialize-exists-"));
 		try {
 			const sessionFile = path.join(root, "already.jsonl");
 			fs.writeFileSync(sessionFile, '{"type":"session"}\n', "utf8");
@@ -124,7 +124,7 @@ describe("pi-session-adapter safe getters", () => {
 
 describe("pi-session-adapter appendCustomEntry", () => {
 	it("appends a custom entry through SessionManager.open", () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-append-custom-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-append-custom-"));
 		try {
 			const sessionFile = path.join(root, "owner.jsonl");
 			fs.writeFileSync(

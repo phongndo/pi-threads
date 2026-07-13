@@ -108,11 +108,11 @@ async function withPlatform<T>(
 
 function managerEnvironment(): NodeJS.ProcessEnv {
 	return {
-		PI_THREADS_DEPTH: "0",
-		PI_THREADS_MAX_DEPTH: "2",
-		PI_THREADS_MAX_THREADS: "8",
-		PI_THREADS_PATH: "/root",
-		PI_THREADS_ROOT_SESSION_ID: "test-root",
+		PI_DISPATCH_DEPTH: "0",
+		PI_DISPATCH_MAX_DEPTH: "2",
+		PI_DISPATCH_MAX_THREADS: "8",
+		PI_DISPATCH_PATH: "/root",
+		PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 	} as NodeJS.ProcessEnv;
 }
 
@@ -286,18 +286,18 @@ describe("ThreadManager session metadata", () => {
 		try {
 			const first = new ThreadManager({
 				...managerEnvironment(),
-				PI_THREADS_MAX_THREADS: "not-a-number",
+				PI_DISPATCH_MAX_THREADS: "not-a-number",
 			});
 			const second = new ThreadManager({
 				...managerEnvironment(),
-				PI_THREADS_MAX_THREADS: "also-bad",
+				PI_DISPATCH_MAX_THREADS: "also-bad",
 			});
 
 			expect(first.list({ action: "list" })).toEqual([]);
 			expect(second.list({ action: "list" })).toEqual([]);
 			expect(warn).toHaveBeenCalledTimes(1);
 			expect(warn).toHaveBeenCalledWith(
-				expect.stringContaining('Ignoring invalid PI_THREADS_MAX_THREADS="not-a-number"'),
+				expect.stringContaining('Ignoring invalid PI_DISPATCH_MAX_THREADS="not-a-number"'),
 			);
 		} finally {
 			warn.mockRestore();
@@ -436,7 +436,7 @@ describe("ThreadManager session metadata", () => {
 	it("keeps the per-session live thread concurrency limit", async () => {
 		const manager = new ThreadManager({
 			...managerEnvironment(),
-			PI_THREADS_MAX_THREADS: "1",
+			PI_DISPATCH_MAX_THREADS: "1",
 		});
 		mockResponsiveChild("session-alpha");
 
@@ -444,9 +444,9 @@ describe("ThreadManager session metadata", () => {
 
 		await expect(
 			manager.start({ action: "start", prompt: "two", taskName: "beta" }, context()),
-		).rejects.toThrow(/pi-threads live thread limit reached: 1\/1/u);
+		).rejects.toThrow(/pi-dispatch live thread limit reached: 1\/1/u);
 		await expect(manager.fork({ action: "fork" }, context())).rejects.toThrow(
-			/pi-threads live thread limit reached: 1\/1/u,
+			/pi-dispatch live thread limit reached: 1\/1/u,
 		);
 		expect(spawnMock).toHaveBeenCalledTimes(1);
 
@@ -481,8 +481,8 @@ describe("ThreadManager session metadata", () => {
 			});
 			const manager = new ThreadManager({
 				...managerEnvironment(),
-				PI_THREADS_MAX_THREADS: "1",
-				PI_THREADS_LIVE_TIMEOUT_MS: "1000",
+				PI_DISPATCH_MAX_THREADS: "1",
+				PI_DISPATCH_LIVE_TIMEOUT_MS: "1000",
 			});
 
 			await manager.start({ action: "start", prompt: "old", taskName: "old" }, context());
@@ -542,8 +542,8 @@ describe("ThreadManager session metadata", () => {
 			});
 			const manager = new ThreadManager({
 				...managerEnvironment(),
-				PI_THREADS_MAX_THREADS: "2",
-				PI_THREADS_LIVE_TIMEOUT_MS: "1000",
+				PI_DISPATCH_MAX_THREADS: "2",
+				PI_DISPATCH_LIVE_TIMEOUT_MS: "1000",
 			});
 
 			await manager.start({ action: "start", prompt: "first", taskName: "first" }, context());
@@ -583,21 +583,21 @@ describe("ThreadManager session metadata", () => {
 	it("keeps the recursive thread depth limit", async () => {
 		const manager = new ThreadManager({
 			...managerEnvironment(),
-			PI_THREADS_DEPTH: "2",
-			PI_THREADS_MAX_DEPTH: "2",
+			PI_DISPATCH_DEPTH: "2",
+			PI_DISPATCH_MAX_DEPTH: "2",
 		});
 
 		await expect(
 			manager.start({ action: "start", prompt: "too deep", taskName: "too_deep" }, context()),
-		).rejects.toThrow(/recursion depth 2 has reached PI_THREADS_MAX_DEPTH=2/u);
+		).rejects.toThrow(/recursion depth 2 has reached PI_DISPATCH_MAX_DEPTH=2/u);
 		await expect(manager.fork({ action: "fork" }, context())).rejects.toThrow(
-			/recursion depth 2 has reached PI_THREADS_MAX_DEPTH=2/u,
+			/recursion depth 2 has reached PI_DISPATCH_MAX_DEPTH=2/u,
 		);
 		expect(spawnMock).not.toHaveBeenCalled();
 	});
 
 	it("auto-generates task names from display names when taskName is omitted", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-default-cwd-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-default-cwd-"));
 		try {
 			const manager = new ThreadManager(managerEnvironment());
 			mockResponsiveChild("session-review-api");
@@ -655,7 +655,7 @@ describe("ThreadManager session metadata", () => {
 	});
 
 	it("validates child cwd exists and is a directory", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-cwd-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-cwd-"));
 		try {
 			const filePath = path.join(root, "file.txt");
 			fs.writeFileSync(filePath, "not a directory");
@@ -703,11 +703,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start({ action: "start", prompt: "finish", taskName: "quick" }, context());
@@ -1120,7 +1120,7 @@ describe("ThreadManager session metadata", () => {
 	});
 
 	it("keeps background persistence bound to the thread owner's session after switches", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-owner-session-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-owner-session-"));
 		try {
 			const rootSessionFile = path.join(root, "root.jsonl");
 			const manager = new ThreadManager(managerEnvironment());
@@ -1185,14 +1185,14 @@ describe("ThreadManager session metadata", () => {
 
 	it("keeps starts bound to the captured registry owner when cleanup awaits", async () => {
 		vi.useFakeTimers();
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-cleanup-owner-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-cleanup-owner-"));
 		try {
 			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
 			const rootSessionFile = path.join(root, "root.jsonl");
 			const otherSessionFile = path.join(root, "other.jsonl");
 			const manager = new ThreadManager({
 				...managerEnvironment(),
-				PI_THREADS_LIVE_TIMEOUT_MS: "1",
+				PI_DISPATCH_LIVE_TIMEOUT_MS: "1",
 			});
 			const writes: Array<{
 				readonly path: string;
@@ -1627,7 +1627,7 @@ describe("ThreadManager session metadata", () => {
 	});
 
 	it("pre-creates child Pi sessions with native parentSession metadata", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-parent-session-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-parent-session-"));
 		try {
 			const parentSessionFile = path.join(root, "parent.jsonl");
 			const sessionDir = path.join(root, "sessions");
@@ -1677,7 +1677,7 @@ describe("ThreadManager session metadata", () => {
 	});
 
 	it("materializes an unflushed current Pi session before forking it", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-current-fork-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-current-fork-"));
 		try {
 			const sessionDir = path.join(root, "sessions");
 			const sessionManager = SessionManager.create(root, sessionDir);
@@ -1742,7 +1742,7 @@ describe("ThreadManager session metadata", () => {
 	});
 
 	it("validates fork inputs before materializing fork session files", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-invalid-fork-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-invalid-fork-"));
 		try {
 			const sessionDir = path.join(root, "sessions");
 			const sessionManager = SessionManager.create(root, sessionDir);
@@ -1802,7 +1802,7 @@ describe("ThreadManager session metadata", () => {
 	});
 
 	it("resumes saved sessions without sending an implicit prompt", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-resume-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-resume-"));
 		try {
 			const sessionFile = path.join(root, "child.jsonl");
 			writeSessionHeader(sessionFile, "session-child", root);
@@ -1871,7 +1871,7 @@ describe("ThreadManager session metadata", () => {
 	});
 
 	it("coalesces overlapping resume calls for the same closed thread", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-resume-race-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-resume-race-"));
 		try {
 			const sessionFile = path.join(root, "child.jsonl");
 			writeSessionHeader(sessionFile, "session-child", root);
@@ -1936,7 +1936,7 @@ describe("ThreadManager session metadata", () => {
 	});
 
 	it("unarchives resumed sessions so live work remains visible", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-resume-archive-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-resume-archive-"));
 		try {
 			const sessionFile = path.join(root, "child.jsonl");
 			writeSessionHeader(sessionFile, "session-child", root);
@@ -1999,7 +1999,7 @@ describe("ThreadManager session metadata", () => {
 	});
 
 	it("archives completed threads as visibility state without deleting session files", () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-archive-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-archive-"));
 		try {
 			const sessionFile = path.join(root, "child.jsonl");
 			writeSessionHeader(sessionFile, "session-child", root);
@@ -2064,11 +2064,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "3",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "3",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 		manager.rebindScope({
 			currentPath: asThreadPath("/root/alpha"),
@@ -2089,10 +2089,10 @@ describe("ThreadManager session metadata", () => {
 			expect.any(Array),
 			expect.objectContaining({
 				env: expect.objectContaining({
-					PI_THREADS_DEPTH: "2",
-					PI_THREADS_PARENT_ID: "thread_aaaaaaaaaaaa",
-					PI_THREADS_PARENT_PATH: "/root/alpha",
-					PI_THREADS_PATH: "/root/alpha/beta",
+					PI_DISPATCH_DEPTH: "2",
+					PI_DISPATCH_PARENT_ID: "thread_aaaaaaaaaaaa",
+					PI_DISPATCH_PARENT_PATH: "/root/alpha",
+					PI_DISPATCH_PATH: "/root/alpha/beta",
 				}),
 			}),
 		);
@@ -2101,7 +2101,7 @@ describe("ThreadManager session metadata", () => {
 	it("captures start scope before cleanup yields", async () => {
 		const manager = new ThreadManager({
 			...managerEnvironment(),
-			PI_THREADS_MAX_DEPTH: "3",
+			PI_DISPATCH_MAX_DEPTH: "3",
 		});
 		manager.rebindScope({
 			currentPath: asThreadPath("/root/alpha"),
@@ -2131,16 +2131,16 @@ describe("ThreadManager session metadata", () => {
 			expect.any(Array),
 			expect.objectContaining({
 				env: expect.objectContaining({
-					PI_THREADS_PARENT_ID: "thread_aaaaaaaaaaaa",
-					PI_THREADS_PARENT_PATH: "/root/alpha",
-					PI_THREADS_PATH: "/root/alpha/child",
+					PI_DISPATCH_PARENT_ID: "thread_aaaaaaaaaaaa",
+					PI_DISPATCH_PARENT_PATH: "/root/alpha",
+					PI_DISPATCH_PATH: "/root/alpha/child",
 				}),
 			}),
 		);
 	});
 
 	it("captures fork scope and source before cleanup yields", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-fork-scope-race-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-fork-scope-race-"));
 		try {
 			const alphaSessionFile = path.join(root, "alpha-source.jsonl");
 			const betaSessionFile = path.join(root, "beta-source.jsonl");
@@ -2170,7 +2170,7 @@ describe("ThreadManager session metadata", () => {
 			});
 			const manager = new ThreadManager({
 				...managerEnvironment(),
-				PI_THREADS_MAX_DEPTH: "3",
+				PI_DISPATCH_MAX_DEPTH: "3",
 			});
 			manager.hydrateFromSession({
 				sessionManager: {
@@ -2206,7 +2206,7 @@ describe("ThreadManager session metadata", () => {
 	});
 
 	it("captures resume depth before cleanup yields", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-resume-scope-race-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-resume-scope-race-"));
 		try {
 			const sessionFile = path.join(root, "alpha.jsonl");
 			writeSessionHeader(sessionFile, "session-alpha", root);
@@ -2220,7 +2220,7 @@ describe("ThreadManager session metadata", () => {
 			});
 			const manager = new ThreadManager({
 				...managerEnvironment(),
-				PI_THREADS_MAX_DEPTH: "2",
+				PI_DISPATCH_MAX_DEPTH: "2",
 			});
 			manager.hydrateFromSession({
 				sessionManager: { getBranch: () => [registryEntry(snapshot)] },
@@ -2256,18 +2256,18 @@ describe("ThreadManager session metadata", () => {
 	});
 
 	it("propagates cleanup limits from the manager environment to children", async () => {
-		const previousIdleCleanupMs = process.env["PI_THREADS_IDLE_CLEANUP_MS"];
-		const previousLiveTimeoutMs = process.env["PI_THREADS_LIVE_TIMEOUT_MS"];
+		const previousIdleCleanupMs = process.env["PI_DISPATCH_IDLE_CLEANUP_MS"];
+		const previousLiveTimeoutMs = process.env["PI_DISPATCH_LIVE_TIMEOUT_MS"];
 		let manager: InstanceType<typeof ThreadManager> | null = null;
-		process.env["PI_THREADS_IDLE_CLEANUP_MS"] = "111";
-		process.env["PI_THREADS_LIVE_TIMEOUT_MS"] = "222";
+		process.env["PI_DISPATCH_IDLE_CLEANUP_MS"] = "111";
+		process.env["PI_DISPATCH_LIVE_TIMEOUT_MS"] = "222";
 
 		try {
 			mockResponsiveChild("session-cleanup-env");
 			manager = new ThreadManager({
 				...managerEnvironment(),
-				PI_THREADS_IDLE_CLEANUP_MS: "3333",
-				PI_THREADS_LIVE_TIMEOUT_MS: "4444",
+				PI_DISPATCH_IDLE_CLEANUP_MS: "3333",
+				PI_DISPATCH_LIVE_TIMEOUT_MS: "4444",
 			});
 
 			await manager.start(
@@ -2280,17 +2280,17 @@ describe("ThreadManager session metadata", () => {
 				expect.any(Array),
 				expect.objectContaining({
 					env: expect.objectContaining({
-						PI_THREADS_IDLE_CLEANUP_MS: "3333",
-						PI_THREADS_LIVE_TIMEOUT_MS: "4444",
+						PI_DISPATCH_IDLE_CLEANUP_MS: "3333",
+						PI_DISPATCH_LIVE_TIMEOUT_MS: "4444",
 					}),
 				}),
 			);
 		} finally {
 			await manager?.shutdown();
-			if (previousIdleCleanupMs === undefined) delete process.env["PI_THREADS_IDLE_CLEANUP_MS"];
-			else process.env["PI_THREADS_IDLE_CLEANUP_MS"] = previousIdleCleanupMs;
-			if (previousLiveTimeoutMs === undefined) delete process.env["PI_THREADS_LIVE_TIMEOUT_MS"];
-			else process.env["PI_THREADS_LIVE_TIMEOUT_MS"] = previousLiveTimeoutMs;
+			if (previousIdleCleanupMs === undefined) delete process.env["PI_DISPATCH_IDLE_CLEANUP_MS"];
+			else process.env["PI_DISPATCH_IDLE_CLEANUP_MS"] = previousIdleCleanupMs;
+			if (previousLiveTimeoutMs === undefined) delete process.env["PI_DISPATCH_LIVE_TIMEOUT_MS"];
+			else process.env["PI_DISPATCH_LIVE_TIMEOUT_MS"] = previousLiveTimeoutMs;
 		}
 	});
 
@@ -2339,11 +2339,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start(
@@ -2510,11 +2510,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 		await manager.start({ action: "start", prompt: "work", taskName: "alpha" }, context());
 
@@ -2533,7 +2533,7 @@ describe("ThreadManager session metadata", () => {
 			const child = mockResponsiveChild("session-idle-cleanup");
 			const manager = new ThreadManager({
 				...managerEnvironment(),
-				PI_THREADS_IDLE_CLEANUP_MS: "1000",
+				PI_DISPATCH_IDLE_CLEANUP_MS: "1000",
 			});
 
 			await manager.start(
@@ -2582,7 +2582,7 @@ describe("ThreadManager session metadata", () => {
 			});
 			const manager = new ThreadManager({
 				...managerEnvironment(),
-				PI_THREADS_IDLE_CLEANUP_MS: "1000",
+				PI_DISPATCH_IDLE_CLEANUP_MS: "1000",
 			});
 
 			await manager.start(
@@ -2659,7 +2659,7 @@ describe("ThreadManager session metadata", () => {
 			});
 			const manager = new ThreadManager({
 				...managerEnvironment(),
-				PI_THREADS_IDLE_CLEANUP_MS: "1000",
+				PI_DISPATCH_IDLE_CLEANUP_MS: "1000",
 			});
 
 			await manager.start(
@@ -2732,7 +2732,7 @@ describe("ThreadManager session metadata", () => {
 			});
 			const manager = new ThreadManager({
 				...managerEnvironment(),
-				PI_THREADS_IDLE_CLEANUP_MS: "1000",
+				PI_DISPATCH_IDLE_CLEANUP_MS: "1000",
 			});
 
 			await manager.start(
@@ -2774,7 +2774,7 @@ describe("ThreadManager session metadata", () => {
 			const child = mockResponsiveChild("session-idle-cleanup-poll");
 			const manager = new ThreadManager({
 				...managerEnvironment(),
-				PI_THREADS_IDLE_CLEANUP_MS: "1000",
+				PI_DISPATCH_IDLE_CLEANUP_MS: "1000",
 			});
 
 			await manager.start(
@@ -2802,7 +2802,7 @@ describe("ThreadManager session metadata", () => {
 			const child = mockResponsiveChild("session-idle-cleanup-activity");
 			const manager = new ThreadManager({
 				...managerEnvironment(),
-				PI_THREADS_IDLE_CLEANUP_MS: "1000",
+				PI_DISPATCH_IDLE_CLEANUP_MS: "1000",
 			});
 
 			await manager.start(
@@ -2827,7 +2827,7 @@ describe("ThreadManager session metadata", () => {
 
 	it("bases idle cleanup on when a resumed child becomes idle", async () => {
 		vi.useFakeTimers();
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-idle-start-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-idle-start-"));
 		try {
 			vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
 			const sessionFile = path.join(root, "child.jsonl");
@@ -2860,7 +2860,7 @@ describe("ThreadManager session metadata", () => {
 			};
 			const manager = new ThreadManager({
 				...managerEnvironment(),
-				PI_THREADS_IDLE_CLEANUP_MS: "1000",
+				PI_DISPATCH_IDLE_CLEANUP_MS: "1000",
 			});
 			manager.hydrateFromSession({
 				sessionManager: { getBranch: () => [registryEntry(snapshot)] },
@@ -2903,7 +2903,7 @@ describe("ThreadManager session metadata", () => {
 			const child = mockResponsiveChild("session-live-timeout");
 			const manager = new ThreadManager({
 				...managerEnvironment(),
-				PI_THREADS_LIVE_TIMEOUT_MS: "1000",
+				PI_DISPATCH_LIVE_TIMEOUT_MS: "1000",
 			});
 
 			await manager.start(
@@ -2930,7 +2930,7 @@ describe("ThreadManager session metadata", () => {
 			const child = mockResponsiveChild("session-large-live-timeout");
 			const manager = new ThreadManager({
 				...managerEnvironment(),
-				PI_THREADS_LIVE_TIMEOUT_MS: String(oversizedLiveTimeoutMs),
+				PI_DISPATCH_LIVE_TIMEOUT_MS: String(oversizedLiveTimeoutMs),
 			});
 
 			await manager.start(
@@ -2957,7 +2957,7 @@ describe("ThreadManager session metadata", () => {
 
 	it("bases live timeout on the current resume launch", async () => {
 		vi.useFakeTimers();
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-resume-timeout-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-resume-timeout-"));
 		try {
 			vi.setSystemTime(new Date("2026-01-02T00:00:00.000Z"));
 			const sessionFile = path.join(root, "child.jsonl");
@@ -2990,7 +2990,7 @@ describe("ThreadManager session metadata", () => {
 			};
 			const manager = new ThreadManager({
 				...managerEnvironment(),
-				PI_THREADS_LIVE_TIMEOUT_MS: "1000",
+				PI_DISPATCH_LIVE_TIMEOUT_MS: "1000",
 			});
 			manager.hydrateFromSession({
 				sessionManager: { getBranch: () => [registryEntry(snapshot)] },
@@ -3118,7 +3118,7 @@ describe("ThreadManager session metadata", () => {
 	});
 
 	it("ignores stale process close events after a force-closed thread is resumed", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-stale-close-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-stale-close-"));
 		try {
 			const sessionFile = path.join(root, "child.jsonl");
 			writeSessionHeader(sessionFile, "session-stale-close", root);
@@ -3183,7 +3183,7 @@ describe("ThreadManager session metadata", () => {
 	});
 
 	it("ignores stale process close events from superseded launches", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-superseded-close-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-superseded-close-"));
 		try {
 			const sessionFile = path.join(root, "child.jsonl");
 			writeSessionHeader(sessionFile, "session-superseded-close", root);
@@ -3317,7 +3317,7 @@ describe("ThreadManager session metadata", () => {
 	});
 
 	it("forces no-approve for a child cwd outside the trusted parent cwd", async () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-outside-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-outside-"));
 		const parentCwd = path.join(root, "parent");
 		const outsideCwd = path.join(root, "outside");
 		fs.mkdirSync(parentCwd);
@@ -3340,11 +3340,11 @@ describe("ThreadManager session metadata", () => {
 			});
 
 			const manager = new ThreadManager({
-				PI_THREADS_DEPTH: "0",
-				PI_THREADS_MAX_DEPTH: "2",
-				PI_THREADS_MAX_THREADS: "8",
-				PI_THREADS_PATH: "/root",
-				PI_THREADS_ROOT_SESSION_ID: "test-root",
+				PI_DISPATCH_DEPTH: "0",
+				PI_DISPATCH_MAX_DEPTH: "2",
+				PI_DISPATCH_MAX_THREADS: "8",
+				PI_DISPATCH_PATH: "/root",
+				PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 			} as NodeJS.ProcessEnv);
 
 			await manager.start(
@@ -3378,15 +3378,15 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 		const originalArgv = process.argv;
 		const startupCwd = process.cwd();
-		const activeSessionCwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-active-"));
+		const activeSessionCwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-active-"));
 		fs.mkdirSync(path.join(activeSessionCwd, "child"));
 
 		try {
@@ -3441,11 +3441,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start({ action: "start", prompt: "fail", taskName: "fails" }, context());
@@ -3480,11 +3480,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start({ action: "start", prompt: "wait", taskName: "waits" }, context());
@@ -3525,11 +3525,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start({ action: "start", prompt: "wait", taskName: "wait_progress" }, context());
@@ -3569,11 +3569,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start({ action: "start", prompt: "wait", taskName: "wait_cancel" }, context());
@@ -3615,11 +3615,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start(
@@ -3678,11 +3678,11 @@ describe("ThreadManager session metadata", () => {
 			});
 
 			const manager = new ThreadManager({
-				PI_THREADS_DEPTH: "0",
-				PI_THREADS_MAX_DEPTH: "2",
-				PI_THREADS_MAX_THREADS: "8",
-				PI_THREADS_PATH: "/root",
-				PI_THREADS_ROOT_SESSION_ID: "test-root",
+				PI_DISPATCH_DEPTH: "0",
+				PI_DISPATCH_MAX_DEPTH: "2",
+				PI_DISPATCH_MAX_THREADS: "8",
+				PI_DISPATCH_PATH: "/root",
+				PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 			} as NodeJS.ProcessEnv);
 
 			const startPromise = manager.start(
@@ -3750,11 +3750,11 @@ describe("ThreadManager session metadata", () => {
 			});
 
 			const manager = new ThreadManager({
-				PI_THREADS_DEPTH: "0",
-				PI_THREADS_MAX_DEPTH: "2",
-				PI_THREADS_MAX_THREADS: "8",
-				PI_THREADS_PATH: "/root",
-				PI_THREADS_ROOT_SESSION_ID: "test-root",
+				PI_DISPATCH_DEPTH: "0",
+				PI_DISPATCH_MAX_DEPTH: "2",
+				PI_DISPATCH_MAX_THREADS: "8",
+				PI_DISPATCH_PATH: "/root",
+				PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 			} as NodeJS.ProcessEnv);
 
 			await manager.start({ action: "start", prompt: "initial", taskName: "slow_send" }, context());
@@ -3822,11 +3822,11 @@ describe("ThreadManager session metadata", () => {
 			});
 
 			const manager = new ThreadManager({
-				PI_THREADS_DEPTH: "0",
-				PI_THREADS_MAX_DEPTH: "2",
-				PI_THREADS_MAX_THREADS: "8",
-				PI_THREADS_PATH: "/root",
-				PI_THREADS_ROOT_SESSION_ID: "test-root",
+				PI_DISPATCH_DEPTH: "0",
+				PI_DISPATCH_MAX_DEPTH: "2",
+				PI_DISPATCH_MAX_THREADS: "8",
+				PI_DISPATCH_PATH: "/root",
+				PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 			} as NodeJS.ProcessEnv);
 
 			await manager.start(
@@ -3890,11 +3890,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start(
@@ -3941,11 +3941,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start(
@@ -3988,11 +3988,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start(
@@ -4046,11 +4046,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start(
@@ -4112,11 +4112,11 @@ describe("ThreadManager session metadata", () => {
 			});
 
 			const manager = new ThreadManager({
-				PI_THREADS_DEPTH: "0",
-				PI_THREADS_MAX_DEPTH: "2",
-				PI_THREADS_MAX_THREADS: "8",
-				PI_THREADS_PATH: "/root",
-				PI_THREADS_ROOT_SESSION_ID: "test-root",
+				PI_DISPATCH_DEPTH: "0",
+				PI_DISPATCH_MAX_DEPTH: "2",
+				PI_DISPATCH_MAX_THREADS: "8",
+				PI_DISPATCH_PATH: "/root",
+				PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 			} as NodeJS.ProcessEnv);
 
 			await manager.start(
@@ -4182,11 +4182,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start(
@@ -4252,11 +4252,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start(
@@ -4322,11 +4322,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start(
@@ -4375,11 +4375,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start(
@@ -4439,11 +4439,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start(
@@ -4517,11 +4517,11 @@ describe("ThreadManager session metadata", () => {
 			});
 
 			const manager = new ThreadManager({
-				PI_THREADS_DEPTH: "0",
-				PI_THREADS_MAX_DEPTH: "2",
-				PI_THREADS_MAX_THREADS: "8",
-				PI_THREADS_PATH: "/root",
-				PI_THREADS_ROOT_SESSION_ID: "test-root",
+				PI_DISPATCH_DEPTH: "0",
+				PI_DISPATCH_MAX_DEPTH: "2",
+				PI_DISPATCH_MAX_THREADS: "8",
+				PI_DISPATCH_PATH: "/root",
+				PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 			} as NodeJS.ProcessEnv);
 
 			await manager.start(
@@ -4586,11 +4586,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start(
@@ -4632,11 +4632,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start({ action: "start", prompt: "initial", taskName: "wait_queued" }, context());
@@ -4687,11 +4687,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start(
@@ -4744,11 +4744,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await manager.start(
@@ -4781,11 +4781,11 @@ describe("ThreadManager session metadata", () => {
 		});
 
 		const manager = new ThreadManager({
-			PI_THREADS_DEPTH: "0",
-			PI_THREADS_MAX_DEPTH: "2",
-			PI_THREADS_MAX_THREADS: "8",
-			PI_THREADS_PATH: "/root",
-			PI_THREADS_ROOT_SESSION_ID: "test-root",
+			PI_DISPATCH_DEPTH: "0",
+			PI_DISPATCH_MAX_DEPTH: "2",
+			PI_DISPATCH_MAX_THREADS: "8",
+			PI_DISPATCH_PATH: "/root",
+			PI_DISPATCH_ROOT_SESSION_ID: "test-root",
 		} as NodeJS.ProcessEnv);
 
 		await expect(
@@ -4808,7 +4808,7 @@ describe("child cwd trust", () => {
 	});
 
 	it("does not inherit approval through a symlink that escapes the parent cwd", () => {
-		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-threads-cwd-"));
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dispatch-cwd-"));
 		try {
 			const parent = path.join(root, "parent");
 			const outside = path.join(root, "outside");

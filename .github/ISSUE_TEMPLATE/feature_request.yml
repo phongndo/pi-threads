@@ -1,12 +1,12 @@
 name: Feature request
-description: Suggest an improvement to pi-threads.
+description: Suggest an improvement to pi-dispatch.
 title: "feat: "
 labels: [enhancement]
 body:
   - type: markdown
     attributes:
       value: |
-        Please describe the workflow you want to enable. pi-threads intentionally avoids hard-coded roles, so examples of agent behavior are especially helpful.
+        Please describe the workflow you want to enable. pi-dispatch intentionally avoids hard-coded roles, so examples of agent behavior are especially helpful.
   - type: textarea
     id: problem
     attributes:

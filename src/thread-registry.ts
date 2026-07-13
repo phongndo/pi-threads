@@ -12,7 +12,7 @@ import { isRecord, stringField } from "./json.ts";
 // cap free-form texts there to keep a chatty child from ballooning that file.
 const REGISTRY_TEXT_LIMIT = 20_000;
 
-export const PI_THREAD_REGISTRY_ENTRY_TYPE = "pi-threads-registry";
+export const PI_THREAD_REGISTRY_ENTRY_TYPE = "pi-dispatch-registry";
 
 export type ThreadRegistryEntryScope = {
 	readonly sessionId: string;

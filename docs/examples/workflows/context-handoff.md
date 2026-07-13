@@ -1,6 +1,6 @@
 # Example workflow: explicit context handoff
 
-This is a user-authored pattern, not a built-in `pi-threads` role or preset.
+This is a user-authored pattern, not a built-in `pi-dispatch` role or preset.
 
 Use it when one child’s result should seed another child. Children do not share
 conversation context, so the parent must pass the handoff context explicitly.

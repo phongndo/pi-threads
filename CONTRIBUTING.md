@@ -1,6 +1,6 @@
-# Contributing to pi-threads
+# Contributing to pi-dispatch
 
-Thanks for helping improve `pi-threads`. This project is a Pi extension, so the
+Thanks for helping improve `pi-dispatch`. This project is a Pi extension, so the
 bar for changes is that they are safe for interactive agent sessions, easy to
 review, and covered by focused tests.
 
@@ -60,7 +60,7 @@ Before opening a PR, please make sure:
 
 For bugs, include:
 
-- Pi version and `pi-threads` version.
+- Pi version and `pi-dispatch` version.
 - Operating system and shell.
 - The exact command or tool call that failed.
 - Expected behavior, actual behavior, and relevant logs or thread output.
