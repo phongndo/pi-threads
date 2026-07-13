@@ -1,6 +1,6 @@
-# Workflow authoring on top of `pi-dispatch`
+# Workflow authoring on top of `pi-threads`
 
-`pi-dispatch` is intentionally small: it exposes background Pi sessions through
+`pi-threads` is intentionally small: it exposes background Pi sessions through
 one `thread` tool and leaves orchestration style to you. It ships no built-in
 roles, agent profiles, planner/reviewer/worker graph, or workflow presets.
 
@@ -139,7 +139,7 @@ Cleanup:
 ```
 
 This kind of workflow describes policy for Pi to follow without adding any
-roles to `pi-dispatch` itself.
+roles to `pi-threads` itself.
 
 ## Prompt policy snippet
 
@@ -154,7 +154,7 @@ threads at once, poll or wait with summary detail first, synthesize results in
 the parent conversation, and stop or archive threads that are no longer needed.
 ```
 
-That snippet is a user-authored policy. It is not injected by `pi-dispatch`.
+That snippet is a user-authored policy. It is not injected by `pi-threads`.
 
 ## Anti-patterns
 

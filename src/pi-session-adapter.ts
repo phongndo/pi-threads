@@ -5,7 +5,7 @@ import { isRecord, stringField } from "./json.ts";
 
 /**
  * Thin adapter over Pi SessionManager public APIs and the few private touchpoints
- * pi-dispatch needs (materialization via `_rewriteFile` / `flushed`, plus
+ * pi-threads needs (materialization via `_rewriteFile` / `flushed`, plus
  * cross-session `appendCustomEntry`). Keeps reach-ins in one place so H1/H2
  * persistence work can depend on a stable surface.
  */

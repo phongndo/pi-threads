@@ -318,19 +318,19 @@ function parseAllowedExtraArgs(args: readonly string[]): readonly string[] {
 		if (arg === undefined) continue;
 		if (arg.includes("=")) {
 			throw new Error(
-				`Unsupported child Pi arg for pi-dispatch: ${arg}. Repair: inline --flag=value forms are not allowed; pass flag and value as separate array items, e.g. "args": ["--model", "sonnet"].`,
+				`Unsupported child Pi arg for pi-threads: ${arg}. Repair: inline --flag=value forms are not allowed; pass flag and value as separate array items, e.g. "args": ["--model", "sonnet"].`,
 			);
 		}
 		if (arg === "--" || PACKAGE_SUBCOMMANDS.has(arg) || !isFlagLike(arg)) {
 			throw new Error(
-				`Unsupported child Pi arg for pi-dispatch: ${arg}. Repair: remove package subcommands, prompts, and positional args; ${ALLOWED_EXTRA_ARGS_HELP}.`,
+				`Unsupported child Pi arg for pi-threads: ${arg}. Repair: remove package subcommands, prompts, and positional args; ${ALLOWED_EXTRA_ARGS_HELP}.`,
 			);
 		}
 
 		const spec = CLI_FLAG_SPECS.get(arg);
 		if (spec?.allowExtra !== true) {
 			throw new Error(
-				`Unsupported child Pi arg for pi-dispatch: ${arg}. Repair: remove this flag or replace it with an allowlisted restriction; ${ALLOWED_EXTRA_ARGS_HELP}. Children always run in RPC mode and cannot set session, approval, extension-loading, or one-shot flags through start.args.`,
+				`Unsupported child Pi arg for pi-threads: ${arg}. Repair: remove this flag or replace it with an allowlisted restriction; ${ALLOWED_EXTRA_ARGS_HELP}. Children always run in RPC mode and cannot set session, approval, extension-loading, or one-shot flags through start.args.`,
 			);
 		}
 
@@ -339,7 +339,7 @@ function parseAllowedExtraArgs(args: readonly string[]): readonly string[] {
 			const value = args[i + 1];
 			if (value === undefined || isFlagLike(value)) {
 				throw new Error(
-					`Unsupported child Pi arg for pi-dispatch: ${arg} requires a value. Repair: pass the value as the next array item, e.g. "args": ["${arg}", "value"].`,
+					`Unsupported child Pi arg for pi-threads: ${arg} requires a value. Repair: pass the value as the next array item, e.g. "args": ["${arg}", "value"].`,
 				);
 			}
 			allowed.push(value);
@@ -416,7 +416,7 @@ function assertNoInheritedModelScopeOverride(
 	if (!hasFlag(allowedExtraArgs, MODEL_SCOPE_OVERRIDE_FLAGS)) return;
 
 	throw new Error(
-		"Unsupported child Pi arg for pi-dispatch: child model/provider/thinking args cannot override an inherited --models scope. Repair: omit --provider/--model/--models/--thinking from start.args or start the parent with a narrower model scope.",
+		"Unsupported child Pi arg for pi-threads: child model/provider/thinking args cannot override an inherited --models scope. Repair: omit --provider/--model/--models/--thinking from start.args or start the parent with a narrower model scope.",
 	);
 }
 

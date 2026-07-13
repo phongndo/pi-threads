@@ -1,6 +1,6 @@
 # `thread` tool contract
 
-`pi-dispatch` registers one model-facing Pi tool named `thread` with the neutral
+`pi-threads` registers one model-facing Pi tool named `thread` with the neutral
 description `Start and manage background Pi child sessions.` It does not add
 built-in roles, profiles, workflow presets, or proactive delegation instructions.
 Workflows are layered by user prompts, skills, prompt templates, or other
@@ -68,7 +68,7 @@ Thread paths are rooted at `/root`. `taskName` values must match
 - `cwd` resolves relative to the parent session cwd and must be an existing
   directory. Omit it to use the parent cwd.
 - `args` are optional, allowlisted Pi CLI narrowing flags. Children always run
-  in RPC mode, and session/approval flags are managed by `pi-dispatch`.
+  in RPC mode, and session/approval flags are managed by `pi-threads`.
 
 Allowed `args` are:
 
@@ -183,7 +183,7 @@ prompt.
 { "action": "archive", "id": "/root/api_survey" }
 ```
 
-Archive is a `pi-dispatch` visibility state. It never deletes the underlying Pi
+Archive is a `pi-threads` visibility state. It never deletes the underlying Pi
 session file. Live threads cannot be archived; stop or wait for closure first.
 Use `{ "archived": false }` to unarchive.
 
@@ -307,12 +307,12 @@ auto-cancelled in headless threads and recorded as `ui_request` events.
 
 Defaults are controlled by environment variables:
 
-| Variable                      | Default | Meaning                                                   |
-| ----------------------------- | ------- | --------------------------------------------------------- |
-| `PI_DISPATCH_MAX_DEPTH`       | `2`     | Maximum recursion depth.                                  |
-| `PI_DISPATCH_MAX_THREADS`     | `8`     | Maximum live threads per parent manager.                  |
-| `PI_DISPATCH_IDLE_CLEANUP_MS` | `0`     | Stop idle live children after this many ms; `0` disables. |
-| `PI_DISPATCH_LIVE_TIMEOUT_MS` | `0`     | Stop live children after this lifetime; `0` disables.     |
+| Variable                     | Default | Meaning                                                   |
+| ---------------------------- | ------- | --------------------------------------------------------- |
+| `PI_THREADS_MAX_DEPTH`       | `2`     | Maximum recursion depth.                                  |
+| `PI_THREADS_MAX_THREADS`     | `8`     | Maximum live threads per parent manager.                  |
+| `PI_THREADS_IDLE_CLEANUP_MS` | `0`     | Stop idle live children after this many ms; `0` disables. |
+| `PI_THREADS_LIVE_TIMEOUT_MS` | `0`     | Stop live children after this lifetime; `0` disables.     |
 
 Managed thread metadata is persisted as Pi custom session entries. On session
 reload, saved managed threads are restored when possible. A previously live

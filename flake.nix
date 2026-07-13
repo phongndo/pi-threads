@@ -1,5 +1,5 @@
 {
-  description = "pi-dispatch development environment";
+  description = "pi-threads development environment";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
@@ -43,7 +43,7 @@
               if command -v mise &>/dev/null; then
                 mise trust --yes 2>/dev/null || true
               fi
-              echo "pi-dispatch: pnpm, oxlint, oxfmt, and LSPs are available."
+              echo "pi-threads: pnpm, oxlint, oxfmt, and LSPs are available."
               echo "  hk hooks: managed via mise.toml + global Git hooks"
             '';
           };

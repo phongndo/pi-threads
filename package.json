@@ -1,23 +1,22 @@
 {
-  "name": "@phongndo/pi-dispatch",
+  "name": "@phongndo/pi-threads",
   "version": "0.4.0",
   "description": "A minimal Pi extension for managing background Pi child sessions.",
   "keywords": [
     "agents",
-    "dispatch",
     "pi-extension",
     "pi-package",
     "threads"
   ],
-  "homepage": "https://github.com/phongndo/pi-dispatch#readme",
+  "homepage": "https://github.com/phongndo/pi-threads#readme",
   "bugs": {
-    "url": "https://github.com/phongndo/pi-dispatch/issues"
+    "url": "https://github.com/phongndo/pi-threads/issues"
   },
   "license": "MIT",
   "author": "phongndo",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/phongndo/pi-dispatch.git"
+    "url": "git+https://github.com/phongndo/pi-threads.git"
   },
   "files": [
     "src",

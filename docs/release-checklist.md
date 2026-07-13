@@ -49,7 +49,7 @@ For normal releases, publish from GitHub Actions or another npm-supported CI
 provenance environment rather than from a local workstation.
 
 - [ ] npm trusted publishing or an appropriate npm automation token is configured
-      for `@phongndo/pi-dispatch`.
+      for `@phongndo/pi-threads`.
 - [ ] The publish job has least-privilege permissions, including `contents: read`
       and `id-token: write` for provenance.
 - [ ] The publish job reruns the local quality gate before publishing.
@@ -81,7 +81,7 @@ the published npm version.
    After publishing, repeat with the npm package:
 
    ```bash
-   pi -e npm:@phongndo/pi-dispatch@<version>
+   pi -e npm:@phongndo/pi-threads@<version>
    ```
 
 2. In Pi, ask for a small background thread that reports its working directory

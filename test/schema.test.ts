@@ -419,7 +419,7 @@ describe("child Pi argv", () => {
 					"/opt/pi/dist/cli.js",
 					"--no-extensions",
 					"--extension",
-					"./pi-dispatch",
+					"./pi-threads",
 					"--no-skills",
 					"--skill",
 					"skills/review",
@@ -432,7 +432,7 @@ describe("child Pi argv", () => {
 		).toEqual([
 			"--no-extensions",
 			"--extension",
-			path.resolve(parentCwd, "pi-dispatch"),
+			path.resolve(parentCwd, "pi-threads"),
 			"--no-skills",
 			"--skill",
 			path.resolve(parentCwd, "skills/review"),
