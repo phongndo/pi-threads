@@ -1,10 +1,16 @@
 {
   description = "pi-threads development environment";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    hk = {
+      url = "github:jdx/hk/v1.49.0";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
   outputs =
-    { nixpkgs, ... }:
+    { hk, nixpkgs, ... }:
     let
       systems = [
         "aarch64-darwin"
@@ -24,27 +30,15 @@
           default = pkgs.mkShell {
             packages = with pkgs; [
               git
-              jq
-              nil
+              hk.packages.${system}.default
               nixd
-              nixfmt
               nodejs_22
-              oxfmt
-              oxlint
               pnpm
               typescript-language-server
-              vscode-langservers-extracted
-              yaml-language-server
             ];
 
             shellHook = ''
               export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
-              # Provide hk + pkl via mise.toml if mise is available
-              if command -v mise &>/dev/null; then
-                mise trust --yes 2>/dev/null || true
-              fi
-              echo "pi-threads: pnpm, oxlint, oxfmt, and LSPs are available."
-              echo "  hk hooks: managed via mise.toml + global Git hooks"
             '';
           };
         }

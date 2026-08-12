@@ -6,14 +6,11 @@ review, and covered by focused tests.
 
 ## Development setup
 
-Requirements:
-
-- Node.js `>=22.19.0`
-- pnpm `11.9.0`
-- Optional: Nix, if you want the pinned development shell
+Requirement: Nix with flakes enabled. The project flake provides Node.js,
+pnpm, hk, and the remaining development tools.
 
 ```bash
-nix develop      # optional
+nix develop
 pnpm install
 pnpm check
 ```
