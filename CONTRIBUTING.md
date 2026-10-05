@@ -29,8 +29,9 @@ hk check             # format + lint validation (via hk)
 hk fix               # auto-format + auto-fix
 ```
 
-Pre-commit formatting and linting is provided by **hk** via global Git hooks.
-No local hook installation needed.
+Pre-commit formatting and linting is provided by **hk**, which the dev shell
+provides. Run `hk install` once from `nix develop` to install the repository's
+hook, and commit from inside `nix develop`.
 
 ## Pull request checklist
 

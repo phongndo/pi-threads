@@ -277,8 +277,9 @@ pnpm dev:pi         # run Pi with the extension loaded locally
 
 ### Git hooks
 
-Pre-commit formatting and linting is handled automatically by **hk** via
-global Git hooks (`~/.gitconfig` `hook.*.command`). No local setup required.
+Pre-commit formatting and linting is handled by **hk**, which the dev shell
+provides. Run `hk install` once from `nix develop` to install the repository's
+hook, and commit from inside `nix develop`.
 
 If you want to run the same checks without committing:
 
